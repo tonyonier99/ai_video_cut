@@ -1,0 +1,40 @@
+INFO:     Started server process [48509]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+✅ Created Symlink and Added to PATH: /Users/huangguanting/.gemini/antigravity/scratch/antigravity-cut/local_bin/ffmpeg
+📥 Loading Whisper AI model...
+✅ Whisper AI Ready!
+🚀 Video Processing Server Running on http://localhost:8000
+🎬 Processing Request: Vertical=true, Mode=zip, Style=classic
+🎬 Processing video: 當你追尋人生的意義.mp4
+🎬 Processing Cut 1: 38.80247331853633-53.80247331853633
+🎥 Smart Reframing Config: Ratio=9:16, Track=True, Viz=false, Zoom=1.5, Weight=5.0
+🤖 AI Tracking v7.2 (OpenCV): High-Confidence Analysis...
+🤖 Trace Start: Locking on Main Subject (Area 3721) at X=153.5
+✂️ Generating Cut-Based Camera Plan...
+✂️ Cut Strategy: Deadband=89.6px, MinDur=2.0s
+🎙️ Transcribing clip 1... (Burn=false)
+❌ SRT Missing after transcribe!
+INFO:     127.0.0.1:59918 - "POST /preview_clip HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:59911 - "POST /process-video HTTP/1.1" 200 OK
+👁️ Preview Request: Vertical=true, Ratio=9:16
+👁️ Preview Requested: 38.80247331853633s - 53.80247331853633s
+🎥 Smart Reframing Config: Ratio=9:16, Track=True, Viz=false, Zoom=1.5, Weight=5.0
+🤖 AI Tracking v7.2 (OpenCV): High-Confidence Analysis...
+🤖 Trace Start: Locking on Main Subject (Area 3721) at X=153.5
+✂️ Generating Cut-Based Camera Plan...
+✂️ Cut Strategy: Deadband=89.6px, MinDur=2.0s
+INFO:     127.0.0.1:59918 - "POST /preview-clip HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59918 - "POST /preview_clip HTTP/1.1" 404 Not Found
+ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers
+  built with Apple clang version 13.1.6 (clang-1316.0.21.2.5)
+  configuration: --prefix=/Volumes/tempdisk/sw --extra-cflags=-fno-stack-check --arch=arm64 --cc=/usr/bin/clang --enable-gpl --enable-libvmaf --enable-libopenjpeg --enable-libopus --enable-libmp3lame --enable-libx264 --enable-libx265 --enable-libvpx --enable-libwebp --enable-libass --enable-libfreetype --enable-fontconfig --enable-libtheora --enable-libvorbis --enable-libsnappy --enable-libaom --enable-libvidstab --enable-libzimg --enable-libsvtav1 --enable-libharfbuzz --enable-libkvazaar --pkg-config-flags=--static --enable-ffplay --enable-postproc --enable-neon --enable-runtime-cpudetect --disable-indev=qtkit --disable-indev=x11grab_xcb
+  libavutil      59. 39.100 / 59. 39.100
+  libavcodec     61. 19.100 / 61. 19.100
+  libavformat    61.  7.100 / 61.  7.100
+  libavdevice    61.  3.100 / 61.  3.100
+  libavfilter    10.  4.100 / 10.  4.100
+  libswscale      8.  3.100 /  8.  3.100
+  libswresample   5.  3.100 /  5.  3.100
+  libpostproc    58.  3.100 / 58.  3.100

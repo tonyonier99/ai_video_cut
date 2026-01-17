@@ -1,0 +1,506 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Trash2, Download, Video, Scissors, Play, Pause, Loader2, Film, Key, Upload, Wand2, Languages, X } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import WaveSurfer from 'wavesurfer.js';
+import './App.css';
+
+// Define the Cut type
+interface Cut {
+  id: string;
+  start: number;
+  end: number;
+  label: string;
+}
+
+function App() {
+  const [videoUrl, setVideoUrl] = useState<string>('');
+  const [cuts, setCuts] = useState<Cut[]>([]);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false); // For local UI spinner
+  const [initLog, setInitLog] = useState<string>('');
+
+  const [targetCount, setTargetCount] = useState(1);
+  const [targetDuration, setTargetDuration] = useState(15);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+  const [ffmpegLoaded, setFfmpegLoaded] = useState(false);
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+
+  // Settings State
+  const [isAutoCaption, setIsAutoCaption] = useState(true);
+  const [isTranslate, setIsTranslate] = useState(false);
+  const [isBurnCaptions, setIsBurnCaptions] = useState(true);
+  const [isFaceTracking, setIsFaceTracking] = useState(true);
+  const [aspectRatio, setAspectRatio] = useState<"9:16" | "16:9">("9:16");
+  const [isMerge, setIsMerge] = useState(false);
+  const [dynamicZoom, setDynamicZoom] = useState(false);
+  const [isStudioSound, setIsStudioSound] = useState(false);
+  const [isVizTracking, setIsVizTracking] = useState(false);
+
+  // Advanced Tracking Params
+  const [trackZoom, setTrackZoom] = useState(1.5);
+  const [trackWeight, setTrackWeight] = useState(5.0);
+  const [trackSensitivity, setTrackSensitivity] = useState(8);
+  const [minShotDuration, setMinShotDuration] = useState(2.0);
+
+  const [subtitleStyle, setSubtitleStyle] = useState('classic');
+  const [subtitleFontSize, setSubtitleFontSize] = useState(72);
+  const [subtitleColor, setSubtitleColor] = useState('#FFFFFF');
+  const [subtitleOutlineColor, setSubtitleOutlineColor] = useState('#000000');
+  const [subtitleMarginV, setSubtitleMarginV] = useState(220);
+  const [subtitleMarginH, setSubtitleMarginH] = useState(40); // New: Horizontal Margin (Safety Area)
+  const [subtitleFontName, setSubtitleFontName] = useState('Arial Black');
+  const [isSubtitleBold, setIsSubtitleBold] = useState(true);
+  const [subtitleShadowSize, setSubtitleShadowSize] = useState(1);
+  const [subtitleOutlineWidth, setSubtitleOutlineWidth] = useState(2);
+  const [isSubtitleBox, setIsSubtitleBox] = useState(false);
+  const [subtitleBoxAlpha, setSubtitleBoxAlpha] = useState(0.8);
+  const [subtitleBoxColor, setSubtitleBoxColor] = useState('#000000'); // New: Box Color
+  const [subtitleBoxPaddingX, setSubtitleBoxPaddingX] = useState(20);
+  const [subtitleBoxPaddingY, setSubtitleBoxPaddingY] = useState(10);
+  const [subtitleBoxRadius, setSubtitleBoxRadius] = useState(0); // New: Box Radius
+  const [outputResolution, setOutputResolution] = useState('1080p');
+  const [outputQuality, setOutputQuality] = useState('high'); // high=8M, medium=4M, low=2M
+  const [isDraggingSubtitle, setIsDraggingSubtitle] = useState(false);
+  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(12);
+  const [previewText, setPreviewText] = useState('預覽文字，test123');
+  // New: Preview Text
+  // Advanced Audio & Tracking
+  const [dfn3Strength, setDfn3Strength] = useState(100);
+  const [mpMinDetectionCon, setMpMinDetectionCon] = useState(0.5);
+  const [mpModelSelection, setMpModelSelection] = useState(1); // 0=short, 1=long
+
+  const [isRendered, setIsRendered] = useState(false);
+  const [customFontFile, setCustomFontFile] = useState<File | null>(null);
+  const [fontList, setFontList] = useState<string[]>(['Arial', 'Arial Black', 'Helvetica', 'Times New Roman', '微軟正黑體', 'Noto Sans TC']);
+
+  // AI & Persist
+  const [instruction, setInstruction] = useState('');
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || '');
+  const [showApiSettings, setShowApiSettings] = useState(false);
+  const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem('gemini_model') || 'gemini-3.0-flash');
+
+  useEffect(() => { localStorage.setItem('gemini_api_key', apiKey); }, [apiKey]);
+  useEffect(() => { localStorage.setItem('gemini_model', selectedModel); }, [selectedModel]);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const waveformRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const wavesurfer = useRef<WaveSurfer | null>(null);
+
+  // Initialize WaveSurfer
+  useEffect(() => {
+    if (waveformRef.current && videoUrl) {
+      if (wavesurfer.current) wavesurfer.current.destroy();
+
+      wavesurfer.current = WaveSurfer.create({
+        container: waveformRef.current,
+        waveColor: '#4f46e5',
+        progressColor: '#3b82f6',
+        cursorColor: '#ffffff',
+        barWidth: 2,
+        barRadius: 3,
+        height: 48,
+        normalize: true,
+      });
+
+      wavesurfer.current.load(videoUrl);
+
+      return () => wavesurfer.current?.destroy();
+    }
+  }, [videoUrl]);
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setVideoFile(file);
+      setVideoUrl(URL.createObjectURL(file));
+      setCuts([]);
+    }
+  };
+
+  const toAssColor = (hex: string) => {
+    // #RRGGBB -> &HBBGGRR
+    if (!hex || !hex.startsWith('#')) return '&HFFFFFF';
+    const r = hex.slice(1, 3);
+    const g = hex.slice(3, 5);
+    const b = hex.slice(5, 7);
+    return `&H${b.toUpperCase()}${g.toUpperCase()}${r.toUpperCase()}`;
+  };
+
+  const [systemStatus, setSystemStatus] = useState({ progress: 100, status: 'ready', message: '就緒' });
+
+  useEffect(() => {
+    setInitLog('Python 後端已就緒');
+    setFfmpegLoaded(true);
+
+    // Poll for model status
+    const pollStatus = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/model-status');
+        const data = await res.json();
+        setSystemStatus(data);
+      } catch (e) {
+        console.error("Failed to fetch system status");
+      }
+    };
+    const timer = setInterval(pollStatus, 2000);
+    pollStatus();
+    return () => clearInterval(timer);
+  }, []);
+
+  const handleFontUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setCustomFontFile(file);
+      const fontName = file.name.split('.')[0];
+      setSubtitleFontName(fontName);
+      if (!fontList.includes(fontName)) {
+        setFontList(prev => [fontName, ...prev]);
+      }
+      const formData = new FormData();
+      formData.append('file', file);
+      try {
+        await fetch('http://localhost:8000/upload-font', {
+          method: 'POST',
+          body: formData
+        });
+        setInitLog(`字體 ${fontName} 已備就緒`);
+      } catch (err) { console.error(err); }
+    }
+  };
+
+  // Updated Strategy: One Main Function
+  const handleMakeVideo = async () => {
+    if (!videoUrl) return;
+    if (instruction.trim().length > 0 && apiKey) {
+      await runAIAnalysis();
+    } else {
+      runBatchGeneration();
+    }
+  };
+
+  const runAIAnalysis = async () => {
+    setIsProcessing(true);
+    setInitLog("AI 正在根據指令分析影片...");
+
+    try {
+      const formData = new FormData();
+      formData.append('file', videoFile!);
+      formData.append('api_key', apiKey);
+      formData.append('model_name', selectedModel);
+      formData.append('instruction', instruction);
+      formData.append('target_count', String(targetCount));
+      formData.append('target_duration', String(targetDuration));
+
+      const response = await fetch('http://localhost:8000/analyze-video', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`AI 分析失敗: ${errText}`);
+      }
+
+      const newCuts = await response.json();
+      if (Array.isArray(newCuts)) {
+        const formattedCuts = newCuts.map((cut: any, idx: number) => ({
+          id: `ai-${Date.now()}-${idx}`,
+          start: cut.start,
+          end: cut.end,
+          label: `✨ ${cut.label || 'AI 精選'}`
+        }));
+        setCuts(formattedCuts);
+        setInitLog(`AI 找到了 ${formattedCuts.length} 個片段！`);
+      }
+    } catch (e: any) {
+      console.error(e);
+      alert(`AI 分析錯誤: ${e.message}`);
+      setInitLog("分析失敗");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const runBatchGeneration = () => {
+    setIsProcessing(true);
+    setInitLog("正在生成片段...");
+
+    setTimeout(() => {
+      const duration = videoRef.current?.duration || 120;
+      const highlights = [];
+      const interval = duration / targetCount;
+
+      for (let i = 1; i <= targetCount; i++) {
+        const start = Math.max(0, (interval * (i - 1)) + (Math.random() * (interval * 0.3)));
+        const actualEnd = Math.min(start + targetDuration, duration);
+        highlights.push({
+          id: `hl-${Date.now()}-${i}`,
+          start: start,
+          end: actualEnd,
+          label: `🔥 精華片段 #${i} [${start.toFixed(0)}s-${actualEnd.toFixed(0)}s]`
+        });
+      }
+
+      setCuts(highlights);
+      setIsProcessing(false);
+      setInitLog("生成完成");
+    }, 1000);
+  };
+
+  // Mode: 'preview_url' (Render & Play) | 'zip' (Download)
+  const handleExport = async (mode: 'zip' | 'preview_url' = 'zip') => {
+    if (!videoFile || cuts.length === 0) return;
+
+    setIsExporting(true);
+    setExportProgress(10);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', videoFile);
+      formData.append('cuts_json', JSON.stringify(cuts));
+      if (apiKey) formData.append('api_key', apiKey);
+      if (selectedModel) formData.append('model_name', selectedModel);
+
+      // Flags
+      formData.append('vertical_mode', String(aspectRatio === '9:16'));
+      formData.append('aspect_ratio', aspectRatio); // NEW
+      formData.append('face_tracking', String(isFaceTracking)); // NEW
+      formData.append('auto_caption', String(isAutoCaption));
+      formData.append('translate_to_chinese', String(isTranslate)); // NEW
+      formData.append('merge_clips', String(isMerge));
+      formData.append('burn_captions', String(isBurnCaptions));
+      formData.append('dynamic_zoom', String(dynamicZoom));
+      formData.append('studio_sound', String(isStudioSound));
+      formData.append('dfn3_strength', String(dfn3Strength / 100));
+      formData.append('mp_detection_con', String(mpMinDetectionCon));
+      formData.append('mp_model_selection', String(mpModelSelection));
+
+      formData.append('viz_tracking', String(isVizTracking)); // NEW
+      // Advanced Params
+      formData.append('track_zoom', String(trackZoom));
+      formData.append('track_weight', String(trackWeight));
+      formData.append('track_stickiness', String(10 - trackSensitivity));
+      formData.append('min_shot_duration', String(minShotDuration));
+      formData.append('output_mode', mode);
+      formData.append('subtitle_style', subtitleStyle); // Pass to backend
+      formData.append('subtitle_font_size', String(subtitleFontSize));
+      formData.append('subtitle_color', subtitleColor);
+      formData.append('subtitle_outline_color', subtitleOutlineColor);
+      formData.append('subtitle_margin_v', String(subtitleMarginV));
+      formData.append('subtitle_font_name', subtitleFontName);
+      formData.append('subtitle_bold', String(isSubtitleBold));
+      formData.append('subtitle_shadow_size', String(subtitleShadowSize));
+      formData.append('subtitle_outline_width', String(subtitleOutlineWidth));
+      formData.append('subtitle_chars_per_line', String(subtitleCharsPerLine));
+      formData.append('subtitle_box_enabled', String(isSubtitleBox));
+      formData.append('subtitle_box_color', subtitleBoxColor);
+      formData.append('subtitle_box_alpha', String(subtitleBoxAlpha));
+      // Pass the larger padding to backend for now
+      formData.append('subtitle_box_padding', String(Math.max(subtitleBoxPaddingX, subtitleBoxPaddingY)));
+      formData.append('subtitle_box_radius', String(subtitleBoxRadius));
+      formData.append('subtitle_margin_h', String(subtitleMarginH));
+      formData.append('output_resolution', outputResolution);
+      formData.append('output_quality', outputQuality);
+
+      setExportProgress(30);
+      setInitLog('正在後端進行 AI 運算 (Whisper / 渲染)... 請勿關閉視窗');
+
+      // Start simulated progress
+      const progressTimer = setInterval(() => {
+        setExportProgress((prev) => {
+          if (prev >= 95) return prev;
+          return prev + (Math.random() * 2);
+        });
+      }, 3000);
+
+      const response = await fetch('http://localhost:8000/process-video', {
+        method: 'POST',
+        body: formData,
+      });
+
+      clearInterval(progressTimer);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        let errorMessage = '處理失敗';
+        try {
+          const errData = JSON.parse(errorText);
+          errorMessage = errData.detail || errorMessage;
+        } catch (e) {
+          errorMessage = errorText;
+        }
+        throw new Error(errorMessage);
+      }
+
+      setExportProgress(90);
+      setInitLog('處理完成，正在下載結果...');
+
+      if (mode === 'preview_url') {
+        const data = await response.json();
+        if (data.preview_url) {
+          setVideoUrl(data.preview_url); // Replace Player Source
+          setIsRendered(true); // Show Download Button
+          setInitLog('預覽渲染完成！請按下載。');
+        }
+        setExportProgress(100);
+        setIsExporting(false);
+        return;
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+
+      const disposition = response.headers.get('content-disposition');
+      let filename = 'Antigravity_Cuts.zip';
+      if (disposition && disposition.indexOf('attachment') !== -1) {
+        const filenameRegex = /filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/;
+        const matches = filenameRegex.exec(disposition);
+        if (matches != null && matches[1]) {
+          filename = matches[1].replace(/['"]/g, '');
+        }
+      }
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      setInitLog('下載完成！');
+      setExportProgress(100);
+
+    } catch (error: any) {
+      console.error('Export failed:', error);
+      alert(`導出失敗: ${error.message}`);
+      setInitLog(`導出失敗: ${error.message}`);
+    } finally {
+      setIsExporting(false);
+      setTimeout(() => setExportProgress(0), 2000);
+    }
+  };
+
+  // Helper to update cut time
+  const updateCutLabel = (id: string, label: string) => {
+    setCuts(cuts.map(c => c.id === id ? { ...c, label } : c));
+  };
+
+  const updateCutTime = (id: string, field: 'start' | 'end', value: number) => {
+    setCuts(prev => prev.map(c => {
+      if (c.id === id) {
+        return { ...c, [field]: value };
+      }
+      return c;
+    }));
+  };
+
+  // Helper to seek video
+  const seekTo = (time: number) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = time;
+      setCurrentTime(time);
+      if (wavesurfer.current) {
+        wavesurfer.current.setTime(time);
+      }
+    }
+  };
+
+  const handleTimelineClick = (e: React.MouseEvent) => {
+    if (timelineRef.current && duration) {
+      const rect = timelineRef.current.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const clickedTime = (x / rect.width) * duration;
+      seekTo(clickedTime);
+    }
+  };
+
+  // Preview State
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const [previewProgresses, setPreviewProgresses] = useState<{ [key: string]: number }>({});
+  const previewCanvasRef = useRef<HTMLDivElement>(null);
+
+  const handlePreview = async (cut: Cut) => {
+    if (!videoFile) return;
+    setPreviewingId(cut.id);
+    setIsPreviewLoading(true);
+    setPreviewProgresses(prev => ({ ...prev, [cut.id]: 10 }));
+    setInitLog(`正在產生 [${cut.label}] 預覽...`);
+
+    // Preview Progress Timer
+    const previewTimer = setInterval(() => {
+      setPreviewProgresses(prev => {
+        const curr = prev[cut.id] || 10;
+        if (curr >= 90) return prev;
+        return { ...prev, [cut.id]: curr + 2 };
+      });
+    }, 1000);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', videoFile);
+      formData.append('start', String(cut.start));
+      formData.append('end', String(cut.end));
+      formData.append('vertical_mode', String(aspectRatio === '9:16'));
+      formData.append('aspect_ratio', aspectRatio);
+      formData.append('face_tracking', String(isFaceTracking));
+      formData.append('viz_tracking', String(isVizTracking));
+      formData.append('dynamic_zoom', String(dynamicZoom));
+      formData.append('burn_captions', String(isBurnCaptions));
+      formData.append('subtitle_style', subtitleStyle);
+      formData.append('translate_to_chinese', String(isTranslate));
+      formData.append('track_zoom', String(trackZoom));
+      formData.append('track_weight', String(trackWeight));
+      formData.append('track_stickiness', String(10 - trackSensitivity));
+      formData.append('min_shot_duration', String(minShotDuration));
+      formData.append('subtitle_font_size', String(subtitleFontSize));
+      formData.append('subtitle_color', subtitleColor);
+      formData.append('subtitle_outline_color', subtitleOutlineColor);
+      formData.append('subtitle_margin_v', String(subtitleMarginV));
+      formData.append('subtitle_font_name', subtitleFontName);
+      formData.append('subtitle_bold', String(isSubtitleBold));
+      formData.append('subtitle_shadow_size', String(subtitleShadowSize));
+      formData.append('subtitle_outline_width', String(subtitleOutlineWidth));
+      formData.append('subtitle_chars_per_line', String(subtitleCharsPerLine));
+      formData.append('subtitle_box_enabled', String(isSubtitleBox));
+      formData.append('subtitle_box_color', subtitleBoxColor);
+      formData.append('subtitle_box_alpha', String(subtitleBoxAlpha));
+      formData.append('subtitle_box_padding', String(Math.max(subtitleBoxPaddingX, subtitleBoxPaddingY)));
+      formData.append('subtitle_margin_h', String(subtitleMarginH));
+      formData.append('studio_sound', String(isStudioSound));
+      formData.append('dfn3_strength', String(dfn3Strength / 100));
+      formData.append('mp_detection_con', String(mpMinDetectionCon));
+      formData.append('mp_model_selection', String(mpModelSelection));
+
+      const response = await fetch('http://localhost:8000/preview-clip', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(errText || "Preview failed");
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      setPreviewUrl(url);
+      setPreviewProgresses(prev => ({ ...prev, [cut.id]: 100 }));
+      setInitLog(`[${cut.label}] 預覽生成完成！`);
+
+    } catch (e: any) {
+      alert(`預覽失敗: ${e.message || e}`);
+      console.error(e);
+      setInitLog('預覽失敗');
+    } finally {
+      clearInterval(previewTimer);
+      setIsPreviewLoading(false);
+      setPreviewingId(null);
+    }
+  };
+
+  return (
+    <div className="app-container">

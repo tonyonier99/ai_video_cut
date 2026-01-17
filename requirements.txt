@@ -1,0 +1,22 @@
+# Backend Framework
+fastapi
+uvicorn
+python-multipart
+
+# Video Processing
+moviepy==1.0.3
+imageio-ffmpeg
+opencv-python-headless
+
+# AI & Machine Learning
+openai-whisper
+google-generativeai
+mediapipe
+scikit-learn
+numpy
+
+# Utilities
+requests
+deepfilternet
+torch
+torchaudio
