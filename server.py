@@ -78,6 +78,52 @@ def wrap_text(text, max_chars=12):
         import textwrap
         return "\n".join(textwrap.wrap(text, width=max_chars))
 
+
+def optimize_segments(segments, max_chars=20):
+    """
+    Splits long whisper segments into shorter ones based on character count and duration.
+    Essential for vertical video to prevent subtitle walls.
+    """
+    new_segments = []
+    import re
+    for s in segments:
+        text = s['text'].strip()
+        if not text: continue
+        
+        # CLEANUP: Remove punctuation for cleaner short-video subtitles
+        text = re.sub(r'[，。、？！：；,.?!:;"\']', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip() # Collapse spaces
+        
+        if not text: continue
+        
+        # Threshold: if text is longer than max_chars (e.g. 20 for vertical)
+        if len(text) > max_chars:
+            # Simple split strategy: Split into N parts
+            num_parts = (len(text) // max_chars) + 1
+            duration = s['end'] - s['start']
+            time_per_part = duration / num_parts
+            chars_per_part = len(text) // num_parts
+            
+            for i in range(num_parts):
+                start_t = s['start'] + (i * time_per_part)
+                end_t = s['start'] + ((i + 1) * time_per_part)
+                
+                # Slicing text safely
+                start_char = i * chars_per_part
+                # Make sure last part gets the rest
+                if i == num_parts - 1:
+                    sub_text = text[start_char:]
+                else:
+                    sub_text = text[start_char : start_char + chars_per_part]
+                
+                new_segments.append({
+                    "start": start_t,
+                    "end": end_t,
+                    "text": sub_text.strip()
+                })
+        else:
+            new_segments.append(s)
+    return new_segments
 # Helper for robustness
 def fallback_cut_video(input_path, output_path, start, end):
     """Fallback to direct FFmpeg command if MoviePy fails"""
@@ -111,8 +157,26 @@ model_status = {"progress": 100, "status": "initializing", "message": "正準備
 whisper_model = None
 
 # MediaPipe Initialization
-mp_face_detection = mp.solutions.face_detection
-face_detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# MediaPipe Initialization
+try:
+    if not hasattr(mp, 'solutions'):
+        import mediapipe.python.solutions as mp_solutions
+        mp_face_detection = mp_solutions.face_detection
+    else:
+        mp_face_detection = mp.solutions.face_detection
+    
+    face_detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+    print("✅ MediaPipe Face Detection Ready")
+except Exception as e:
+    print(f"⚠️ MediaPipe Init Failed: {e}")
+    # Initialize fallback OpenCV detector as last resort
+    try:
+        import cv2
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        face_detector = "opencv_fallback"
+        print("⚠️ Used OpenCV Haar Classifier as fallback")
+    except:
+        face_detector = None
 
 # Studio Sound (DFN3)
 try:
@@ -124,42 +188,39 @@ except Exception as e:
     df_model = None
 
 def download_whisper_model(model_name="turbo"):
-    global model, model_status
-    import whisper.utils as whisper_utils
-    import urllib.request
+    global whisper_model, model_status
     
-    # Standard location for whisper models
-    import os
-    download_root = os.path.expanduser("~/.cache/whisper")
-    os.makedirs(download_root, exist_ok=True)
-    
-    # Map model name to URL
-    urls = {
-        "turbo": "https://openaipublic.azureedge.net/main/whisper/models/aff2414bc3a43665576983508339ca91069903bc036573e87002bc0519098906/large-v3-turbo.pt"
-    }
-    
-    url = urls.get(model_name)
-    model_path = os.path.join(download_root, f"{model_name}.pt")
-    
-    if os.path.exists(model_path):
-        model_status = {"progress": 100, "status": "ready", "message": "極速模型 Turbo 已就緒"}
-        model = whisper.load_model(model_name)
-        return
-
-    def progress_callback(count, block_size, total_size):
-        progress = int(count * block_size * 100 / total_size)
-        model_status["progress"] = min(100, progress)
-        model_status["status"] = "downloading"
-        model_status["message"] = f"正在下載頂規模型 {model_name} ({progress}%)..."
-
     try:
-        print(f"📥 Starting custom download for {model_name}...")
-        urllib.request.urlretrieve(url, model_path, reporthook=progress_callback)
-        model_status = {"progress": 100, "status": "loading", "message": "下載完成，正在載入記憶體..."}
-        whitelist_model = whisper.load_model(model_path)
-        whisper_model = whitelist_model
-        model_status["status"] = "ready"
-        model_status["message"] = "Whisper Turbo 載入成功！"
+        # Check if model is already cached
+        import os
+        download_root = os.path.expanduser("~/.cache/whisper")
+        
+        # Try to load directly using whisper's built-in download
+        model_status = {"progress": 50, "status": "downloading", "message": f"正在載入 Whisper {model_name} 模型..."}
+        print(f"📥 Loading Whisper model: {model_name}...")
+        
+        # Use official whisper API - it handles download automatically
+        # Fallback order: turbo -> large-v3 -> medium -> base
+        model_options = [model_name, "large-v3", "medium", "base"]
+        
+        loaded_model = None
+        for try_model in model_options:
+            try:
+                print(f"🔄 Trying model: {try_model}...")
+                loaded_model = whisper.load_model(try_model)
+                print(f"✅ Successfully loaded: {try_model}")
+                break
+            except Exception as model_err:
+                print(f"⚠️ Failed to load {try_model}: {model_err}")
+                continue
+        
+        if loaded_model:
+            whisper_model = loaded_model
+            model_status = {"progress": 100, "status": "ready", "message": f"Whisper 模型載入成功！"}
+        else:
+            model_status = {"progress": 0, "status": "error", "message": "所有模型載入失敗"}
+            print("❌ All Whisper model options failed to load")
+            
     except Exception as e:
         model_status = {"progress": 0, "status": "error", "message": f"下載失敗: {str(e)}"}
         print(f"❌ Download error: {e}")
@@ -193,8 +254,23 @@ async def upload_font(file: UploadFile = File(...)):
         font_path = os.path.join(FONTS_DIR, file.filename)
         with open(font_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        print(f"✅ Font uploaded: {file.filename}")
-        return {"message": f"Font {file.filename} uploaded successfully"}
+        font_name = file.filename.rsplit('.', 1)[0]  # Remove extension
+        print(f"✅ Font uploaded: {file.filename} (name: {font_name})")
+        return {"message": f"Font {file.filename} uploaded successfully", "font_name": font_name}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+@app.get("/list-fonts")
+async def list_fonts():
+    try:
+        # Get custom uploaded fonts
+        custom_fonts = []
+        if os.path.exists(FONTS_DIR):
+            for f in os.listdir(FONTS_DIR):
+                if f.endswith(('.ttf', '.otf', '.woff', '.woff2', '.TTF', '.OTF')):
+                    font_name = f.rsplit('.', 1)[0]
+                    custom_fonts.append(font_name)
+        return {"fonts": custom_fonts}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
@@ -361,26 +437,36 @@ def get_smart_crop_plan(clip, width, height, target_w, speaker_weight=5.0, stick
                 # Convert to Gray
                 gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
                 
-                # MediaPipe Face Detection (Instead of Haar)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_detector.process(rgb_frame)
-                
-                if results.detections:
-                    for detection in results.detections:
-                        bbox = detection.location_data.relative_bounding_box
-                        # Convert relative to absolute
-                        fw = bbox.width * width
-                        fh = bbox.height * height
-                        fx_center = (bbox.xmin + bbox.width/2) * width
-                        fy_center = (bbox.ymin + bbox.height/2) * height
-                        
-                        robust_faces.append({
-                            't': t, 'x': fx_center, 'w': fw, 'area': fw*fh
-                        })
-                        # Pick only the first detected face for tracking speed
-                        break
+                if face_detector == "opencv_fallback":
+                     # OpenCV Haar Cascade Logic
+                     faces = face_cascade.detectMultiScale(gray, 1.1, 5)
+                     for (fx, fy, fw, fh) in faces:
+                         fx_center = fx + fw / 2
+                         robust_faces.append({
+                             't': t, 'x': fx_center, 'w': fw, 'area': fw*fh
+                         })
+                         break # One face enough
+                elif face_detector:
+                     # MediaPipe Logic
+                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Actually clip.get_frame usually returns RGB
+                     # Only convert if using raw cv2 capture
+                     # Clip.get_frame returns numpy array RGB usually
+                     results = face_detector.process(frame) 
+                     
+                     if results.detections:
+                         for detection in results.detections:
+                             bbox = detection.location_data.relative_bounding_box
+                             fw = bbox.width * width
+                             fh = bbox.height * height
+                             fx_center = (bbox.xmin + bbox.width/2) * width
+                             
+                             robust_faces.append({
+                                 't': t, 'x': fx_center, 'w': fw, 'area': fw*fh
+                             })
+                             break
             except Exception as e:
-                pass # Specific frame error
+                # print(f"Frame analysis error: {e}")
+                pass
                 
         if not robust_faces:
             print("⚠️ No faces found in clip (or tracking failed). Defaulting to center.")
@@ -694,6 +780,8 @@ async def preview_clip(
     track_stickiness: float = Form(2.0),
     min_shot_duration: float = Form(2.0),
     dynamic_zoom: str = Form("false"),
+    translate_to_chinese: str = Form("false"),
+    whisper_language: str = Form("zh"),
     burn_captions: str = Form("false"),
     subtitle_style: str = Form("classic"),
     subtitle_margin_v: int = Form(220),
@@ -711,6 +799,10 @@ async def preview_clip(
     subtitle_box_padding: int = Form(10),
     subtitle_box_radius: int = Form(0),
     subtitle_margin_h: int = Form(40),
+    subtitle_italic: str = Form("false"),
+    subtitle_shadow_color: str = Form("#000000"),
+    subtitle_shadow_opacity: float = Form(0.8),
+    dfn3_strength: int = Form(100),
     output_resolution: str = Form("1080p"),
     output_quality: str = Form("high")
 ):
@@ -770,10 +862,42 @@ async def preview_clip(
         # Let's generate real one if requested
         if burn_captions == "true" or burn_captions is True:
             try:
+                # --- Handle Output Resolution (Vertical 9:16) for Preview ---
+                # To ensure preview looks correct (not shrunk)
+                target_w, target_h = (1080, 1920) # Default Preview Resolution
+                current_w, current_h = new_clip.size
+                if (current_w, current_h) != (target_w, target_h):
+                    # Only resize if significantly different to save preview time?
+                    # No, better be accurate.
+                    new_clip = new_clip.resize(newsize=(target_w, target_h))
+
                 temp_audio = f"{OUTPUT_DIR}/preview_audio.mp3"
-                new_clip.audio.write_audiofile(temp_audio, logger=None)
-                # Use the upgraded Whisper Turbo model
-                result = whisper_model.transcribe(temp_audio)
+                if new_clip.audio:
+                    new_clip.audio.write_audiofile(temp_audio, logger=None)
+                
+                # Use the upgraded Whisper Turbo model with language hint
+                transcribe_options = {}
+                if whisper_language and whisper_language != "auto":
+                     transcribe_options["language"] = whisper_language
+                     # FORCE TRADITIONAL CHINESE PROMPT
+                     if whisper_language == "zh":
+                         transcribe_options["initial_prompt"] = "以下是繁體中文的字幕。"
+
+                print(f"🗣️ Preview Transcribing with language: {whisper_language}")
+                
+                if new_clip.audio:
+                     result = whisper_model.transcribe(temp_audio, **transcribe_options)
+                else:
+                     result = {"segments": []} # No audio
+                
+                # --- OPTIMIZE SEGMENTS FOR VERTICAL VIDEO ---
+                # Force split long segments to avoid "subtitle wall"
+                opt_max_chars = 18 if aspect_ratio == "9:16" else 30
+                optimized_segments = optimize_segments(result["segments"], max_chars=opt_max_chars)
+                
+                # --- AI Translation for Preview ---
+                # ... (Can be added later if needed)
+                
                 srt_path = output_path.replace(".mp4", ".srt")
                 with open(srt_path, "w", encoding="utf-8") as f:
                     # Smart Wrap based on margins
@@ -786,7 +910,7 @@ async def preview_clip(
                     # Use the smaller of user limit vs safety limit
                     effective_chars = min(int(subtitle_chars_per_line), max_safe_chars) if int(subtitle_chars_per_line) > 0 else max_safe_chars
                     
-                    for idx, s in enumerate(result["segments"]):
+                    for idx, s in enumerate(optimized_segments):
                         wrapped = wrap_text(s['text'], max_chars=effective_chars)
                         f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{wrapped}\n\n")
                 
@@ -799,49 +923,112 @@ async def preview_clip(
                 abs_in = os.path.abspath(output_path)
                 abs_out = os.path.abspath(burned_path)
                 abs_fonts = os.path.abspath(FONTS_DIR)
+                abs_fonts_f = abs_fonts.replace("\\", "/").replace(":", "\\:") # Use correct variable for filter
 
                 # Consistent Style Calculation
                 bold_val = 1 if str(subtitle_bold).lower() == "true" else 0
+                italic_val = 1 if str(subtitle_italic).lower() == "true" else 0
                 final_color_ass = hex_to_ass(subtitle_color)
+                
+                # Boost outline for visibility if white-on-white risk
+                try: outline_width_int = int(subtitle_outline_width)
+                except: outline_width_int = 2
+                if final_color_ass == "&H00FFFFFF" and outline_width_int < 2:
+                    outline_width_int = 3
+
                 outline_color_ass = hex_to_ass(subtitle_outline_color)
                 box_color_ass = hex_to_ass(subtitle_box_color, float(subtitle_box_alpha))
-                shadow_color_ass = "&H00000000" # Solid Black Shadow
+                
+                # Custom Shadow
+                shadow_color_ass = hex_to_ass(subtitle_shadow_color, float(subtitle_shadow_opacity))
                 
                 is_box = (subtitle_box_enabled == "true") or (subtitle_style == "box") or (subtitle_box_enabled == "on")
                 border_style = 3 if is_box else 1
                 
                 try: box_pad_int = int(subtitle_box_padding)
                 except: box_pad_int = 10
-                try: outline_width_int = int(subtitle_outline_width)
-                except: outline_width_int = 2
                 
                 outline_val = box_pad_int if is_box else outline_width_int
                 shadow_val = 0 if is_box else int(subtitle_shadow_size)
+                
+                # FIX: Scale Params for Consistency (Same as Export)
+                target_res_y = 1080
+                if aspect_ratio == "9:16":
+                     target_res_y = 1920
+                
+                scale_factor = target_res_y / 1080.0
+                
+                # CRITICAL FIX: MarginV is 0-200 relative value from Frontend (100 = 50% height)
+                # We must convert this to pixels relative to target_res_y
+                raw_scaled_margin = int(target_res_y * (float(subtitle_margin_v) / 200.0))
+                # CLAMP: Ensure it doesn't fly off screen (max 90% height)
+                scaled_margin_v = min(raw_scaled_margin, int(target_res_y * 0.9))
+                
+                # Font size is 1080p-based pixels, so we scale it normally for 1920p
+                scaled_fontsize = int(float(subtitle_font_size) * scale_factor)
 
+                escaped_font = subtitle_font_name.replace("'", "").replace(":", "") 
+                
                 # Standard ASS Style String
                 style_parts = [
-                    "PlayResY=1080", f"Fontname={subtitle_font_name}", f"Fontsize={subtitle_font_size}",
+                    f"PlayResY={target_res_y}", f"Fontname={escaped_font}", f"Fontsize={scaled_fontsize}",
                     f"PrimaryColour={final_color_ass}", f"SecondaryColour={final_color_ass}",
                     f"OutlineColour={outline_color_ass if not is_box else box_color_ass}",
                     f"BackColour={shadow_color_ass if not is_box else box_color_ass}",
                     f"BorderStyle={border_style}", f"Outline={outline_val}", f"Shadow={shadow_val}",
-                    f"MarginV={subtitle_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
-                    "Alignment=2", f"Bold={bold_val}"
+                    f"MarginV={scaled_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
+                    "Alignment=2", f"Bold={bold_val}", f"Italic={italic_val}"
                 ]
-                escaped_style = ",".join(style_parts).replace(",", "\\,")
+                force_style_arg = ",".join(style_parts)
+
+                # SMART FONT HANDLING (Same as Export)
+                font_in_dir = False
+                for ext in [".ttf", ".otf", ".ttc"]:
+                    if os.path.exists(os.path.join(FONTS_DIR, subtitle_font_name + ext)):
+                        font_in_dir = True
+                        break
+                
+                vf_string = f"subtitles='{safe_srt_path}':force_style='{force_style_arg}'"
+                if font_in_dir:
+                     # Only append fontsdir if we have the file
+                     vf_string = f"subtitles='{safe_srt_path}':fontsdir='{abs_fonts_f}':force_style='{force_style_arg}'"
+                else:
+                     print(f"ℹ️ [Preview] Font '{subtitle_font_name}' not found locally, trying system fonts...")
 
                 cmd = [
                     ffmpeg_exe, "-y", "-i", abs_in, 
-                    "-vf", f"subtitles='{safe_srt_path}':fontsdir='{abs_fonts}':force_style='{escaped_style}'",
+                    "-vf", vf_string,
                     "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_out
                 ]
                 
-                subprocess.run(cmd, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                if os.path.exists(burned_path):
-                    os.remove(output_path)
-                    os.rename(burned_path, output_path)
+                try:
+                    subprocess.run(cmd, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    if os.path.exists(burned_path):
+                        os.remove(output_path)
+                        os.rename(burned_path, output_path)
+                except subprocess.CalledProcessError as e:
+                    err_msg = e.stderr.decode() if e.stderr else "Unknown"
+                    print(f"⚠️ Primary preview burn failed: {err_msg}")
+                    print("🔄 Retrying with system fonts fallback...")
+                    
+                    # Fallback: Remove fontsdir and force_style complexity if needed, or just fontsdir
+                    vf_simple = f"subtitles='{safe_srt_path}':force_style='{force_style_arg}'"
+                    cmd_fallback = [
+                        ffmpeg_exe, "-y", "-i", abs_in, 
+                        "-vf", vf_simple,
+                        "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_out
+                    ]
+                    try:
+                        subprocess.run(cmd_fallback, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                        if os.path.exists(burned_path):
+                            os.remove(output_path)
+                            os.rename(burned_path, output_path)
+                            print("✅ Preview burn succeeded with fallback.")
+                    except subprocess.CalledProcessError as e2:
+                        print(f"❌ Preview fallback burn also failed: {e2.stderr.decode() if e2.stderr else 'Unknown'}")
+
             except Exception as e:
-                print(f"🔥 Preview burn failed: {e}")
+                print(f"🔥 Preview burn exception: {e}")
 
         return FileResponse(output_path, media_type="video/mp4")
         
@@ -858,7 +1045,8 @@ async def process_video(
     aspect_ratio: str = Form("9:16"),
     face_tracking: str = Form("true"),
     auto_caption: str = Form("false"),
-    translate_to_chinese: str = Form("false"), # NEW
+    translate_to_chinese: str = Form("false"),
+    whisper_language: str = Form("zh"), # NEW: Default to Traditional Chinese (zh) which usually handles both, but we can hint it
     api_key: str = Form(None),
     merge_clips: str = Form("false"),
     burn_captions: str = Form("false"),
@@ -886,6 +1074,10 @@ async def process_video(
     subtitle_box_padding: int = Form(10),
     subtitle_box_radius: int = Form(0),
     subtitle_margin_h: int = Form(40),
+    subtitle_italic: str = Form("false"),
+    subtitle_shadow_color: str = Form("#000000"),
+    subtitle_shadow_opacity: float = Form(0.8),
+    dfn3_strength: int = Form(100),
     output_resolution: str = Form("1080p"),
     output_quality: str = Form("high")
 ):
@@ -1015,6 +1207,20 @@ async def process_video(
                     "low": "4000k"
                 }
                 target_bitrate = bitrate_map.get(output_quality, "8000k")
+                
+                # --- Handle Output Resolution (Vertical 9:16) ---
+                resolution_map = {
+                    "1080x1920": (1080, 1920),
+                    "720x1280": (720, 1280),
+                    "1080p": (1080, 1920),  # Legacy support
+                    "720p": (720, 1280),    # Legacy support
+                }
+                if output_resolution in resolution_map:
+                    target_w, target_h = resolution_map[output_resolution]
+                    current_w, current_h = new_clip.size
+                    if (current_w, current_h) != (target_w, target_h):
+                        print(f"📐 Scaling output: {current_w}x{current_h} → {target_w}x{target_h}")
+                        new_clip = new_clip.resize(newsize=(target_w, target_h))
 
                 # --- 3. Write RAW Video First (Required for FFmpeg Burning) ---
                 try:
@@ -1022,7 +1228,7 @@ async def process_video(
                         output_path, 
                         codec="libx264", 
                         audio_codec="aac",
-                        bitrate=target_bitrate_mw,
+                        bitrate=target_bitrate,
                         audio_bitrate="192k",
                         preset="fast",
                         logger=None,
@@ -1048,15 +1254,29 @@ async def process_video(
                         # Use temp audio for speed and to avoid codec issues in direct transcription
                         temp_audio_path = os.path.join(OUTPUT_DIR, f"temp_audio_{i}.mp3")
                         new_clip.audio.write_audiofile(temp_audio_path, logger=None)
-                        # Use the upgraded Whisper Turbo model
-                        result = whisper_model.transcribe(temp_audio_path)
+                        new_clip.audio.write_audiofile(temp_audio_path, logger=None)
+                        # Use the upgraded Whisper Turbo model with language hint
+                        transcribe_options = {}
+                        if whisper_language and whisper_language != "auto":
+                             transcribe_options["language"] = whisper_language
+                             # FORCE TRADITIONAL CHINESE PROMPT
+                             if whisper_language == "zh":
+                                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕。"
+
+                        print(f"🗣️ Transcribing with language: {whisper_language}")
+                        result = whisper_model.transcribe(temp_audio_path, **transcribe_options)
+                        
+                        # --- OPTIMIZE SEGMENTS FOR VERTICAL VIDEO ---
+                        # Force split long segments to avoid "subtitle wall"
+                        opt_max_chars = 18 if aspect_ratio == "9:16" or output_resolution == "1080x1920" else 30
+                        optimized_segments = optimize_segments(result["segments"], max_chars=opt_max_chars)
                         
                         # 4b. AI Translation (Gemini)
                         if (translate_to_chinese == "true" or translate_to_chinese is True) and api_key and api_key != "null":
                              try:
                                  print(f"🇨🇳 Translating SRT for clip {i+1} using Gemini...")
                                  segments_text = ""
-                                 for idx, s in enumerate(result["segments"]):
+                                 for idx, s in enumerate(optimized_segments):
                                      segments_text += f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{s['text']}\n\n"
                                  
                                  target_model = model_name if model_name else "gemini-2.0-flash-exp"
@@ -1076,7 +1296,7 @@ async def process_video(
                              except Exception as te:
                                  print(f"⚠️ Translation failed: {te}")
                                  with open(srt_path, "w", encoding="utf-8") as f:
-                                     for idx, s in enumerate(result["segments"]):
+                                     for idx, s in enumerate(optimized_segments):
                                          wrapped = wrap_text(s['text'], max_chars=subtitle_chars_per_line)
                                          f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{wrapped}\n\n")
                         else:
@@ -1084,12 +1304,24 @@ async def process_video(
                              with open(srt_path, "w", encoding="utf-8") as f:
                                  # Smart Wrap (Same as preview)
                                  total_w_units = 608 if aspect_ratio == "9:16" else 1920
-                                 available_w = total_w_units - (int(subtitle_margin_h) * 2)
-                                 max_safe_chars = max(1, int(available_w / (float(subtitle_font_size) * 0.9)))
-                                 effective_chars = min(int(subtitle_chars_per_line), max_safe_chars) if int(subtitle_chars_per_line) > 0 else max_safe_chars
+                                 
+                                 # CRITICAL: Force wrap for 9:16 to avoid "exploded" text
+                                 if aspect_ratio == "9:16" or output_resolution == "1080x1920":
+                                     # Force strict limit for vertical video
+                                     effective_chars = min(int(subtitle_chars_per_line), 10) if int(subtitle_chars_per_line) > 0 else 10
+                                 else:
+                                     available_w = total_w_units - (int(subtitle_margin_h) * 2)
+                                     max_safe_chars = max(1, int(available_w / (float(subtitle_font_size) * 0.9)))
+                                     effective_chars = min(int(subtitle_chars_per_line), max_safe_chars) if int(subtitle_chars_per_line) > 0 else max_safe_chars
 
-                                 for idx, s in enumerate(result["segments"]):
+                                 for idx, s in enumerate(optimized_segments):
+                                     # Extra safety: Ensure max 2 lines
                                      wrapped = wrap_text(s['text'], max_chars=effective_chars)
+                                     lines = wrapped.split('\n')
+                                     if len(lines) > 2:
+                                          # Re-wrap aggressively if too many lines
+                                          wrapped = wrap_text(s['text'], max_chars=effective_chars + 2)
+                                     
                                      f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{wrapped}\n\n")
 
                         try: os.remove(temp_audio_path)
@@ -1102,10 +1334,13 @@ async def process_video(
                                 
                                 # Use Consistent Global hex_to_ass calculations
                                 bold_val = 1 if str(subtitle_bold).lower() == "true" else 0
+                                italic_val = 1 if str(subtitle_italic).lower() == "true" else 0
                                 final_color_ass = hex_to_ass(subtitle_color)
-                                box_color_ass = hex_to_ass(subtitle_box_color, subtitle_box_alpha)
+                                box_color_ass = hex_to_ass(subtitle_box_color, float(subtitle_box_alpha))
                                 outline_color_ass = hex_to_ass(subtitle_outline_color)
-                                shadow_color_ass = "&H00000000" # Black shadow
+                                
+                                # Custom Shadow
+                                shadow_color_ass = hex_to_ass(subtitle_shadow_color, float(subtitle_shadow_opacity))
 
                                 is_box = (subtitle_box_enabled == "true") or (subtitle_style == "box") or (subtitle_box_enabled == "on")
                                 border_style = 3 if is_box else 1
@@ -1114,42 +1349,113 @@ async def process_video(
                                 except: box_pad_int = 10
                                 try: outline_width_int = int(subtitle_outline_width)
                                 except: outline_width_int = 2
-                
+                                
+                                # Boost outline for visibility if white-on-white risk
+                                if final_color_ass == "&H00FFFFFF" and outline_width_int < 2:
+                                    outline_width_int = 3
+
                                 outline_val = box_pad_int if is_box else outline_width_int
                                 shadow_val = 0 if is_box else int(subtitle_shadow_size)
                                 
                                 # Standard ASS Style String
+                                # FIX: PlayResY should match video height (e.g. 1920 for 9:16)
+                                target_res_y = 1080
+                                if output_resolution == "1080x1920" or aspect_ratio == "9:16":
+                                     target_res_y = 1920
+                                elif output_resolution == "720x1280":
+                                     target_res_y = 1280
+                                
+                                # FIX: Fontname escaping logic
+                                escaped_font = subtitle_font_name.replace("'", "").replace(":", "") 
+                                
+                                # FIX: Scale Params for Consistency
+                                # Frontend likely designs based on ~1080p visual height.
+                                # If output is 1920p (vertical), we must scale up margins and fonts to assume same relative position.
+                                scale_factor = target_res_y / 1080.0
+                                
+                                # CRITICAL FIX: MarginV is 0-200 relative value from Frontend (100 = 50% height)
+                                raw_scaled_margin = int(target_res_y * (float(subtitle_margin_v) / 200.0))
+                                # CLAMP: Ensure it doesn't fly off screen
+                                scaled_margin_v = min(raw_scaled_margin, int(target_res_y * 0.9))
+                                
+                                # Font size is 1080p-based pixels
+                                scaled_fontsize = int(float(subtitle_font_size) * scale_factor)
+                                
                                 style_parts = [
-                                    "PlayResY=1080", f"Fontname={subtitle_font_name}", f"Fontsize={subtitle_font_size}",
+                                    f"PlayResY={target_res_y}", f"Fontname={escaped_font}", f"Fontsize={scaled_fontsize}",
                                     f"PrimaryColour={final_color_ass}", f"SecondaryColour={final_color_ass}",
                                     f"OutlineColour={outline_color_ass if not is_box else box_color_ass}",
                                     f"BackColour={shadow_color_ass if not is_box else box_color_ass}",
                                     f"BorderStyle={border_style}", f"Outline={outline_val}", f"Shadow={shadow_val}",
-                                    f"MarginV={subtitle_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
-                                    "Alignment=2", f"Bold={bold_val}"
+                                    f"MarginV={scaled_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
+                                    "Alignment=2", f"Bold={bold_val}", f"Italic={italic_val}"
                                 ]
-                                escaped_style = ",".join(style_parts).replace(",", "\\,")
+                                force_style_arg = ",".join(style_parts)
                                 
-                                abs_srt_path = os.path.abspath(srt_path).replace("\\", "/").replace(":", "\\:")
-                                abs_input_path = os.path.abspath(output_path)
+                                # Define absolute paths clearly (FIX: Ensure all path vars are defined)
                                 burned_output_path = output_path.replace(".mp4", "_burned.mp4")
+                                abs_input_path = os.path.abspath(output_path)
                                 abs_output_path = os.path.abspath(burned_output_path)
+                                abs_srt_path = os.path.abspath(srt_path)
                                 abs_fonts = os.path.abspath(FONTS_DIR)
                                 
+                                # Use proper path formatting
+                                abs_srt_path_f = abs_srt_path.replace("\\", "/").replace(":", "\\:")
+                                abs_fonts_f = abs_fonts.replace("\\", "/").replace(":", "\\:")
+
+                                # SMART FONT HANDLING:
+                                # Only use fontsdir if the font file actually exists there.
+                                # Otherwise, let ffmpeg use fontconfig to find system fonts.
+                                font_in_dir = False
+                                for ext in [".ttf", ".otf", ".ttc"]:
+                                    if os.path.exists(os.path.join(FONTS_DIR, subtitle_font_name + ext)):
+                                        font_in_dir = True
+                                        break
+                                
+                                vf_string = f"subtitles='{abs_srt_path_f}':force_style='{force_style_arg}'"
+                                if font_in_dir:
+                                     # Only append fontsdir if we have the file
+                                     vf_string = f"subtitles='{abs_srt_path_f}':fontsdir='{abs_fonts_f}':force_style='{force_style_arg}'"
+                                else:
+                                     print(f"ℹ️ Font '{subtitle_font_name}' not found in local dir, trying system fonts...")
+
                                 cmd = [
                                     imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", abs_input_path,
-                                    "-vf", f"subtitles='{abs_srt_path}':fontsdir='{abs_fonts}':force_style='{escaped_style}'",
+                                    "-vf", vf_string,
                                     "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_output_path
                                 ]
                                 
-                                subprocess.run(cmd, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                                if os.path.exists(burned_output_path):
-                                    os.remove(output_path)
-                                    os.rename(burned_output_path, output_path)
-                            except Exception as e:
-                                print(f"⚠️ Burn failed for clip {i+1}: {e}")
-                            else:
-                                print(f"✅ Captions burned for clip {i+1}")
+                                try:
+                                    # Attempt 1
+                                    subprocess.run(cmd, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                    if os.path.exists(burned_output_path):
+                                        os.remove(output_path)
+                                        os.rename(burned_output_path, output_path)
+                                except subprocess.CalledProcessError as e:
+                                    err_msg = e.stderr.decode() if e.stderr else "Unknown"
+                                    print(f"⚠️ Primary burn failed for clip {i+1}: {err_msg}")
+                                    print("🔄 Retrying with system fonts fallback...")
+                                    
+                                    # Fallback: Simple subtitles filter (without fontsdir)
+                                    vf_simple = f"subtitles='{abs_srt_path_f}':force_style='{force_style_arg}'"
+                                    cmd_fallback = [
+                                        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", abs_input_path,
+                                        "-vf", vf_simple,
+                                        "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_output_path
+                                    ]
+                                    
+                                    subprocess.run(cmd_fallback, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                    if os.path.exists(burned_output_path):
+                                        os.remove(output_path)
+                                        os.rename(burned_output_path, output_path)
+                                        print(f"✅ Fallback burn succeeded for clip {i+1}")
+
+                                except Exception as e:
+                                    print(f"⚠️ Burn exception for clip {i+1}: {e}")
+                                else:
+                                    print(f"✅ Captions burned for clip {i+1}")
+                            except Exception as outer_e:
+                                print(f"🔥 Critical burn error clip {i+1}: {outer_e}")
                                 
                     except Exception as we:
                         print(f"⚠️ Transcription process failed: {we}")

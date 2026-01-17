@@ -34,7 +34,7 @@ function App() {
   const [isFaceTracking, setIsFaceTracking] = useState(true);
   const [isStudioSound, setIsStudioSound] = useState(true);
   const [isAutoCaption, setIsAutoCaption] = useState(true);
-  const [isTranslate, setIsTranslate] = useState(true);
+  const [isTranslate, setIsTranslate] = useState(false); // Default false, Whisper directly outputs Chinese
   const [isBurnCaptions, setIsBurnCaptions] = useState(true);
 
   // 進階參數
@@ -45,7 +45,7 @@ function App() {
   // 字幕樣式
   const [subtitleFontSize, setSubtitleFontSize] = useState(72);
   const [subtitleColor, setSubtitleColor] = useState('#FFFFFF');
-  const [subtitleFontName, setSubtitleFontName] = useState('Arial Black');
+  const [subtitleFontName, setSubtitleFontName] = useState('Heiti TC'); // Default to a Chinese font
   const [subtitleOutlineWidth, setSubtitleOutlineWidth] = useState(4);
   const [subtitleOutlineColor, setSubtitleOutlineColor] = useState('#000000');
   const [subtitleMarginV, setSubtitleMarginV] = useState(100);
@@ -67,8 +67,12 @@ function App() {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const [draggingCut, setDraggingCut] = useState<{ id: string, edge: 'start' | 'end' | 'move', initialX: number, initialStart: number, initialEnd: number } | null>(null);
   const [systemStatus, setSystemStatus] = useState({ progress: 100, status: 'ready', message: '就緒' });
-  const [fontList, setFontList] = useState(['Arial Black', 'Helvetica', 'Times New Roman', 'Inter', 'Outfit']);
+  const [fontList, setFontList] = useState(['Heiti TC', 'PingFang TC', 'Microsoft JhengHei', 'Arial Black', 'Helvetica', 'Inter']);
+  const [outputQuality, setOutputQuality] = useState('high');
+  const [outputResolution, setOutputResolution] = useState('1080x1920');
+  const [whisperLanguage, setWhisperLanguage] = useState('zh');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -76,18 +80,48 @@ function App() {
   const wavesurferRef = useRef<WaveSurfer | null>(null);
 
   useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+
     const pollStatus = async () => {
       try {
-        const res = await fetch('http://localhost:8000/status');
+        const res = await fetch('http://localhost:8000/model-status');
         if (res.ok) {
           const data = await res.json();
           setSystemStatus(data);
+          // Stop polling once model is ready
+          if (data.status === 'ready' && timer) {
+            clearInterval(timer);
+            timer = null;
+          }
         }
       } catch (e) { }
     };
-    const timer = setInterval(pollStatus, 2000);
+
+    timer = setInterval(pollStatus, 2000);
     pollStatus();
-    return () => clearInterval(timer);
+
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, []);
+
+  // Load available fonts from server
+  useEffect(() => {
+    const loadFonts = async () => {
+      try {
+        const res = await fetch('http://localhost:8000/list-fonts');
+        if (res.ok) {
+          const data = await res.json();
+          if (data.fonts && data.fonts.length > 0) {
+            setFontList(prev => {
+              const combined = [...new Set([...prev, ...data.fonts])];
+              return combined;
+            });
+          }
+        }
+      } catch (e) { /* Server not running */ }
+    };
+    loadFonts();
   }, []);
 
   // Initialize WaveSurfer
@@ -177,8 +211,14 @@ function App() {
     if (!videoFile) return;
     setIsPreviewLoading(true);
     setPreviewingId(cut.id);
+    setPreviewProgress(0);
+
+    // Simulate progress
+    const progressInterval = setInterval(() => {
+      setPreviewProgress(prev => Math.min(prev + Math.random() * 10, 95));
+    }, 500);
     const formData = new FormData();
-    formData.append('video', videoFile);
+    formData.append('file', videoFile);
     formData.append('start', cut.start.toString());
     formData.append('end', cut.end.toString());
     formData.append('face_tracking', isFaceTracking.toString());
@@ -191,15 +231,35 @@ function App() {
     formData.append('subtitle_font_size', subtitleFontSize.toString());
     formData.append('subtitle_color', subtitleColor);
     formData.append('subtitle_outline_width', subtitleOutlineWidth.toString());
+    formData.append('subtitle_outline_color', subtitleOutlineColor);
     formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
+    formData.append('whisper_language', whisperLanguage);
+
+    // Missing Params Added
+    formData.append('subtitle_margin_v', subtitleMarginV.toString());
+    formData.append('subtitle_bold', subtitleBold.toString());
+    formData.append('subtitle_italic', subtitleItalic.toString());
+    formData.append('subtitle_shadow_size', subtitleShadowSize.toString());
+    formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
+    formData.append('subtitle_box_color', subtitleBgColor);
+    formData.append('subtitle_box_alpha', (subtitleBgOpacity / 100).toString());
+
 
     try {
       const res = await fetch('http://localhost:8000/preview-clip', { method: 'POST', body: formData });
       if (res.ok) {
         const blob = await res.blob();
         setPreviewUrl(URL.createObjectURL(blob));
+      } else {
+        const errorData = await res.json().catch(() => ({ detail: '預覽生成失敗' }));
+        alert(`預覽失敗: ${errorData.detail || res.statusText}`);
       }
-    } catch (e) { }
+    } catch (e) {
+      alert('無法連接後端服務，請確認 server.py 正在運行');
+    }
+    clearInterval(progressInterval);
+    setPreviewProgress(100);
+    setTimeout(() => setPreviewProgress(0), 500);
     setIsPreviewLoading(false);
     setPreviewingId(null);
   };
@@ -207,10 +267,16 @@ function App() {
   const handleExport = async () => {
     if (cuts.length === 0) return;
     setIsExporting(true);
+    setExportProgress(0);
+
+    // Simulate progress
+    const progressInterval = setInterval(() => {
+      setExportProgress(prev => Math.min(prev + Math.random() * 5, 95));
+    }, 800);
 
     const formData = new FormData();
-    formData.append('video', videoFile!);
-    formData.append('cuts', JSON.stringify(cuts));
+    formData.append('file', videoFile!);
+    formData.append('cuts_json', JSON.stringify(cuts));
     formData.append('face_tracking', isFaceTracking.toString());
     formData.append('studio_sound', isStudioSound.toString());
     formData.append('dfn3_strength', dfn3Strength.toString());
@@ -221,7 +287,21 @@ function App() {
     formData.append('subtitle_font_size', subtitleFontSize.toString());
     formData.append('subtitle_color', subtitleColor);
     formData.append('subtitle_outline_width', subtitleOutlineWidth.toString());
+    formData.append('subtitle_outline_color', subtitleOutlineColor);
     formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
+
+    // Missing Params Added
+    formData.append('subtitle_margin_v', subtitleMarginV.toString());
+    formData.append('subtitle_bold', subtitleBold.toString());
+    formData.append('subtitle_italic', subtitleItalic.toString());
+    formData.append('subtitle_shadow_size', subtitleShadowSize.toString());
+    formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
+    formData.append('subtitle_box_color', subtitleBgColor);
+    formData.append('subtitle_box_alpha', (subtitleBgOpacity / 100).toString());
+
+    formData.append('output_quality', outputQuality);
+    formData.append('output_resolution', outputResolution);
+    formData.append('whisper_language', whisperLanguage);
 
     try {
       const res = await fetch('http://localhost:8000/process-video', { method: 'POST', body: formData });
@@ -232,8 +312,16 @@ function App() {
         a.href = url;
         a.download = `Antigravity_Cuts_${new Date().getTime()}.zip`;
         a.click();
+      } else {
+        const errorData = await res.json().catch(() => ({ detail: '匯出失敗' }));
+        alert(`匯出失敗: ${errorData.detail || res.statusText}`);
       }
-    } catch (e) { }
+    } catch (e) {
+      alert('無法連接後端服務，請確認 server.py 正在運行');
+    }
+    clearInterval(progressInterval);
+    setExportProgress(100);
+    setTimeout(() => setExportProgress(0), 500);
     setIsExporting(false);
   };
 
@@ -244,12 +332,45 @@ function App() {
   const seekTo = (time: number) => { if (videoRef.current) videoRef.current.currentTime = time; };
 
   const handleTimelineClick = (e: React.MouseEvent) => {
+    if (draggingCut) return; // Don't seek when dragging
     if (timelineRef.current) {
       const rect = timelineRef.current.getBoundingClientRect();
       const pos = (e.clientX - rect.left) / rect.width;
       const targetTime = pos * duration;
       seekTo(targetTime);
     }
+  };
+
+  const handleCutDragStart = (e: React.MouseEvent, cutId: string, edge: 'start' | 'end' | 'move') => {
+    e.stopPropagation();
+    const cut = cuts.find(c => c.id === cutId);
+    if (cut) {
+      setDraggingCut({ id: cutId, edge, initialX: e.clientX, initialStart: cut.start, initialEnd: cut.end });
+    }
+  };
+
+  const handleCutDrag = (e: React.MouseEvent) => {
+    if (!draggingCut || !timelineRef.current) return;
+    const rect = timelineRef.current.getBoundingClientRect();
+    const deltaX = e.clientX - draggingCut.initialX;
+    const deltaTime = (deltaX / rect.width) * duration;
+
+    if (draggingCut.edge === 'start') {
+      const newStart = Math.max(0, Math.min(draggingCut.initialEnd - 0.5, draggingCut.initialStart + deltaTime));
+      updateCutTime(draggingCut.id, 'start', newStart);
+    } else if (draggingCut.edge === 'end') {
+      const newEnd = Math.max(draggingCut.initialStart + 0.5, Math.min(duration, draggingCut.initialEnd + deltaTime));
+      updateCutTime(draggingCut.id, 'end', newEnd);
+    } else { // move
+      const clipDuration = draggingCut.initialEnd - draggingCut.initialStart;
+      let newStart = draggingCut.initialStart + deltaTime;
+      newStart = Math.max(0, Math.min(duration - clipDuration, newStart));
+      setCuts(cuts.map(c => c.id === draggingCut.id ? { ...c, start: newStart, end: newStart + clipDuration } : c));
+    }
+  };
+
+  const handleCutDragEnd = () => {
+    setDraggingCut(null);
   };
 
   // Wrap text based on chars per line (each character = 1)
@@ -317,7 +438,7 @@ function App() {
           <span>Antigravity Cut <small>v3.0</small></span>
         </div>
         <div className="api-status">
-          {apiKey ? <span className="status-badge success">AI Ready</span> : <span className="status-badge warning" onClick={() => setShowApiSettings(true)}>Set API Key</span>}
+          {/* Empty space - API Key moved to sidebar */}
         </div>
       </header>
 
@@ -362,10 +483,30 @@ function App() {
                   ref={timelineRef}
                   className="markers-track"
                   onClick={handleTimelineClick}
+                  onMouseMove={handleCutDrag}
+                  onMouseUp={handleCutDragEnd}
+                  onMouseLeave={handleCutDragEnd}
                 >
                   <div className="playhead" style={{ left: `${(currentTime / (duration || 1)) * 100}%` }} />
                   {cuts.map(cut => (
-                    <div key={cut.id} className="cut-marker" style={{ left: `${(cut.start / (duration || 1)) * 100}%`, width: `${((cut.end - cut.start) / (duration || 1)) * 100}%` }} />
+                    <div
+                      key={cut.id}
+                      className={`cut-marker ${draggingCut?.id === cut.id ? 'dragging' : ''}`}
+                      style={{ left: `${(cut.start / (duration || 1)) * 100}%`, width: `${((cut.end - cut.start) / (duration || 1)) * 100}%` }}
+                    >
+                      <div
+                        className="cut-edge cut-edge-start"
+                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'start')}
+                      />
+                      <div
+                        className="cut-center"
+                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'move')}
+                      />
+                      <div
+                        className="cut-edge cut-edge-end"
+                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'end')}
+                      />
+                    </div>
                   ))}
                 </div>
               </div>
@@ -435,13 +576,18 @@ function App() {
                   <div className="section-header">
                     <Film size={16} className="icon-primary" />
                     <span>專案與模型配置</span>
-                    <button onClick={() => setShowApiSettings(!showApiSettings)} className={`toggle-btn-sm ${apiKey ? 'active' : ''}`}><Key size={14} /></button>
+                    <button onClick={() => setShowApiSettings(!showApiSettings)} className={`toggle-btn-sm ${apiKey ? 'active' : ''}`}>
+                      <Key size={14} />
+                    </button>
                   </div>
 
                   <AnimatePresence>
                     {showApiSettings && (
                       <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="settings-drawer">
-                        <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Gemini API Key..." className="api-input-sm" />
+                        <div className="api-key-row">
+                          <Key size={14} className="icon-dim" />
+                          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="輸入 Gemini API Key..." className="api-input-inline" />
+                        </div>
                         <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)} className="select-sm">
                           <option value="gemini-3.0-flash">Gemini 3.0 Flash</option>
                           <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
@@ -502,8 +648,17 @@ function App() {
                     </label>
                     {isAutoCaption && (
                       <div className="caption-sub-settings">
-                        <label className="checkbox-inline"><input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} /><span>繁體中文翻譯</span></label>
-                        <label className="checkbox-inline"><input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} /><span>燒錄至影片</span></label>
+                        <div className="style-row-inline" style={{ marginBottom: '8px' }}>
+                          <span className="style-label" style={{ minWidth: '60px' }}>轉錄語言</span>
+                          <select value={whisperLanguage} onChange={e => setWhisperLanguage(e.target.value)} className="select-xs" style={{ flex: 1 }}>
+                            <option value="zh">繁體中文 (Chinese)</option>
+                            <option value="en">英文 (English)</option>
+                            <option value="ja">日文 (Japanese)</option>
+                            <option value="auto">自動偵測 (Auto)</option>
+                          </select>
+                        </div>
+                        <label className="checkbox-inline"><input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} /><span>繁體中文翻譯 (Gemini)</span></label>
+                        <label className="checkbox-inline"><input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} /><span>燒錄至影片 (硬字幕)</span></label>
                       </div>
                     )}
                   </div>
@@ -517,9 +672,38 @@ function App() {
                     {/* Font Selection */}
                     <div className="style-item" style={{ marginBottom: '16px' }}>
                       <label>字體系統</label>
-                      <select value={subtitleFontName} onChange={e => setSubtitleFontName(e.target.value)} className="select-sm">
-                        {fontList.map(f => <option key={f} value={f}>{f}</option>)}
-                      </select>
+                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                        <select value={subtitleFontName} onChange={e => setSubtitleFontName(e.target.value)} className="select-sm" style={{ flex: 1 }}>
+                          {fontList.map(f => <option key={f} value={f}>{f}</option>)}
+                        </select>
+                        <input
+                          type="file"
+                          accept=".ttf,.otf,.woff,.woff2"
+                          style={{ display: 'none' }}
+                          id="font-upload"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            const formData = new FormData();
+                            formData.append('file', file);
+                            try {
+                              const res = await fetch('http://localhost:8000/upload-font', { method: 'POST', body: formData });
+                              if (res.ok) {
+                                const data = await res.json();
+                                const fontName = data.font_name || file.name.replace(/\.[^/.]+$/, '');
+                                setFontList(prev => [...new Set([...prev, fontName])]);
+                                setSubtitleFontName(fontName);
+                                alert(`字體 "${fontName}" 上傳成功！`);
+                              }
+                            } catch {
+                              alert('字體上傳失敗，請確認後端服務運行中');
+                            }
+                          }}
+                        />
+                        <label htmlFor="font-upload" className="btn-icon-sm" style={{ cursor: 'pointer', padding: '6px 10px' }}>
+                          <Upload size={14} />
+                        </label>
+                      </div>
                     </div>
 
                     {/* Font Size Slider */}
@@ -645,7 +829,7 @@ function App() {
                       <div key={cut.id} className="cut-card">
                         <div className="cut-header">
                           <input className="cut-label-input" value={cut.label} onChange={(e) => updateCutLabel(cut.id, e.target.value)} />
-                          <button onClick={() => setCuts(cuts.filter(c => c.id !== cut.id))} className="btn-delete"><Trash size={12} /></button>
+                          <button onClick={() => setCuts(cuts.filter(c => c.id !== cut.id))} className="btn-delete"><Trash size={14} /></button>
                         </div>
                         <div className="cut-time-inputs">
                           <div className="time-input-group">
@@ -653,6 +837,8 @@ function App() {
                             <input
                               type="number"
                               step="0.1"
+                              min="0"
+                              max={cut.end - 0.5}
                               value={cut.start.toFixed(1)}
                               onChange={(e) => updateCutTime(cut.id, 'start', parseFloat(e.target.value) || 0)}
                               className="time-input"
@@ -664,6 +850,8 @@ function App() {
                             <input
                               type="number"
                               step="0.1"
+                              min={cut.start + 0.5}
+                              max={duration}
                               value={cut.end.toFixed(1)}
                               onChange={(e) => updateCutTime(cut.id, 'end', parseFloat(e.target.value) || 0)}
                               className="time-input"
@@ -672,17 +860,65 @@ function App() {
                           </div>
                           <span className="cut-duration">({(cut.end - cut.start).toFixed(1)}s)</span>
                         </div>
-                        <button className={`btn-preview-xs ${previewingId === cut.id ? 'active' : ''}`} onClick={() => handlePreview(cut)} disabled={isPreviewLoading}>
-                          {previewingId === cut.id ? <Loader2 className="spin" size={10} /> : <Play size={10} />} 預覽此片段
-                        </button>
+                        {/* Time Range Sliders */}
+                        <div className="cut-slider-row">
+                          <label>開始</label>
+                          <input
+                            type="range"
+                            min="0"
+                            max={duration}
+                            step="0.1"
+                            value={cut.start}
+                            onChange={(e) => updateCutTime(cut.id, 'start', parseFloat(e.target.value))}
+                            className="cut-slider"
+                          />
+                        </div>
+                        <div className="cut-slider-row">
+                          <label>結束</label>
+                          <input
+                            type="range"
+                            min="0"
+                            max={duration}
+                            step="0.1"
+                            value={cut.end}
+                            onChange={(e) => updateCutTime(cut.id, 'end', parseFloat(e.target.value))}
+                            className="cut-slider"
+                          />
+                        </div>
+                        <div className="cut-actions">
+                          <button className="btn-seek" onClick={() => seekTo(cut.start)}>
+                            <Play size={12} /> 跳轉開始
+                          </button>
+                          <button className={`btn-preview-xs ${previewingId === cut.id ? 'active' : ''}`} onClick={() => handlePreview(cut)} disabled={isPreviewLoading}>
+                            {previewingId === cut.id ? <Loader2 className="spin" size={12} /> : <Play size={12} />} 預覽此片段
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
                 </div>
               </div>
 
-              {/* 5. Footer Export */}
+              {/* 5. Output Settings & Export */}
               <div className="controls-footer">
+                <div className="output-settings">
+                  <div className="output-row">
+                    <label>畫質</label>
+                    <select value={outputQuality} onChange={e => setOutputQuality(e.target.value)} className="select-xs">
+                      <option value="high">高畫質 (20Mbps)</option>
+                      <option value="medium">中畫質 (8Mbps)</option>
+                      <option value="low">低畫質 (4Mbps)</option>
+                    </select>
+                  </div>
+                  <div className="output-row">
+                    <label>解析度 (9:16)</label>
+                    <select value={outputResolution} onChange={e => setOutputResolution(e.target.value)} className="select-xs">
+                      <option value="1080x1920">1080×1920</option>
+                      <option value="720x1280">720×1280</option>
+                      <option value="original">原始比例</option>
+                    </select>
+                  </div>
+                </div>
                 <button onClick={() => handleExport()} disabled={cuts.length === 0 || isExporting} className="btn-export-main">
                   {isExporting ? <Loader2 className="spin" size={18} /> : <><Download size={18} /> 匯出全部片段</>}
                 </button>
@@ -694,6 +930,18 @@ function App() {
 
 
       </main>
+
+      {/* Bottom Progress Bar */}
+      {(isPreviewLoading || isExporting) && (
+        <div className="progress-bar-bottom">
+          <div className="progress-bar-fill" style={{ width: `${isExporting ? exportProgress : previewProgress}%` }} />
+          <div className="progress-bar-content">
+            <Loader2 className="spin" size={16} />
+            <span>{isExporting ? '匯出處理中' : '預覽生成中'}</span>
+            <span className="progress-percent">{Math.round(isExporting ? exportProgress : previewProgress)}%</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
