@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# App specific
+uploads/
+exports/
+local_bin/
+*.wav

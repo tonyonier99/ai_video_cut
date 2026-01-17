@@ -32,7 +32,7 @@ function App() {
 
   // AI 核心功能
   const [isFaceTracking, setIsFaceTracking] = useState(true);
-  const [isStudioSound, setIsStudioSound] = useState(true);
+  const [isStudioSound, setIsStudioSound] = useState(false); // Default disabled
   const [isAutoCaption, setIsAutoCaption] = useState(true);
   const [isTranslate, setIsTranslate] = useState(false); // Default false, Whisper directly outputs Chinese
   const [isBurnCaptions, setIsBurnCaptions] = useState(true);
@@ -43,25 +43,25 @@ function App() {
   const [dfn3Strength, setDfn3Strength] = useState(100);
 
   // 字幕樣式
-  const [subtitleFontSize, setSubtitleFontSize] = useState(72);
+  const [subtitleFontSize, setSubtitleFontSize] = useState(55);
   const [subtitleColor, setSubtitleColor] = useState('#FFFFFF');
   const [subtitleFontName, setSubtitleFontName] = useState('Heiti TC'); // Default to a Chinese font
   const [subtitleOutlineWidth, setSubtitleOutlineWidth] = useState(4);
   const [subtitleOutlineColor, setSubtitleOutlineColor] = useState('#000000');
-  const [subtitleMarginV, setSubtitleMarginV] = useState(100);
-  const [subtitleBold, setSubtitleBold] = useState(true);
+  const [subtitleMarginV, setSubtitleMarginV] = useState(50);
+  const [subtitleBold, setSubtitleBold] = useState(false); // Default disabled
   const [subtitleItalic, setSubtitleItalic] = useState(false);
   const [subtitleShadowSize, setSubtitleShadowSize] = useState(3);
-  const [subtitleShadowAngle, setSubtitleShadowAngle] = useState(135);
+  // Removed unsupported Angle (Fixed to 135/45 deg in backend)
   const [subtitleShadowColor, setSubtitleShadowColor] = useState('#000000');
   const [subtitleShadowOpacity, setSubtitleShadowOpacity] = useState(80);
-  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(12);
+  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(8);
   const [subtitleBgEnabled, setSubtitleBgEnabled] = useState(false);
   const [subtitleBgColor, setSubtitleBgColor] = useState('#000000');
   const [subtitleBgOpacity, setSubtitleBgOpacity] = useState(50);
-  const [subtitleBgRadius, setSubtitleBgRadius] = useState(8);
+  // Removed unsupported Radius
   const [showSafeArea, setShowSafeArea] = useState(true);
-  const [previewText, setPreviewText] = useState('預覽文字內容');
+  const [previewText, setPreviewText] = useState('預覽文字內容Test123456');
   const [isDraggingSubtitle, setIsDraggingSubtitle] = useState(false);
 
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -69,7 +69,7 @@ function App() {
   const [previewingId, setPreviewingId] = useState<string | null>(null);
   const [draggingCut, setDraggingCut] = useState<{ id: string, edge: 'start' | 'end' | 'move', initialX: number, initialStart: number, initialEnd: number } | null>(null);
   const [systemStatus, setSystemStatus] = useState({ progress: 100, status: 'ready', message: '就緒' });
-  const [fontList, setFontList] = useState(['Heiti TC', 'PingFang TC', 'Microsoft JhengHei', 'Arial Black', 'Helvetica', 'Inter']);
+  const [fontList, setFontList] = useState(['Arial', 'Sans-serif']); // Remove client-local fonts that backend doesn't have
   const [outputQuality, setOutputQuality] = useState('high');
   const [outputResolution, setOutputResolution] = useState('1080x1920');
   const [whisperLanguage, setWhisperLanguage] = useState('zh');
@@ -78,6 +78,26 @@ function App() {
   const timelineRef = useRef<HTMLDivElement>(null);
   const waveformRef = useRef<HTMLDivElement>(null);
   const wavesurferRef = useRef<WaveSurfer | null>(null);
+
+  // NEW: Precise Subtitle Scaling System
+  const [scaleRatio, setScaleRatio] = useState(0.4);
+  const previewCanvasRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!previewCanvasRef.current) return;
+    const updateScale = () => {
+      if (previewCanvasRef.current) {
+        // Standardize scaling: 
+        // User sets font size relative to 1080p height.
+        // We scale the DOM preview linearly based on the canvas height vs 1080.
+        setScaleRatio(previewCanvasRef.current.offsetHeight / 1080);
+      }
+    };
+    const observer = new ResizeObserver(updateScale);
+    observer.observe(previewCanvasRef.current);
+    updateScale(); // Init relative to current size
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -114,7 +134,27 @@ function App() {
           const data = await res.json();
           if (data.fonts && data.fonts.length > 0) {
             setFontList(prev => {
-              const combined = [...new Set([...prev, ...data.fonts])];
+              // Only show fonts that actually exist on backend + basic fallbacks
+              const combined = [...new Set([...data.fonts, 'Arial', 'Sans-serif'])];
+
+              // Dynamically load fonts for accurate preview
+              data.fonts.forEach(async (fontName: string) => {
+                // Try TTF first
+                const fontTTF = new FontFace(fontName, `url(http://localhost:8000/fonts/${fontName}.ttf)`);
+                try {
+                  await fontTTF.load();
+                  document.fonts.add(fontTTF);
+                  return;
+                } catch (e) { }
+
+                // Try OTF fallback
+                const fontOTF = new FontFace(fontName, `url(http://localhost:8000/fonts/${fontName}.otf)`);
+                try {
+                  await fontOTF.load();
+                  document.fonts.add(fontOTF);
+                } catch (e) { }
+              });
+
               return combined;
             });
           }
@@ -519,6 +559,7 @@ function App() {
             <div className="preview-916-panel">
               <div
                 className="preview-916-canvas"
+                ref={previewCanvasRef} // Attach Observer
                 style={{ background: '#00ff00' }}
                 onMouseMove={(e) => {
                   if (isDraggingSubtitle && e.buttons === 1) {
@@ -537,17 +578,22 @@ function App() {
                   style={{
                     bottom: `${subtitleMarginV / 2}%`,
                     color: subtitleColor,
-                    fontSize: `${subtitleFontSize / 2.5}px`,
+                    fontSize: `${subtitleFontSize * scaleRatio}px`,
                     fontFamily: subtitleFontName,
                     fontWeight: subtitleBold ? 'bold' : 'normal',
                     fontStyle: subtitleItalic ? 'italic' : 'normal',
-                    textShadow: `${getShadowOffset(subtitleShadowAngle, subtitleShadowSize).x}px ${getShadowOffset(subtitleShadowAngle, subtitleShadowSize).y}px ${subtitleShadowSize * 2}px ${subtitleShadowColor}${Math.round(subtitleShadowOpacity * 2.55).toString(16).padStart(2, '0')}`,
-                    WebkitTextStroke: `${subtitleOutlineWidth / 2}px ${subtitleOutlineColor}`,
+                    // Dynamic scaling for Shadow
+                    textShadow: `${Math.round(subtitleShadowSize * scaleRatio * 0.7)}px ${Math.round(subtitleShadowSize * scaleRatio * 0.7)}px 0px ${subtitleShadowColor}${Math.round(subtitleShadowOpacity * 2.55).toString(16).padStart(2, '0')}`,
+                    // Dynamic scaling for Stroke
+                    // FIX: Multiply by 2. Web CSS stroke is centered (half hidden by fill), ASS outline is outer.
+                    // So we must 2x the CSS stroke to match the visual thickness of ASS outline.
+                    WebkitTextStroke: subtitleBgEnabled ? '0px' : `${subtitleOutlineWidth * 2 * scaleRatio}px ${subtitleOutlineColor}`,
                     paintOrder: 'stroke fill',
                     cursor: 'ns-resize',
                     backgroundColor: subtitleBgEnabled ? `${subtitleBgColor}${Math.round(subtitleBgOpacity * 2.55).toString(16).padStart(2, '0')}` : 'transparent',
-                    padding: subtitleBgEnabled ? '6px 14px' : '0',
-                    borderRadius: subtitleBgEnabled ? `${subtitleBgRadius}px` : '0',
+                    // Dynamic scaling for Padding
+                    padding: subtitleBgEnabled ? `${4 * scaleRatio}px ${subtitleOutlineWidth * scaleRatio}px` : '0',
+                    borderRadius: '0px',
                   }}
                   onMouseDown={(e) => {
                     e.preventDefault();
@@ -713,24 +759,33 @@ function App() {
                       <input type="number" min="24" max="150" value={subtitleFontSize} onChange={e => setSubtitleFontSize(parseInt(e.target.value) || 24)} className="val-input" />
                     </div>
 
-                    {/* Colors */}
-                    <div className="style-grid" style={{ marginTop: '14px' }}>
-                      <div className="style-item">
+                    {/* Outline Width / Box Padding Slider (Dual Purpose) */}
+                    <div className="slider-row" style={{ marginTop: '14px' }}>
+                      <label>{subtitleBgEnabled ? '背景寬度 (Padding)' : '邊框寬度'}</label>
+                      <input type="range" min="0" max={subtitleBgEnabled ? 50 : 20} value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value))} className="slider-sm" />
+                      <input type="number" min="0" max={subtitleBgEnabled ? 50 : 20} value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value) || 0)} className="val-input" />
+                    </div>
+
+                    {/* Outline Color - Only show if BG is disabled */}
+                    {!subtitleBgEnabled && (
+                      <div className="style-grid" style={{ marginTop: '14px' }}>
+                        <div className="style-item">
+                          <label>文字顏色</label>
+                          <input type="color" value={subtitleColor} onChange={e => setSubtitleColor(e.target.value)} className="color-sm" />
+                        </div>
+                        <div className="style-item">
+                          <label>邊框顏色</label>
+                          <input type="color" value={subtitleOutlineColor} onChange={e => setSubtitleOutlineColor(e.target.value)} className="color-sm" />
+                        </div>
+                      </div>
+                    )}
+
+                    {subtitleBgEnabled && (
+                      <div className="style-item" style={{ marginTop: '14px' }}>
                         <label>文字顏色</label>
                         <input type="color" value={subtitleColor} onChange={e => setSubtitleColor(e.target.value)} className="color-sm" />
                       </div>
-                      <div className="style-item">
-                        <label>邊框顏色</label>
-                        <input type="color" value={subtitleOutlineColor} onChange={e => setSubtitleOutlineColor(e.target.value)} className="color-sm" />
-                      </div>
-                    </div>
-
-                    {/* Outline Width Slider */}
-                    <div className="slider-row">
-                      <label>邊框寬度</label>
-                      <input type="range" min="0" max="20" value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="0" max="20" value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value) || 0)} className="val-input" />
-                    </div>
+                    )}
 
                     {/* Shadow Slider */}
                     <div className="slider-row">
@@ -739,23 +794,12 @@ function App() {
                       <input type="number" min="0" max="20" value={subtitleShadowSize} onChange={e => setSubtitleShadowSize(parseInt(e.target.value) || 0)} className="val-input" />
                     </div>
 
-                    {/* Shadow Angle */}
-                    <div className="slider-row">
-                      <label>陰影角度</label>
-                      <input type="range" min="0" max="360" value={subtitleShadowAngle} onChange={e => setSubtitleShadowAngle(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="0" max="360" value={subtitleShadowAngle} onChange={e => setSubtitleShadowAngle(parseInt(e.target.value) || 0)} className="val-input" />
-                    </div>
-
-                    {/* Shadow Color & Opacity */}
+                    {/* Shadow Color & Opacity (Color removed, opacity only) */}
                     <div className="style-grid" style={{ marginTop: '14px' }}>
-                      <div className="style-item">
-                        <label>陰影顏色</label>
-                        <input type="color" value={subtitleShadowColor} onChange={e => setSubtitleShadowColor(e.target.value)} className="color-sm" />
-                      </div>
-                      <div className="style-item">
+                      <div className="style-item" style={{ width: '100%' }}>
                         <label>陰影透明度</label>
                         <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                          <input type="range" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value))} className="slider-sm" style={{ width: '60px' }} />
+                          <input type="range" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
                           <input type="number" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value) || 0)} className="val-input" style={{ width: '40px' }} />
                         </div>
                       </div>
@@ -804,12 +848,8 @@ function App() {
                             <input type="range" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value))} className="slider-sm" />
                             <input type="number" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value) || 0)} className="val-input" />
                           </div>
-                          <div className="slider-row">
-                            <label>圓角</label>
-                            <input type="range" min="0" max="30" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value))} className="slider-sm" />
-                            <input type="number" min="0" max="30" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value) || 0)} className="val-input" />
-                          </div>
                         </div>
+
                       )}
                     </div>
 
@@ -925,24 +965,26 @@ function App() {
               </div>
             </aside>
           </div>
-        </div>
+        </div >
 
 
 
-      </main>
+      </main >
 
       {/* Bottom Progress Bar */}
-      {(isPreviewLoading || isExporting) && (
-        <div className="progress-bar-bottom">
-          <div className="progress-bar-fill" style={{ width: `${isExporting ? exportProgress : previewProgress}%` }} />
-          <div className="progress-bar-content">
-            <Loader2 className="spin" size={16} />
-            <span>{isExporting ? '匯出處理中' : '預覽生成中'}</span>
-            <span className="progress-percent">{Math.round(isExporting ? exportProgress : previewProgress)}%</span>
+      {
+        (isPreviewLoading || isExporting) && (
+          <div className="progress-bar-bottom">
+            <div className="progress-bar-fill" style={{ width: `${isExporting ? exportProgress : previewProgress}%` }} />
+            <div className="progress-bar-content">
+              <Loader2 className="spin" size={16} />
+              <span>{isExporting ? '匯出處理中' : '預覽生成中'}</span>
+              <span className="progress-percent">{Math.round(isExporting ? exportProgress : previewProgress)}%</span>
+            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )
+      }
+    </div >
   );
 }
 

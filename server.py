@@ -50,6 +50,57 @@ import time
 import subprocess
 import mediapipe as mp
 import numpy as np
+from fontTools.ttLib import TTFont
+
+# -- NEW: Font Mapping Logic --
+FONT_FILE_MAP = {} # "wt009" -> "WangHanZong..."
+
+def scan_fonts():
+    global FONT_FILE_MAP
+    FONT_FILE_MAP = {}
+    if not os.path.exists(FONTS_DIR): return
+    
+    print("🔍 Scanning fonts for real Family Names...")
+    for f in os.listdir(FONTS_DIR):
+        if f.lower().endswith(('.ttf', '.otf', '.ttc')):
+            base_name = os.path.splitext(f)[0]
+            try:
+                path = os.path.join(FONTS_DIR, f)
+                font = TTFont(path)
+                family = ""
+                # Priority: ID 16 (Typographic Family) -> ID 1 (Family)
+                # Iterate all namerecords to find best match
+                for record in font['name'].names:
+                    try:
+                         # We specifically look for English names (platformID=1, langID=0) or (platformID=3, langID=0x409)
+                         # to ensure FFmpeg compatibility
+                         if record.nameID in [1, 16]:
+                             decoded = record.toUnicode()
+                             # Simple heuristic: ASCII names are safer for ASS
+                             if all(ord(c) < 128 for c in decoded):
+                                 if record.nameID == 16: # Typographic Preferred
+                                     family = decoded
+                                     break
+                                 if record.nameID == 1 and not family:
+                                     family = decoded
+                    except: pass
+                
+                # If no English name found, try any name
+                if not family:
+                     for record in font['name'].names:
+                         if record.nameID == 1:
+                             family = record.toUnicode()
+                             break
+
+                real_name = family if family else base_name
+                FONT_FILE_MAP[base_name] = real_name
+                print(f"   Fetched Font: {base_name} -> {real_name}")
+            except Exception as e:
+                print(f"   Error parsing font {f}: {e}")
+                FONT_FILE_MAP[base_name] = base_name
+
+# Initial scan
+scan_fonts()
 
 # ... (Previous imports remained, but ensuring order)
 
@@ -246,6 +297,7 @@ app.add_middleware(
 
 # Enable Static Access to Exports for Preview (Placed here after app init)
 app.mount("/exports", StaticFiles(directory=OUTPUT_DIR), name="exports")
+app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 @app.post("/upload-font")
@@ -966,8 +1018,12 @@ async def preview_clip(
                 
                 # Font size is 1080p-based pixels, so we scale it normally for 1920p
                 scaled_fontsize = int(float(subtitle_font_size) * scale_factor)
+                scaled_outline = int(outline_val * scale_factor)
+                scaled_shadow = int(shadow_val * scale_factor)
 
-                escaped_font = subtitle_font_name.replace("'", "").replace(":", "") 
+                # FIX: Use Real Family Name for ASS
+                real_family = FONT_FILE_MAP.get(subtitle_font_name, subtitle_font_name)
+                escaped_font = real_family.replace("'", "").replace(":", "") 
                 
                 # Standard ASS Style String
                 style_parts = [
@@ -975,7 +1031,7 @@ async def preview_clip(
                     f"PrimaryColour={final_color_ass}", f"SecondaryColour={final_color_ass}",
                     f"OutlineColour={outline_color_ass if not is_box else box_color_ass}",
                     f"BackColour={shadow_color_ass if not is_box else box_color_ass}",
-                    f"BorderStyle={border_style}", f"Outline={outline_val}", f"Shadow={shadow_val}",
+                    f"BorderStyle={border_style}", f"Outline={scaled_outline}", f"Shadow={scaled_shadow}",
                     f"MarginV={scaled_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
                     "Alignment=2", f"Bold={bold_val}", f"Italic={italic_val}"
                 ]
@@ -1380,13 +1436,19 @@ async def process_video(
                                 
                                 # Font size is 1080p-based pixels
                                 scaled_fontsize = int(float(subtitle_font_size) * scale_factor)
+                                scaled_outline = int(outline_val * scale_factor)
+                                scaled_shadow = int(shadow_val * scale_factor)
+                                
+                                # FIX: Use Real Family Name for ASS
+                                real_family = FONT_FILE_MAP.get(subtitle_font_name, subtitle_font_name)
+                                escaped_font = real_family.replace("'", "").replace(":", "") 
                                 
                                 style_parts = [
                                     f"PlayResY={target_res_y}", f"Fontname={escaped_font}", f"Fontsize={scaled_fontsize}",
                                     f"PrimaryColour={final_color_ass}", f"SecondaryColour={final_color_ass}",
                                     f"OutlineColour={outline_color_ass if not is_box else box_color_ass}",
                                     f"BackColour={shadow_color_ass if not is_box else box_color_ass}",
-                                    f"BorderStyle={border_style}", f"Outline={outline_val}", f"Shadow={shadow_val}",
+                                    f"BorderStyle={border_style}", f"Outline={scaled_outline}", f"Shadow={scaled_shadow}",
                                     f"MarginV={scaled_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
                                     "Alignment=2", f"Bold={bold_val}", f"Italic={italic_val}"
                                 ]
