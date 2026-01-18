@@ -28,3 +28,5 @@ uploads/
 exports/
 local_bin/
 *.wav
+public/render_source_*
+temp_props_*.json

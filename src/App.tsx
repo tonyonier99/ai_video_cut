@@ -1,7 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Download, Video, Scissors, Play, Pause, Loader2, Film, Key, Upload, Wand2, Languages, X, Trash } from 'lucide-react';
+import { Download, Video, Scissors, Play, Pause, Loader2, Film, Key, Upload, Wand2, Zap, Languages, Trash, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import WaveSurfer from 'wavesurfer.js';
+import { Player } from '@remotion/player';
+import { MyComposition } from './remotion/MyComposition';
 import './App.css';
 
 interface Cut {
@@ -21,7 +23,7 @@ function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
-  const [previewProgress, setPreviewProgress] = useState(0);
+
 
   const [targetCount, setTargetCount] = useState(1);
   const [targetDuration, setTargetDuration] = useState(15);
@@ -42,31 +44,68 @@ function App() {
   const [mpMinDetectionCon, setMpMinDetectionCon] = useState(0.5);
   const [dfn3Strength, setDfn3Strength] = useState(100);
 
+  // Silence Removal & Jump Cut Parameters
+  const [isSilenceRemoval, setIsSilenceRemoval] = useState(false);
+  const [silenceThreshold, setSilenceThreshold] = useState(0.5); // Seconds
+  const [isJumpCutZoom, setIsJumpCutZoom] = useState(true);
+
   // 字幕樣式
-  const [subtitleFontSize, setSubtitleFontSize] = useState(55);
-  const [subtitleColor, setSubtitleColor] = useState('#FFFFFF');
-  const [subtitleFontName, setSubtitleFontName] = useState('Heiti TC'); // Default to a Chinese font
+  // 字幕樣式 (Advanced)
+  const [subtitleFontSize, setSubtitleFontSize] = useState(90);
+  const [subtitleFontName, setSubtitleFontName] = useState('Arial');
+  const [subtitleFontWeight, setSubtitleFontWeight] = useState<string | number>('normal');
+  const [subtitleFontStyle, setSubtitleFontStyle] = useState('normal');
+
+  const [subtitleTextColor, setSubtitleTextColor] = useState('#FFFFFF');
+  const [isTextGradient, setIsTextGradient] = useState(false);
+  const [textGradientColors, setTextGradientColors] = useState(['#FF0080', '#7928CA']); // Default nice gradient
+  const [textGradientDirection, setTextGradientDirection] = useState('to right');
+
   const [subtitleOutlineWidth, setSubtitleOutlineWidth] = useState(4);
   const [subtitleOutlineColor, setSubtitleOutlineColor] = useState('#000000');
-  const [subtitleMarginV, setSubtitleMarginV] = useState(50);
-  const [subtitleBold, setSubtitleBold] = useState(false); // Default disabled
-  const [subtitleItalic, setSubtitleItalic] = useState(false);
-  const [subtitleShadowSize, setSubtitleShadowSize] = useState(3);
-  // Removed unsupported Angle (Fixed to 135/45 deg in backend)
+  const [isSubtitleOutline, setIsSubtitleOutline] = useState(true);
+
   const [subtitleShadowColor, setSubtitleShadowColor] = useState('#000000');
   const [subtitleShadowOpacity, setSubtitleShadowOpacity] = useState(80);
-  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(8);
+  const [subtitleShadowBlur, setSubtitleShadowBlur] = useState(0);
+  const [subtitleShadowOffsetX, setSubtitleShadowOffsetX] = useState(3);
+  const [subtitleShadowOffsetY, setSubtitleShadowOffsetY] = useState(3);
+  const [isSubtitleShadow, setIsSubtitleShadow] = useState(true);
+
+  const [subtitleLetterSpacing, setSubtitleLetterSpacing] = useState(0);
+  const [subtitleLineHeight, setSubtitleLineHeight] = useState(1.2);
+  const [subtitleTextTransform, setSubtitleTextTransform] = useState('none');
+  const [subtitleTextAlign, setSubtitleTextAlign] = useState('center');
+
+  const [subtitleMarginV, setSubtitleMarginV] = useState(600);
+  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(7); // Restored missing param
+
   const [subtitleBgEnabled, setSubtitleBgEnabled] = useState(false);
   const [subtitleBgColor, setSubtitleBgColor] = useState('#000000');
   const [subtitleBgOpacity, setSubtitleBgOpacity] = useState(50);
-  // Removed unsupported Radius
+  const [subtitleBgPaddingX, setSubtitleBgPaddingX] = useState(10);
+  const [subtitleBgPaddingY, setSubtitleBgPaddingY] = useState(4);
+  const [subtitleBgRadius, setSubtitleBgRadius] = useState(4);
+
+  const [subtitleAnimation, setSubtitleAnimation] = useState<'none' | 'pop' | 'fade' | 'slide-up'>('pop');
+
   const [showSafeArea, setShowSafeArea] = useState(true);
-  const [previewText, setPreviewText] = useState('預覽文字內容Test123456');
+  const [previewText, setPreviewText] = useState('預覽文字內容預覽文字內容');
   const [isDraggingSubtitle, setIsDraggingSubtitle] = useState(false);
 
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+  const [previewCut, setPreviewCut] = useState<Cut | null>(null); // NEW: Remotion Preview State
+  const [showPreviewModal, setShowPreviewModal] = useState(false);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
-  const [previewingId, setPreviewingId] = useState<string | null>(null);
+  const [previewProgress, setPreviewProgress] = useState(0);
+  const [previewFaceCenter, setPreviewFaceCenter] = useState(0.5); // NEW for Face Tracking
+  const [previewMessage, setPreviewMessage] = useState(''); // NEW: Detailed status
+  const [previewSubtitles, setPreviewSubtitles] = useState<any[]>([]); // Temp subs for preview
+  const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
+  const [previewVisualSegments, setPreviewVisualSegments] = useState<any[]>([]);
+  const [srtSubtitles, setSrtSubtitles] = useState<any[]>([]); // User uploaded SRT content
+
+
   const [draggingCut, setDraggingCut] = useState<{ id: string, edge: 'start' | 'end' | 'move', initialX: number, initialStart: number, initialEnd: number } | null>(null);
   const [systemStatus, setSystemStatus] = useState({ progress: 100, status: 'ready', message: '就緒' });
   const [fontList, setFontList] = useState(['Arial', 'Sans-serif']); // Remove client-local fonts that backend doesn't have
@@ -88,9 +127,9 @@ function App() {
     const updateScale = () => {
       if (previewCanvasRef.current) {
         // Standardize scaling: 
-        // User sets font size relative to 1080p height.
-        // We scale the DOM preview linearly based on the canvas height vs 1080.
-        setScaleRatio(previewCanvasRef.current.offsetHeight / 1080);
+        // User sets font size relative to 1080x1920 canvas.
+        // We scale the DOM preview linearly based on the canvas height vs 1920 (Height).
+        setScaleRatio(previewCanvasRef.current.offsetHeight / 1920);
       }
     };
     const observer = new ResizeObserver(updateScale);
@@ -98,6 +137,26 @@ function App() {
     updateScale(); // Init relative to current size
     return () => observer.disconnect();
   }, []);
+
+  // Poll Job Status when Exporting to show detailed steps (like "Applying Subtitles")
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isExporting) {
+      interval = setInterval(async () => {
+        try {
+          const res = await fetch('http://localhost:8000/job-status');
+          if (res.ok) {
+            const status = await res.json();
+            if (status.step !== 'idle' && status.step !== 'done') {
+              setExportProgress(status.progress);
+              setSystemStatus(prev => ({ ...prev, message: status.message }));
+            }
+          }
+        } catch (e) { }
+      }, 500);
+    }
+    return () => clearInterval(interval);
+  }, [isExporting]);
 
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -133,26 +192,32 @@ function App() {
         if (res.ok) {
           const data = await res.json();
           if (data.fonts && data.fonts.length > 0) {
-            setFontList(prev => {
+            setFontList(() => {
               // Only show fonts that actually exist on backend + basic fallbacks
               const combined = [...new Set([...data.fonts, 'Arial', 'Sans-serif'])];
 
               // Dynamically load fonts for accurate preview
               data.fonts.forEach(async (fontName: string) => {
-                // Try TTF first
-                const fontTTF = new FontFace(fontName, `url(http://localhost:8000/fonts/${fontName}.ttf)`);
-                try {
-                  await fontTTF.load();
-                  document.fonts.add(fontTTF);
-                  return;
-                } catch (e) { }
+                const baseUrl = `http://localhost:8000/fonts/${encodeURIComponent(fontName)}`;
+                // Try multiple extensions
+                const extensions = ['.ttf', '.otf', '.TTF', '.OTF'];
+                let loaded = false;
 
-                // Try OTF fallback
-                const fontOTF = new FontFace(fontName, `url(http://localhost:8000/fonts/${fontName}.otf)`);
-                try {
-                  await fontOTF.load();
-                  document.fonts.add(fontOTF);
-                } catch (e) { }
+                for (const ext of extensions) {
+                  if (loaded) break;
+                  try {
+                    const font = new FontFace(fontName, `url(${baseUrl}${ext})`);
+                    await font.load();
+                    document.fonts.add(font);
+                    loaded = true;
+                    console.log(`✅ Loaded font: ${fontName} (${ext})`);
+                  } catch (e) {
+                    // Silently try next extension
+                  }
+                }
+                if (!loaded) {
+                  console.warn(`❌ Failed to load font: ${fontName} after trying various extensions.`);
+                }
               });
 
               return combined;
@@ -196,9 +261,9 @@ function App() {
       setVideoFile(file);
       setVideoUrl(URL.createObjectURL(file));
       setCuts([]);
+      setSrtSubtitles([]); // Clear SRT when new video
     }
   };
-
 
   const handleMakeVideo = async () => {
     if (!videoFile) return;
@@ -229,115 +294,203 @@ function App() {
 
     // With API key, use AI analysis
     const formData = new FormData();
-    formData.append('video', videoFile);
+    formData.append('file', videoFile as any);
     formData.append('instruction', instruction);
-    formData.append('target_count', targetCount.toString());
+    if (targetCount) formData.append('target_count', targetCount.toString());
     formData.append('api_key', apiKey);
-    formData.append('model', selectedModel);
+    formData.append('model_name', selectedModel);
 
     try {
+      console.log("🚀 Starting AI Analysis...", { model: selectedModel, targetCount });
       const res = await fetch('http://localhost:8000/analyze-video', { method: 'POST', body: formData });
       if (res.ok) {
         const data = await res.json();
-        setCuts(data.cuts.map((c: any, i: number) => ({ ...c, id: i.toString() })));
+        console.log("✅ Analysis Result:", data);
+        setCuts(data.map((c: any, i: number) => ({ ...c, id: i.toString() })));
+      } else {
+        const errData = await res.json();
+        alert(`分析失敗: ${errData.detail || res.statusText}`);
       }
     } catch (e) {
-      alert('分析失敗，請檢查 API Key 或後端狀態');
+      console.error("❌ AI Analysis Error:", e);
+      alert('分析失敗，請檢查網路連線或後端服務是否運行於 localhost:8000');
     }
     setIsProcessing(false);
   };
 
+
+  // NEW: Instant Remotion Preview
   const handlePreview = async (cut: Cut) => {
-    if (!videoFile) return;
-    setIsPreviewLoading(true);
-    setPreviewingId(cut.id);
+    if (!videoUrl) return;
+
+    setPreviewCut({ ...cut });
+    setShowPreviewModal(false); // Hide Player Modal initially
+    setIsPreviewLoading(true); // Show Loading Overlay
     setPreviewProgress(0);
+    setPreviewMessage("正在初始化...");
 
-    // Simulate progress
-    const progressInterval = setInterval(() => {
-      setPreviewProgress(prev => Math.min(prev + Math.random() * 10, 95));
-    }, 500);
-    const formData = new FormData();
-    formData.append('file', videoFile);
-    formData.append('start', cut.start.toString());
-    formData.append('end', cut.end.toString());
-    formData.append('face_tracking', isFaceTracking.toString());
-    formData.append('studio_sound', isStudioSound.toString());
-    formData.append('dfn3_strength', dfn3Strength.toString());
-    formData.append('auto_caption', isAutoCaption.toString());
-    formData.append('translate', isTranslate.toString());
-    formData.append('burn_captions', isBurnCaptions.toString());
-    formData.append('subtitle_font_name', subtitleFontName);
-    formData.append('subtitle_font_size', subtitleFontSize.toString());
-    formData.append('subtitle_color', subtitleColor);
-    formData.append('subtitle_outline_width', subtitleOutlineWidth.toString());
-    formData.append('subtitle_outline_color', subtitleOutlineColor);
-    formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
-    formData.append('whisper_language', whisperLanguage);
+    setPreviewSubtitles([]);
+    setPreviewAudioUrl(null);
+    setPreviewVisualSegments([]);
+    setPreviewFaceCenter(0.5);
 
-    // Missing Params Added
-    formData.append('subtitle_margin_v', subtitleMarginV.toString());
-    formData.append('subtitle_bold', subtitleBold.toString());
-    formData.append('subtitle_italic', subtitleItalic.toString());
-    formData.append('subtitle_shadow_size', subtitleShadowSize.toString());
-    formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
-    formData.append('subtitle_box_color', subtitleBgColor);
-    formData.append('subtitle_box_alpha', (subtitleBgOpacity / 100).toString());
+    // Strict Pipeline Execution
+    if (!videoFile) {
+      alert("⚠️ 請重新上傳原始影片以執行完整 AI 預覽流程。");
+      setTimeout(() => setShowPreviewModal(false), 500);
+      return;
+    }
 
+    setPreviewMessage("AI 全流程處理中... (降噪 -> 去氣口 -> 字幕 -> 人臉)");
+    setPreviewProgress(10);
 
     try {
-      const res = await fetch('http://localhost:8000/preview-clip', { method: 'POST', body: formData });
-      if (res.ok) {
-        const blob = await res.blob();
-        setPreviewUrl(URL.createObjectURL(blob));
-      } else {
-        const errorData = await res.json().catch(() => ({ detail: '預覽生成失敗' }));
-        alert(`預覽失敗: ${errorData.detail || res.statusText}`);
+      const fd = new FormData();
+      fd.append('file', videoFile);
+      fd.append('start', cut.start.toString());
+      fd.append('end', cut.end.toString());
+
+      // Pass all configs for Strict Execution
+      fd.append('is_denoise', isStudioSound.toString());
+      fd.append('is_silence_removal', isSilenceRemoval.toString());
+      fd.append('silence_threshold', silenceThreshold.toString());
+
+      // Auto Caption
+      fd.append('is_auto_caption', (isAutoCaption || isBurnCaptions).toString());
+      fd.append('whisper_language', whisperLanguage);
+      fd.append('translate_to_chinese', isTranslate.toString());
+      fd.append('api_key', apiKey);
+
+      // Pass Subtitle Config JSON to ensure Chars Per Line is respected in Transcription
+      const subConfigObj = { charsPerLine: subtitleCharsPerLine };
+      fd.append('subtitle_config', JSON.stringify(subConfigObj));
+
+      // Face Tracking
+      fd.append('is_face_tracking', isFaceTracking.toString());
+
+      // Endpoint Call with Streaming Support
+      const res = await fetch('http://localhost:8000/process-preview-pipeline', { method: 'POST', body: fd });
+
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("Failed to get reader");
+
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n").filter(l => l.trim() !== "");
+
+        for (const line of lines) {
+          try {
+            const msg = JSON.parse(line);
+            console.log("[Preview Pipeline Stream]", msg);
+
+            if (msg.status === 'progress') {
+              setPreviewMessage(msg.message);
+              setPreviewProgress(msg.percent);
+            }
+            else if (msg.status === 'success') {
+              const data = msg.data;
+              if (data.subtitles) setPreviewSubtitles(data.subtitles);
+              if (data.faceCenterX) setPreviewFaceCenter(data.faceCenterX);
+              if (data.audioUrl) setPreviewAudioUrl(data.audioUrl);
+              if (data.visualSegments) setPreviewVisualSegments(data.visualSegments);
+
+              setPreviewProgress(100);
+              setTimeout(() => {
+                setIsPreviewLoading(false);
+                setShowPreviewModal(true);
+              }, 500);
+            }
+            else if (msg.status === 'error') {
+              setPreviewMessage("發生錯誤: " + msg.message);
+              console.error("Pipeline Back-end Error", msg.message);
+              return;
+            }
+          } catch (e) {
+            console.warn("Stream parse error", e, line);
+          }
+        }
       }
+
     } catch (e) {
-      alert('無法連接後端服務，請確認 server.py 正在運行');
+      console.error("Pipeline Error", e);
+      setPreviewMessage("連線錯誤");
     }
-    clearInterval(progressInterval);
-    setPreviewProgress(100);
-    setTimeout(() => setPreviewProgress(0), 500);
-    setIsPreviewLoading(false);
-    setPreviewingId(null);
+
   };
 
-  const handleExport = async () => {
-    if (cuts.length === 0) return;
+  /* LEGACY BACKEND PREVIEW (Disabled for Remotion)
+  const handlePreview = async (cut: Cut) => {
+     // ... old logic ...
+  };
+  */
+
+  const handleExport = async (singleCut?: Cut) => {
+    const activeCuts = singleCut ? [singleCut] : cuts;
+    if (activeCuts.length === 0) {
+      alert("請先分析影片或手動新增片段");
+      return;
+    }
+
     setIsExporting(true);
     setExportProgress(0);
 
-    // Simulate progress
-    const progressInterval = setInterval(() => {
-      setExportProgress(prev => Math.min(prev + Math.random() * 5, 95));
-    }, 800);
+    // Start Export
+    setIsExporting(true);
+    setExportProgress(0);
 
     const formData = new FormData();
     formData.append('file', videoFile!);
-    formData.append('cuts_json', JSON.stringify(cuts));
+    formData.append('cuts_json', JSON.stringify(activeCuts));
     formData.append('face_tracking', isFaceTracking.toString());
     formData.append('studio_sound', isStudioSound.toString());
     formData.append('dfn3_strength', dfn3Strength.toString());
+    formData.append('is_silence_removal', isSilenceRemoval.toString());
+    formData.append('silence_threshold', silenceThreshold.toString());
+    formData.append('is_jump_cut_zoom', isJumpCutZoom.toString());
+
     formData.append('auto_caption', isAutoCaption.toString());
-    formData.append('translate', isTranslate.toString());
+    formData.append('translate_to_chinese', isTranslate.toString());
     formData.append('burn_captions', isBurnCaptions.toString());
+    formData.append('srt_json', JSON.stringify(srtSubtitles)); // Send user's SRT
     formData.append('subtitle_font_name', subtitleFontName);
     formData.append('subtitle_font_size', subtitleFontSize.toString());
-    formData.append('subtitle_color', subtitleColor);
-    formData.append('subtitle_outline_width', subtitleOutlineWidth.toString());
-    formData.append('subtitle_outline_color', subtitleOutlineColor);
-    formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
+    formData.append('subtitle_font_weight', subtitleFontWeight.toString());
+    formData.append('subtitle_font_style', subtitleFontStyle);
 
-    // Missing Params Added
+    formData.append('subtitle_text_color', subtitleTextColor);
+    formData.append('is_text_gradient', isTextGradient.toString());
+    formData.append('text_gradient_colors', JSON.stringify(textGradientColors));
+    formData.append('text_gradient_direction', textGradientDirection);
+
+    formData.append('subtitle_outline_width', (isSubtitleOutline ? subtitleOutlineWidth : 0).toString());
+    formData.append('subtitle_outline_color', subtitleOutlineColor);
+
+    formData.append('subtitle_shadow_color', subtitleShadowColor);
+    formData.append('subtitle_shadow_opacity', (isSubtitleShadow ? subtitleShadowOpacity : 0).toString()); // Int 0-100
+    formData.append('subtitle_shadow_blur', subtitleShadowBlur.toString());
+    formData.append('subtitle_shadow_offset_x', subtitleShadowOffsetX.toString());
+    formData.append('subtitle_shadow_offset_y', subtitleShadowOffsetY.toString());
+
+    formData.append('subtitle_letter_spacing', subtitleLetterSpacing.toString());
+    formData.append('subtitle_line_height', subtitleLineHeight.toString());
+    formData.append('subtitle_text_transform', subtitleTextTransform);
+    formData.append('subtitle_text_align', subtitleTextAlign);
+
     formData.append('subtitle_margin_v', subtitleMarginV.toString());
-    formData.append('subtitle_bold', subtitleBold.toString());
-    formData.append('subtitle_italic', subtitleItalic.toString());
-    formData.append('subtitle_shadow_size', subtitleShadowSize.toString());
+    formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
+    formData.append('subtitle_animation', subtitleAnimation);
+
     formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
     formData.append('subtitle_box_color', subtitleBgColor);
-    formData.append('subtitle_box_alpha', (subtitleBgOpacity / 100).toString());
+    formData.append('subtitle_box_opacity', subtitleBgOpacity.toString()); // Int 0-100
+    formData.append('subtitle_box_padding_x', subtitleBgPaddingX.toString());
+    formData.append('subtitle_box_padding_y', subtitleBgPaddingY.toString());
+    formData.append('subtitle_box_radius', subtitleBgRadius.toString());
 
     formData.append('output_quality', outputQuality);
     formData.append('output_resolution', outputResolution);
@@ -346,20 +499,24 @@ function App() {
     try {
       const res = await fetch('http://localhost:8000/process-video', { method: 'POST', body: formData });
       if (res.ok) {
-        const blob = await res.blob();
-        const url = window.URL.createObjectURL(blob);
+        const data = await res.json();
+        // Trigger download via direct URL
+        const downloadUrl = `http://localhost:8000${data.download_url}`;
         const a = document.createElement('a');
-        a.href = url;
-        a.download = `Antigravity_Cuts_${new Date().getTime()}.zip`;
+        a.href = downloadUrl;
+        a.download = data.filename;
+        document.body.appendChild(a);
         a.click();
+        document.body.removeChild(a);
+        alert('匯出成功！檔案已開始下載。');
       } else {
         const errorData = await res.json().catch(() => ({ detail: '匯出失敗' }));
         alert(`匯出失敗: ${errorData.detail || res.statusText}`);
       }
     } catch (e) {
-      alert('無法連接後端服務，請確認 server.py 正在運行');
+      alert('無法連接後端服務，或處理時間過長導致超時');
     }
-    clearInterval(progressInterval);
+
     setExportProgress(100);
     setTimeout(() => setExportProgress(0), 500);
     setIsExporting(false);
@@ -416,20 +573,47 @@ function App() {
   // Wrap text based on chars per line (each character = 1)
   const wrapText = (text: string, charsPerLine: number): string => {
     if (!text || charsPerLine <= 0) return text;
-    const lines: string[] = [];
-    for (let i = 0; i < text.length; i += charsPerLine) {
-      lines.push(text.slice(i, i + charsPerLine));
-    }
-    return lines.join('\n');
+
+    // Support existing newlines first
+    const paragraphs = text.split('\n');
+    const wrappedParagraphs = paragraphs.map(p => {
+      if (p.length <= charsPerLine) return p;
+
+      const lines = [];
+      let current = p;
+
+      while (current.length > 0) {
+        if (current.length <= charsPerLine) {
+          lines.push(current);
+          break;
+        }
+
+        // Find best break point for English (space) within the limit
+        let breakAt = charsPerLine;
+        const sub = current.substring(0, charsPerLine + 1);
+        const lastSpace = sub.lastIndexOf(' ');
+
+        // Only use space break if it's not too far back (e.g. at least 60% of limit)
+        if (lastSpace > charsPerLine * 0.6) {
+          breakAt = lastSpace;
+        }
+
+        lines.push(current.substring(0, breakAt).trim());
+        current = current.substring(breakAt).trim();
+      }
+      return lines.join('\n');
+    });
+
+    return wrappedParagraphs.join('\n');
   };
 
   // Calculate shadow offset from angle
-  const getShadowOffset = (angle: number, size: number) => {
-    const rad = (angle * Math.PI) / 180;
-    return {
-      x: Math.round(Math.cos(rad) * size),
-      y: Math.round(Math.sin(rad) * size)
-    };
+
+
+  const handleGradientColorChange = (index: number, color: string) => {
+    const newColors = [...textGradientColors];
+    newColors[index] = color;
+    setTextGradientColors(newColors);
   };
 
   return (
@@ -448,25 +632,106 @@ function App() {
         </div>
       )}
 
-      {/* Preview Modal */}
+      {/* Preview Modal (Updated for Remotion) */}
+
+      {/* Preview Modal (Updated for Remotion) */}
       <AnimatePresence>
-        {previewUrl && (
+        {showPreviewModal && previewCut && videoUrl && (
           <motion.div
             className="modal-overlay"
             initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            onClick={() => setPreviewUrl(null)}
+            onClick={() => { setPreviewCut(null); setShowPreviewModal(false); }}
             style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.9)', zIndex: 9999, display: 'flex', justifyContent: 'center', alignItems: 'center' }}
           >
             <motion.div
-              className="modal-content glass"
-              onClick={e => e.stopPropagation()}
-              style={{ width: '90%', maxWidth: '360px', padding: 24, borderRadius: 20 }}
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="preview-modal-content"
+              style={{
+                width: 'auto',
+                height: '85vh',
+                aspectRatio: '9/16',
+                background: '#000',
+                borderRadius: '24px',
+                position: 'relative',
+                overflow: 'hidden',
+                boxShadow: '0 8px 32px rgba(0,0,0,0.5)'
+              }}
             >
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-                <h3 style={{ margin: 0 }}>預覽片段</h3>
-                <button onClick={() => setPreviewUrl(null)} className="btn-ghost"><X size={20} /></button>
+              <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+                <Player
+                  key={`res-preview-${previewCut.id}-${previewCut.start}-${previewCut.end}-${previewFaceCenter}-${previewAudioUrl}-${subtitleFontSize}-${subtitleFontName}-${subtitleFontWeight}-${subtitleFontStyle}-${subtitleTextColor}-${subtitleBgEnabled}-${subtitleOutlineWidth}-${subtitleShadowOpacity}-${subtitleLetterSpacing}-${subtitleLineHeight}-${subtitleTextAlign}-${subtitleTextTransform}-${isTextGradient}-${subtitleBgColor}-${subtitleBgOpacity}-${subtitleBgPaddingX}-${subtitleBgPaddingY}-${subtitleBgRadius}-${subtitleCharsPerLine}-${isBurnCaptions}`}
+                  component={MyComposition}
+                  durationInFrames={Math.max(1, Math.floor((previewCut.end - previewCut.start) * 30))}
+                  compositionWidth={1080}
+                  compositionHeight={1920}
+                  fps={30}
+                  style={{ width: '100%', height: '100%' }}
+                  controls
+                  autoPlay
+                  loop
+                  inputProps={{
+                    videoUrl: videoUrl,
+                    audioUrl: previewAudioUrl || undefined,
+                    startFrom: previewCut.start,
+                    visualSegments: previewVisualSegments.length > 0 ? previewVisualSegments : [{
+                      startInVideo: previewCut.start,
+                      duration: previewCut.end - previewCut.start,
+                      zoom: 1.0
+                    }],
+                    subtitles: (
+                      (previewSubtitles.length > 0 ? previewSubtitles : srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start)).length > 0
+                        ? (previewSubtitles.length > 0 ? previewSubtitles : srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start))
+                        : [{
+                          id: 'preview',
+                          start: previewCut.start,
+                          end: previewCut.end,
+                          text: wrapText(previewText || '預覽文字內容 (可以手動輸入設定測試)', subtitleCharsPerLine)
+                        }]
+                    ),
+                    isFaceTracking: isFaceTracking,
+                    faceCenterX: previewFaceCenter, // Force usage of detected face center
+                    subtitleConfig: {
+                      fontSize: subtitleFontSize,
+                      fontFamily: subtitleFontName,
+                      fontWeight: subtitleFontWeight,
+                      fontStyle: subtitleFontStyle,
+
+                      textColor: subtitleTextColor,
+                      isTextGradient: isTextGradient,
+                      textGradientColors: textGradientColors,
+                      textGradientDirection: textGradientDirection,
+
+                      outlineWidth: isSubtitleOutline ? subtitleOutlineWidth : 0,
+                      outlineColor: subtitleOutlineColor,
+
+                      shadowColor: subtitleShadowColor,
+                      shadowBlur: subtitleShadowBlur,
+                      shadowOffsetX: subtitleShadowOffsetX,
+                      shadowOffsetY: subtitleShadowOffsetY,
+                      shadowOpacity: isSubtitleShadow ? subtitleShadowOpacity / 100 : 0,
+
+                      letterSpacing: subtitleLetterSpacing,
+                      lineHeight: subtitleLineHeight,
+                      textTransform: subtitleTextTransform as any,
+                      textAlign: subtitleTextAlign as any,
+
+                      marginBottom: subtitleMarginV,
+                      charsPerLine: subtitleCharsPerLine,
+                      animation: subtitleAnimation,
+
+                      isUnknownBackground: subtitleBgEnabled,
+                      backgroundColor: subtitleBgColor,
+                      backgroundOpacity: subtitleBgOpacity / 100,
+                      backgroundPaddingX: subtitleBgPaddingX,
+                      backgroundPaddingY: subtitleBgPaddingY,
+                      backgroundBorderRadius: subtitleBgRadius,
+                    } as any // Force cast to avoid strict union type errors temporarily
+                  }}
+                />
               </div>
-              <video src={previewUrl} controls autoPlay style={{ width: '100%', borderRadius: 12, boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }} />
+              {/* Overlay instruction removed to avoid overlap with subtitles */}
             </motion.div>
           </motion.div>
         )}
@@ -564,43 +829,80 @@ function App() {
                 onMouseMove={(e) => {
                   if (isDraggingSubtitle && e.buttons === 1) {
                     const rect = e.currentTarget.getBoundingClientRect();
-                    const y = e.clientY - rect.top;
-                    const percentage = 100 - (y / rect.height) * 100;
-                    setSubtitleMarginV(Math.max(0, Math.min(200, Math.round(percentage * 2))));
+                    // Calculate distance from bottom in visual pixels
+                    const visualBottom = rect.height - (e.clientY - rect.top);
+                    // Convert to 1080p reference pixels
+                    const truePixels = visualBottom / scaleRatio;
+                    // Clamp to reasonable range (0 to full height)
+                    setSubtitleMarginV(Math.max(0, Math.round(truePixels)));
                   }
                 }}
                 onMouseUp={() => setIsDraggingSubtitle(false)}
                 onMouseLeave={() => setIsDraggingSubtitle(false)}
               >
                 {showSafeArea && <div className="safe-area-guide" />}
+
+                {/* Subtitle Display Wrapper matches Remotion Layout */}
                 <div
-                  className="subtitle-draggable"
+                  className="subtitle-draggable-wrapper"
                   style={{
-                    bottom: `${subtitleMarginV / 2}%`,
-                    color: subtitleColor,
-                    fontSize: `${subtitleFontSize * scaleRatio}px`,
-                    fontFamily: subtitleFontName,
-                    fontWeight: subtitleBold ? 'bold' : 'normal',
-                    fontStyle: subtitleItalic ? 'italic' : 'normal',
-                    // Dynamic scaling for Shadow
-                    textShadow: `${Math.round(subtitleShadowSize * scaleRatio * 0.7)}px ${Math.round(subtitleShadowSize * scaleRatio * 0.7)}px 0px ${subtitleShadowColor}${Math.round(subtitleShadowOpacity * 2.55).toString(16).padStart(2, '0')}`,
-                    // Dynamic scaling for Stroke
-                    // FIX: Multiply by 2. Web CSS stroke is centered (half hidden by fill), ASS outline is outer.
-                    // So we must 2x the CSS stroke to match the visual thickness of ASS outline.
-                    WebkitTextStroke: subtitleBgEnabled ? '0px' : `${subtitleOutlineWidth * 2 * scaleRatio}px ${subtitleOutlineColor}`,
-                    paintOrder: 'stroke fill',
+                    position: 'absolute',
+                    top: 0,
+                    left: 0,
+                    width: '100%',
+                    height: '100%',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    justifyContent: 'flex-end', // Aligns items to bottom
+                    alignItems: (subtitleTextAlign === 'left' ? 'flex-start' : (subtitleTextAlign === 'right' ? 'flex-end' : 'center')),
+                    paddingBottom: `${subtitleMarginV * scaleRatio}px`, // Scaled pixel margin
+                    paddingLeft: '5%',
+                    paddingRight: '5%',
+                    boxSizing: 'border-box',
                     cursor: 'ns-resize',
-                    backgroundColor: subtitleBgEnabled ? `${subtitleBgColor}${Math.round(subtitleBgOpacity * 2.55).toString(16).padStart(2, '0')}` : 'transparent',
-                    // Dynamic scaling for Padding
-                    padding: subtitleBgEnabled ? `${4 * scaleRatio}px ${subtitleOutlineWidth * scaleRatio}px` : '0',
-                    borderRadius: '0px',
+                    pointerEvents: 'auto' // Allow dragging on empty space? Maybe better on text only
                   }}
                   onMouseDown={(e) => {
                     e.preventDefault();
                     setIsDraggingSubtitle(true);
                   }}
                 >
-                  {wrapText(previewText, subtitleCharsPerLine)}
+                  <div style={{
+                    // Inner content box
+                    backgroundColor: subtitleBgEnabled ? `${subtitleBgColor}${Math.round((subtitleBgOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'transparent',
+                    padding: `${subtitleBgPaddingY * scaleRatio}px ${subtitleBgPaddingX * scaleRatio}px`,
+                    borderRadius: `${subtitleBgRadius * scaleRatio}px`,
+                    maxWidth: '100%',
+                    boxSizing: 'border-box',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: (subtitleTextAlign === 'left' ? 'flex-start' : (subtitleTextAlign === 'right' ? 'flex-end' : 'center')),
+                  }}>
+                    <span style={{
+                      fontFamily: subtitleFontName ? `"${subtitleFontName}", Arial, sans-serif` : 'Arial',
+                      fontSize: `${subtitleFontSize * scaleRatio}px`,
+                      fontWeight: subtitleFontWeight,
+                      fontStyle: subtitleFontStyle,
+                      color: isTextGradient ? 'transparent' : subtitleTextColor,
+                      textAlign: (subtitleTextAlign as any) || 'center',
+                      letterSpacing: `${subtitleLetterSpacing * scaleRatio}px`,
+                      lineHeight: subtitleLineHeight,
+                      textTransform: (subtitleTextTransform as any) || 'none',
+                      backgroundImage: isTextGradient ? `linear-gradient(${textGradientDirection}, ${textGradientColors.join(', ')})` : 'none',
+                      WebkitBackgroundClip: isTextGradient ? 'text' : undefined,
+                      WebkitTextFillColor: isTextGradient ? 'transparent' : undefined,
+                      // CSS Stroke simulation
+                      WebkitTextStroke: (isSubtitleOutline && subtitleOutlineWidth > 0) ? `${(subtitleOutlineWidth * scaleRatio) * 2}px ${subtitleOutlineColor}` : '0px',
+                      paintOrder: 'stroke fill',
+                      strokeLinejoin: 'round',
+                      strokeLinecap: 'round',
+                      // CSS Shadow simulation
+                      textShadow: isSubtitleShadow ? `${subtitleShadowOffsetX * scaleRatio}px ${subtitleShadowOffsetY * scaleRatio}px ${subtitleShadowBlur * scaleRatio}px ${subtitleShadowColor}${Math.round((subtitleShadowOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'none',
+                      whiteSpace: 'pre-wrap'
+                    }}>
+                      {wrapText(previewText, subtitleCharsPerLine)}
+                    </span>
+                  </div>
                 </div>
               </div>
               <div className="preview-controls">
@@ -647,8 +949,15 @@ function App() {
                     <div className="setting-mini"><label>長度(秒)</label><input type="number" value={targetDuration} onChange={(e) => setTargetDuration(Number(e.target.value))} /></div>
                   </div>
                   <textarea className="instruction-input-sm" placeholder="AI 剪輯指令 (例如：找出所有精彩笑點...)" value={instruction} onChange={(e) => setInstruction(e.target.value)} />
-                  <button onClick={handleMakeVideo} disabled={!videoFile || isProcessing} className="btn-action-sm">
-                    {isProcessing ? <Loader2 className="spin" size={14} /> : <><Wand2 size={14} /> AI 分析片段</>}
+                  <button
+                    onClick={handleMakeVideo}
+                    disabled={!videoFile || isProcessing}
+                    className={!videoFile ? "btn-disabled" : "btn-premium-ai"}
+                    style={{ width: '100%', marginTop: '16px' }}
+                  >
+                    {isProcessing ? <><Loader2 className="spin" size={20} /> AI 分析中 (約 30s)...</> :
+                      !videoFile ? <><Video size={20} /> 請先上傳素材影片</> :
+                        <><Zap size={20} /> 開始 AI 自動分析片段</>}
                   </button>
                 </div>
 
@@ -676,7 +985,7 @@ function App() {
 
                     <label className="checkbox-sm">
                       <input type="checkbox" checked={isStudioSound} onChange={e => setIsStudioSound(e.target.checked)} />
-                      <span>DFN3 深度智慧降噪</span>
+                      <span>DFN3 深度智慧降噪 (Beta)</span>
                     </label>
                     {isStudioSound && (
                       <div className="mini-settings-panel">
@@ -689,174 +998,284 @@ function App() {
                     )}
 
                     <label className="checkbox-sm">
-                      <input type="checkbox" checked={isAutoCaption} onChange={e => setIsAutoCaption(e.target.checked)} />
-                      <span>AI 語音轉文字 (SRT)</span>
+                      <input type="checkbox" checked={isSilenceRemoval} onChange={e => setIsSilenceRemoval(e.target.checked)} />
+                      <span>智慧去氣口 & Jump Cuts (Beta)</span>
                     </label>
+                    {isSilenceRemoval && (
+                      <div className="mini-settings-panel">
+                        <div className="style-row-inline" style={{ marginBottom: '8px' }}>
+                          <span className="style-label">靜音閾值(秒)</span>
+                          <input type="range" min="0.1" max="2.0" step="0.1" value={silenceThreshold} onChange={e => setSilenceThreshold(parseFloat(e.target.value))} className="slider-sm" />
+                          <span className="val-display">{silenceThreshold}s</span>
+                        </div>
+                        <label className="checkbox-inline">
+                          <input type="checkbox" checked={isJumpCutZoom} onChange={e => setIsJumpCutZoom(e.target.checked)} />
+                          <span>自動變焦 (Visual Pop)</span>
+                        </label>
+                      </div>
+                    )}
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                      <label className="checkbox-sm">
+                        <input type="checkbox" checked={isAutoCaption} onChange={e => setIsAutoCaption(e.target.checked)} />
+                        <span>{srtSubtitles.length > 0 ? `已載入 SRT 字幕 (${srtSubtitles.length})` : 'AI 語音轉文字 (SRT)'}</span>
+                      </label>
+                    </div>
+
                     {isAutoCaption && (
                       <div className="caption-sub-settings">
-                        <div className="style-row-inline" style={{ marginBottom: '8px' }}>
-                          <span className="style-label" style={{ minWidth: '60px' }}>轉錄語言</span>
-                          <select value={whisperLanguage} onChange={e => setWhisperLanguage(e.target.value)} className="select-xs" style={{ flex: 1 }}>
-                            <option value="zh">繁體中文 (Chinese)</option>
-                            <option value="en">英文 (English)</option>
-                            <option value="ja">日文 (Japanese)</option>
-                            <option value="auto">自動偵測 (Auto)</option>
-                          </select>
-                        </div>
-                        <label className="checkbox-inline"><input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} /><span>繁體中文翻譯 (Gemini)</span></label>
-                        <label className="checkbox-inline"><input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} /><span>燒錄至影片 (硬字幕)</span></label>
+                        {srtSubtitles.length === 0 && (
+                          <>
+                            <div className="style-row-inline" style={{ marginBottom: '8px' }}>
+                              <span className="style-label" style={{ minWidth: '60px' }}>轉錄語言</span>
+                              <select value={whisperLanguage} onChange={e => setWhisperLanguage(e.target.value)} className="select-xs" style={{ flex: 1 }}>
+                                <option value="zh">中文 (Auto)</option>
+                                <option value="zh-tw">繁體中文 (Taiwan)</option>
+                                <option value="en">英文 (English)</option>
+                                <option value="ja">日文 (Japanese)</option>
+                                <option value="auto">自動偵測 (Auto)</option>
+                              </select>
+                            </div>
+                            <label className="checkbox-inline"><input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} /><span>繁體中文翻譯 (Gemini)</span></label>
+                          </>
+                        )}
+                        {srtSubtitles.length !== 0 && (
+                          <div style={{ marginBottom: '8px' }}>
+                            <button onClick={() => setSrtSubtitles([])} className="btn-ghost-xs" style={{ color: '#ef4444' }}>移除已載入的 SRT</button>
+                          </div>
+                        )}
+
+                        <label className="checkbox-inline" style={{ marginTop: '10px' }}>
+                          <input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} />
+                          <span>燒錄至影片 (硬字幕)</span>
+                        </label>
                       </div>
                     )}
                   </div>
                 </div>
 
-                {/* 3. Subtitle Styles */}
-                {isBurnCaptions && (
+                {/* 3. Subtitle Styles (Advanced) - Redesigned for Pro Layout */}
+                {(isBurnCaptions || isAutoCaption) && (
                   <div className="controls-section">
                     <div className="section-header"><Wand2 size={16} className="icon-primary" /><span>字幕視覺設計</span></div>
 
-                    {/* Font Selection */}
-                    <div className="style-item" style={{ marginBottom: '16px' }}>
-                      <label>字體系統</label>
-                      <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                        <select value={subtitleFontName} onChange={e => setSubtitleFontName(e.target.value)} className="select-sm" style={{ flex: 1 }}>
+                    <div className="style-group">
+                      <label className="group-label">文字樣式</label>
+
+                      <div className="style-item" style={{ marginBottom: '10px' }}>
+                        <select
+                          value={subtitleFontName}
+                          onChange={e => setSubtitleFontName(e.target.value)}
+                          className="select-sm"
+                          style={{ width: '100%' }}
+                        >
                           {fontList.map(f => <option key={f} value={f}>{f}</option>)}
                         </select>
-                        <input
-                          type="file"
-                          accept=".ttf,.otf,.woff,.woff2"
-                          style={{ display: 'none' }}
-                          id="font-upload"
-                          onChange={async (e) => {
-                            const file = e.target.files?.[0];
-                            if (!file) return;
-                            const formData = new FormData();
-                            formData.append('file', file);
-                            try {
-                              const res = await fetch('http://localhost:8000/upload-font', { method: 'POST', body: formData });
-                              if (res.ok) {
-                                const data = await res.json();
-                                const fontName = data.font_name || file.name.replace(/\.[^/.]+$/, '');
-                                setFontList(prev => [...new Set([...prev, fontName])]);
-                                setSubtitleFontName(fontName);
-                                alert(`字體 "${fontName}" 上傳成功！`);
-                              }
-                            } catch {
-                              alert('字體上傳失敗，請確認後端服務運行中');
-                            }
-                          }}
-                        />
-                        <label htmlFor="font-upload" className="btn-icon-sm" style={{ cursor: 'pointer', padding: '6px 10px' }}>
-                          <Upload size={14} />
-                        </label>
                       </div>
-                    </div>
 
-                    {/* Font Size Slider */}
-                    <div className="slider-row">
-                      <label>字體大小</label>
-                      <input type="range" min="24" max="150" value={subtitleFontSize} onChange={e => setSubtitleFontSize(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="24" max="150" value={subtitleFontSize} onChange={e => setSubtitleFontSize(parseInt(e.target.value) || 24)} className="val-input" />
-                    </div>
-
-                    {/* Outline Width / Box Padding Slider (Dual Purpose) */}
-                    <div className="slider-row" style={{ marginTop: '14px' }}>
-                      <label>{subtitleBgEnabled ? '背景寬度 (Padding)' : '邊框寬度'}</label>
-                      <input type="range" min="0" max={subtitleBgEnabled ? 50 : 20} value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="0" max={subtitleBgEnabled ? 50 : 20} value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseInt(e.target.value) || 0)} className="val-input" />
-                    </div>
-
-                    {/* Outline Color - Only show if BG is disabled */}
-                    {!subtitleBgEnabled && (
-                      <div className="style-grid" style={{ marginTop: '14px' }}>
-                        <div className="style-item">
-                          <label>文字顏色</label>
-                          <input type="color" value={subtitleColor} onChange={e => setSubtitleColor(e.target.value)} className="color-sm" />
-                        </div>
-                        <div className="style-item">
-                          <label>邊框顏色</label>
-                          <input type="color" value={subtitleOutlineColor} onChange={e => setSubtitleOutlineColor(e.target.value)} className="color-sm" />
+                      <div className="style-item">
+                        <div className="style-row-inline">
+                          <span className="style-label" style={{ minWidth: '30px' }}>大小</span>
+                          <input type="range" min="12" max="150" value={subtitleFontSize} onChange={e => setSubtitleFontSize(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                          <span className="val-display" style={{ minWidth: '40px' }}>{subtitleFontSize}px</span>
                         </div>
                       </div>
-                    )}
 
-                    {subtitleBgEnabled && (
-                      <div className="style-item" style={{ marginTop: '14px' }}>
-                        <label>文字顏色</label>
-                        <input type="color" value={subtitleColor} onChange={e => setSubtitleColor(e.target.value)} className="color-sm" />
-                      </div>
-                    )}
-
-                    {/* Shadow Slider */}
-                    <div className="slider-row">
-                      <label>陰影大小</label>
-                      <input type="range" min="0" max="20" value={subtitleShadowSize} onChange={e => setSubtitleShadowSize(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="0" max="20" value={subtitleShadowSize} onChange={e => setSubtitleShadowSize(parseInt(e.target.value) || 0)} className="val-input" />
-                    </div>
-
-                    {/* Shadow Color & Opacity (Color removed, opacity only) */}
-                    <div className="style-grid" style={{ marginTop: '14px' }}>
-                      <div className="style-item" style={{ width: '100%' }}>
-                        <label>陰影透明度</label>
-                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
-                          <input type="range" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                          <input type="number" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value) || 0)} className="val-input" style={{ width: '40px' }} />
+                      <div className="style-grid-2" style={{ marginTop: '10px' }}>
+                        <div className="mini-control">
+                          <label className="label-xs">粗細</label>
+                          <select value={subtitleFontWeight} onChange={e => setSubtitleFontWeight(e.target.value)} className="select-xs">
+                            <option value="normal">Normal</option>
+                            <option value="bold">Bold</option>
+                            <option value="500">Medium</option>
+                            <option value="900">Black</option>
+                          </select>
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">斜體</label>
+                          <select value={subtitleFontStyle} onChange={e => setSubtitleFontStyle(e.target.value)} className="select-xs">
+                            <option value="normal">正體</option>
+                            <option value="italic">斜體</option>
+                          </select>
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">轉換</label>
+                          <select value={subtitleTextTransform} onChange={e => setSubtitleTextTransform(e.target.value)} className="select-xs">
+                            <option value="none">正常</option>
+                            <option value="uppercase">大寫</option>
+                            <option value="lowercase">小寫</option>
+                            <option value="capitalize">首字大寫</option>
+                          </select>
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">對齊</label>
+                          <select value={subtitleTextAlign} onChange={e => setSubtitleTextAlign(e.target.value)} className="select-xs">
+                            <option value="center">置中</option>
+                            <option value="left">靠左</option>
+                            <option value="right">靠右</option>
+                          </select>
                         </div>
                       </div>
                     </div>
 
-                    {/* Vertical Position Slider */}
-                    <div className="slider-row">
-                      <label>垂直位移</label>
-                      <input type="range" min="0" max="200" value={subtitleMarginV} onChange={e => setSubtitleMarginV(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="0" max="200" value={subtitleMarginV} onChange={e => setSubtitleMarginV(parseInt(e.target.value) || 0)} className="val-input" />
+                    <div className="style-group">
+                      <label className="group-label">間隔與佈局</label>
+
+                      <div className="style-grid-3">
+                        <div className="mini-control">
+                          <label className="label-xs">行高</label>
+                          <input type="range" min="0.8" max="2.5" step="0.1" value={subtitleLineHeight} onChange={e => setSubtitleLineHeight(parseFloat(e.target.value))} className="slider-xs" />
+                          <input type="number" step="0.1" value={subtitleLineHeight} onChange={e => setSubtitleLineHeight(parseFloat(e.target.value))} className="input-xs" />
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">字距</label>
+                          <input type="range" min="-5" max="20" step="0.5" value={subtitleLetterSpacing} onChange={e => setSubtitleLetterSpacing(parseFloat(e.target.value))} className="slider-xs" />
+                          <input type="number" step="0.5" value={subtitleLetterSpacing} onChange={e => setSubtitleLetterSpacing(parseFloat(e.target.value))} className="input-xs" />
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">限制字數</label>
+                          <input type="range" min="4" max="40" step="1" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="slider-xs" />
+                          <input type="number" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="input-xs" />
+                        </div>
+                      </div>
+
+                      <div className="style-row-inline" style={{ marginTop: '12px' }}>
+                        <span className="label-xs" style={{ minWidth: '50px' }}>垂直邊距</span>
+                        <input type="range" min="0" max="600" value={subtitleMarginV} onChange={e => setSubtitleMarginV(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                        <span className="val-display" style={{ minWidth: '30px' }}>{subtitleMarginV}</span>
+                      </div>
+
+                      <div className="style-row-inline" style={{ marginTop: '12px' }}>
+                        <span className="label-xs" style={{ minWidth: '50px' }}>出現動畫</span>
+                        <select
+                          value={subtitleAnimation}
+                          onChange={e => setSubtitleAnimation(e.target.value as any)}
+                          className="select-xs"
+                          style={{ flex: 1 }}
+                        >
+                          <option value="none">無 (Static)</option>
+                          <option value="pop">放大彈出 (Pop)</option>
+                          <option value="fade">淡入 (Fade)</option>
+                          <option value="slide-up">向上滑入 (Slide Up)</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="style-item" style={{ marginTop: '10px' }}>
+                      <div className="input-group-xs">
+                        <span className="label-xs">預覽文字</span>
+                        <input type="text" value={previewText} onChange={e => setPreviewText(e.target.value)} className="input-xs" style={{ flex: 1, textAlign: 'left' }} placeholder="輸入預覽字樣..." />
+                      </div>
                     </div>
 
-                    {/* Chars Per Line Slider */}
-                    <div className="slider-row">
-                      <label>每行字數</label>
-                      <input type="range" min="4" max="30" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="slider-sm" />
-                      <input type="number" min="4" max="30" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value) || 4)} className="val-input" />
+                    <div className="style-group">
+                      <label className="group-label">外觀與特效</label>
+
+                      <div className="tab-switch" style={{ marginBottom: '10px' }}>
+                        <button className={!isTextGradient ? 'active' : ''} onClick={() => setIsTextGradient(false)}>單色</button>
+                        <button className={isTextGradient ? 'active' : ''} onClick={() => setIsTextGradient(true)}>漸層</button>
+                      </div>
+
+                      {!isTextGradient ? (
+                        <div className="style-row-inline">
+                          <input type="color" value={subtitleTextColor} onChange={e => setSubtitleTextColor(e.target.value)} className="color-full" style={{ height: '32px' }} />
+                        </div>
+                      ) : (
+                        <div className="style-col-flex">
+                          <div className="style-grid-2">
+                            <input type="color" value={textGradientColors[0]} onChange={e => handleGradientColorChange(0, e.target.value)} className="color-full" />
+                            <input type="color" value={textGradientColors[1]} onChange={e => handleGradientColorChange(1, e.target.value)} className="color-full" />
+                          </div>
+                          <select value={textGradientDirection} onChange={e => setTextGradientDirection(e.target.value)} className="select-xs" style={{ width: '100%', marginTop: '4px' }}>
+                            <option value="to bottom">垂直漸層 (↓)</option>
+                            <option value="to right">水平漸層 (→)</option>
+                            <option value="to bottom right">對角漸層 (↘)</option>
+                            <option value="to top">反向垂直 (↑)</option>
+                          </select>
+                        </div>
+                      )}
+
+                      <div className="style-grid-3" style={{ marginTop: '10px' }}>
+                        <div className="mini-control" style={{ gridColumn: 'span 2' }}>
+                          <label className="checkbox-inline">
+                            <input type="checkbox" checked={isSubtitleOutline} onChange={e => setIsSubtitleOutline(e.target.checked)} />
+                            <span className="label-xs">描邊效果</span>
+                          </label>
+                          <input type="range" min="0" max="30" step="0.5" value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseFloat(e.target.value))} className="slider-sm" disabled={!isSubtitleOutline} />
+                        </div>
+                        <div className="mini-control">
+                          <label className="label-xs">顏色</label>
+                          <input type="color" value={subtitleOutlineColor} onChange={e => setSubtitleOutlineColor(e.target.value)} className="color-sm" style={{ width: '100%' }} disabled={!isSubtitleOutline} />
+                        </div>
+                      </div>
                     </div>
 
-                    {/* Font Style */}
-                    <div className="style-row-checkboxes" style={{ marginTop: '14px', display: 'flex', gap: '16px' }}>
-                      <label className="checkbox-inline">
-                        <input type="checkbox" checked={subtitleBold} onChange={e => setSubtitleBold(e.target.checked)} />
-                        <span>粗體</span>
+                    <div className="style-group">
+                      <label className="checkbox-inline" style={{ marginBottom: '14px', display: 'flex' }}>
+                        <input type="checkbox" checked={isSubtitleShadow} onChange={e => setIsSubtitleShadow(e.target.checked)} />
+                        <span className="label-xs" style={{ fontWeight: 600, color: '#fafafa' }}>陰影 Shadow</span>
                       </label>
-                      <label className="checkbox-inline">
-                        <input type="checkbox" checked={subtitleItalic} onChange={e => setSubtitleItalic(e.target.checked)} />
-                        <span>斜體</span>
-                      </label>
+                      {isSubtitleShadow && (
+                        <div style={{ paddingLeft: '4px' }}>
+                          <div className="style-row-inline" style={{ marginBottom: '16px' }}>
+                            <input type="color" value={subtitleShadowColor} onChange={e => setSubtitleShadowColor(e.target.value)} className="color-sm" style={{ width: '36px', height: '36px' }} />
+                            <div className="style-col-flex" style={{ flex: 1, marginLeft: '12px' }}>
+                              <div className="style-row-inline" style={{ justifyContent: 'space-between', marginBottom: '4px' }}>
+                                <span className="label-xs">模糊</span>
+                                <input type="range" min="0" max="30" value={subtitleShadowBlur} onChange={e => setSubtitleShadowBlur(parseFloat(e.target.value))} className="slider-sm" style={{ width: '80px' }} />
+                              </div>
+                              <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
+                                <span className="label-xs">不透</span>
+                                <input type="range" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value))} className="slider-sm" style={{ width: '80px' }} />
+                              </div>
+                            </div>
+                          </div>
+                          <div className="style-col-flex" style={{ marginTop: '14px', gap: '8px' }}>
+                            <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
+                              <span className="label-xs">Shadow X</span>
+                              <input type="range" min="-50" max="50" value={subtitleShadowOffsetX} onChange={e => setSubtitleShadowOffsetX(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1, margin: '0 8px' }} />
+                              <input type="number" value={subtitleShadowOffsetX} onChange={e => setSubtitleShadowOffsetX(parseFloat(e.target.value))} className="input-xs" style={{ width: '36px' }} />
+                            </div>
+                            <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
+                              <span className="label-xs">Shadow Y</span>
+                              <input type="range" min="-50" max="50" value={subtitleShadowOffsetY} onChange={e => setSubtitleShadowOffsetY(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1, margin: '0 8px' }} />
+                              <input type="number" value={subtitleShadowOffsetY} onChange={e => setSubtitleShadowOffsetY(parseFloat(e.target.value))} className="input-xs" style={{ width: '36px' }} />
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
-                    {/* Background Box */}
-                    <div className="style-block" style={{ marginTop: '16px' }}>
+                    <div className="style-group">
                       <label className="checkbox-sm">
                         <input type="checkbox" checked={subtitleBgEnabled} onChange={e => setSubtitleBgEnabled(e.target.checked)} />
                         <span>字幕背景框</span>
                       </label>
                       {subtitleBgEnabled && (
-                        <div style={{ marginLeft: '28px', marginTop: '10px' }}>
-                          <div className="style-item" style={{ marginBottom: '10px' }}>
-                            <label>背景顏色</label>
-                            <input type="color" value={subtitleBgColor} onChange={e => setSubtitleBgColor(e.target.value)} className="color-sm" />
+                        <div className="nested-panel" style={{ marginTop: '10px' }}>
+                          <div className="style-row-inline" style={{ marginBottom: '8px', gap: '8px' }}>
+                            <input type="color" value={subtitleBgColor} onChange={e => setSubtitleBgColor(e.target.value)} className="color-sm" style={{ width: '32px' }} />
+                            <span className="label-xs">不透</span>
+                            <input type="range" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
                           </div>
-                          <div className="slider-row">
-                            <label>透明度</label>
-                            <input type="range" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value))} className="slider-sm" />
-                            <input type="number" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value) || 0)} className="val-input" />
+                          <div className="style-col-flex" style={{ gap: '10px' }}>
+                            <div className="slider-row">
+                              <label className="label-xs" style={{ minWidth: '40px' }}>Pad X</label>
+                              <input type="range" min="0" max="100" value={subtitleBgPaddingX} onChange={e => setSubtitleBgPaddingX(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                              <input type="number" value={subtitleBgPaddingX} onChange={e => setSubtitleBgPaddingX(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
+                            </div>
+                            <div className="slider-row">
+                              <label className="label-xs" style={{ minWidth: '40px' }}>Pad Y</label>
+                              <input type="range" min="0" max="100" value={subtitleBgPaddingY} onChange={e => setSubtitleBgPaddingY(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                              <input type="number" value={subtitleBgPaddingY} onChange={e => setSubtitleBgPaddingY(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
+                            </div>
+                            <div className="slider-row">
+                              <label className="label-xs" style={{ minWidth: '40px' }}>圓角</label>
+                              <input type="range" min="0" max="50" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                              <input type="number" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
+                            </div>
                           </div>
                         </div>
-
                       )}
-                    </div>
-
-                    {/* Preview Text */}
-                    <div className="preview-text-box">
-                      <label>預覽文字</label>
-                      <input type="text" value={previewText} onChange={e => setPreviewText(e.target.value)} className="input-full-sm" />
                     </div>
                   </div>
                 )}
@@ -869,7 +1288,10 @@ function App() {
                       <div key={cut.id} className="cut-card">
                         <div className="cut-header">
                           <input className="cut-label-input" value={cut.label} onChange={(e) => updateCutLabel(cut.id, e.target.value)} />
-                          <button onClick={() => setCuts(cuts.filter(c => c.id !== cut.id))} className="btn-delete"><Trash size={14} /></button>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <span className="cut-duration-badge">{(cut.end - cut.start).toFixed(1)}s</span>
+                            <button onClick={() => setCuts(cuts.filter(c => c.id !== cut.id))} className="btn-delete"><Trash size={14} /></button>
+                          </div>
                         </div>
                         <div className="cut-time-inputs">
                           <div className="time-input-group">
@@ -898,7 +1320,6 @@ function App() {
                             />
                             <span>s</span>
                           </div>
-                          <span className="cut-duration">({(cut.end - cut.start).toFixed(1)}s)</span>
                         </div>
                         {/* Time Range Sliders */}
                         <div className="cut-slider-row">
@@ -929,8 +1350,11 @@ function App() {
                           <button className="btn-seek" onClick={() => seekTo(cut.start)}>
                             <Play size={12} /> 跳轉開始
                           </button>
-                          <button className={`btn-preview-xs ${previewingId === cut.id ? 'active' : ''}`} onClick={() => handlePreview(cut)} disabled={isPreviewLoading}>
-                            {previewingId === cut.id ? <Loader2 className="spin" size={12} /> : <Play size={12} />} 預覽此片段
+                          <button className="btn-preview-xs" onClick={() => handlePreview(cut)}>
+                            <Play size={12} /> 預覽
+                          </button>
+                          <button className="btn-preview-xs" style={{ background: 'rgba(16, 185, 129, 0.1)', borderColor: 'rgba(16, 185, 129, 0.3)' }} onClick={() => handleExport(cut)}>
+                            <Download size={12} /> 匯出此段
                           </button>
                         </div>
                       </div>
@@ -965,27 +1389,31 @@ function App() {
               </div>
             </aside>
           </div>
-        </div >
-
-
-
-      </main >
+        </div>
+      </main>
 
       {/* Bottom Progress Bar */}
       {
-        (isPreviewLoading || isExporting) && (
+        (isExporting || isPreviewLoading) && (
           <div className="progress-bar-bottom">
-            <div className="progress-bar-fill" style={{ width: `${isExporting ? exportProgress : previewProgress}%` }} />
+            <div className="progress-bar-fill" style={{ width: `${isPreviewLoading ? previewProgress : exportProgress}%` }} />
             <div className="progress-bar-content">
               <Loader2 className="spin" size={16} />
-              <span>{isExporting ? '匯出處理中' : '預覽生成中'}</span>
-              <span className="progress-percent">{Math.round(isExporting ? exportProgress : previewProgress)}%</span>
+              <span>{isPreviewLoading ? previewMessage : (systemStatus.message || '匯出處理中')}</span>
+              <span className="progress-percent">{Math.round(isPreviewLoading ? previewProgress : exportProgress)}%</span>
             </div>
+            {/* Cancel Button (Only for export for now) */}
+            {!isPreviewLoading && (
+              <button className="btn-icon-xs" style={{ marginLeft: '10px', background: 'rgba(255,255,255,0.2)' }} onClick={() => window.location.reload()}>
+                <X size={14} />
+              </button>
+            )}
           </div>
         )
       }
     </div >
   );
 }
+
 
 export default App;

@@ -27,7 +27,7 @@ except Exception as e:
 import shutil
 import base64
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -117,20 +117,33 @@ def hex_to_ass(hex_color, alpha=1.0):
         return "&H00FFFFFF" # Fallback White
 
 def wrap_text(text, max_chars=12):
-    """Simple wrapping for subtitles"""
-    if not text: return ""
-    if max_chars <= 0: max_chars = 12 # Safety fallback
-    import re
-    # If CJK characters found, do character-based wrap
-    if re.search(r'[\u4e00-\u9fff]', text):
-        return "\n".join([text[i:i+max_chars] for i in range(0, len(text), max_chars)])
-    else:
-        # Standard word wrap for English
-        import textwrap
-        return "\n".join(textwrap.wrap(text, width=max_chars))
+    """Improved wrapping for subtitles (supports CJK and English)"""
+    if not text or max_chars <= 0: return text
+    
+    # Check if there are existing newlines
+    lines = text.split('\n')
+    new_lines = []
+    
+    for line in lines:
+        if len(line) <= max_chars:
+            new_lines.append(line)
+            continue
+            
+        import re
+        # If CJK characters found, do character-based wrap
+        if re.search(r'[\u4e00-\u9fff]', line):
+            # For CJK, we just cut at max_chars
+            for i in range(0, len(line), max_chars):
+                new_lines.append(line[i:i+max_chars])
+        else:
+            # Standard word wrap for English
+            import textwrap
+            new_lines.extend(textwrap.wrap(line, width=max_chars))
+            
+    return "\n".join(new_lines)
 
 
-def optimize_segments(segments, max_chars=20):
+def optimize_segments(segments, max_chars=7):
     """
     Splits long whisper segments into shorter ones based on character count and duration.
     Essential for vertical video to prevent subtitle walls.
@@ -175,29 +188,48 @@ def optimize_segments(segments, max_chars=20):
         else:
             new_segments.append(s)
     return new_segments
-# Helper for robustness
-def fallback_cut_video(input_path, output_path, start, end):
-    """Fallback to direct FFmpeg command if MoviePy fails"""
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        duration = end - start
+    return new_segments
+
+def translate_subtitles(full_subtitles, api_key):
+    """Translate list of subtitle dicts using Gemini"""
+    if not api_key or api_key == "null" or not full_subtitles:
+        return full_subtitles
         
-        # Simple cut re-encoding
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-ss", str(start),
-            "-i", input_path,
-            "-t", str(duration),
-            "-c:v", "libx264", "-c:a", "aac",
-            "-strict", "experimental",
-            output_path
-        ]
-        print(f"⚠️ MoviePy failed, trying fallback FFmpeg cut: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        return True
+    print("🤖 Translating transcription with Gemini...")
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash") # Use fast model for translation
+        
+        # Translate in batches to avoid rate limits/prompt length issues
+        batch_size = 20
+        for i in range(0, len(full_subtitles), batch_size):
+            batch = full_subtitles[i : i+batch_size]
+            text_to_translate = "\n".join([f"{idx}: {s['text']}" for idx, s in enumerate(batch)])
+            
+            prompt = f"請將以下逐字稿內容翻譯成繁體中文（台灣習慣用語），保持簡短與原始意思。只回傳翻譯內容，格式為 '索引: 翻譯'：\n{text_to_translate}"
+            try:
+                response = model.generate_content(prompt)
+                # Parse response (expected each line: "0: translated text")
+                for line in response.text.strip().split('\n'):
+                    if ':' in line:
+                        idx_str, trans = line.split(':', 1)
+                        try:
+                            # Use regex to find index and text
+                            import re
+                            m = re.match(r'(\d+)\s*:\s*(.*)', line)
+                            if m:
+                                b_idx = int(m.group(1).strip())
+                                trans_val = m.group(2).strip()
+                                if b_idx < len(batch):
+                                    batch[b_idx]['text'] = trans_val
+                        except: pass
+            except Exception as te:
+                print(f"⚠️ Translation batch {i} failed: {te}")
     except Exception as e:
-        print(f"❌ Fallback cut also failed: {e}")
-        return False
+        print(f"⚠️ Global translation failed: {e}")
+    
+    return full_subtitles
+# Fallback logic removed as we use Remotion
 
 # ... (Existing code)
 
@@ -207,27 +239,50 @@ def fallback_cut_video(input_path, output_path, start, end):
 model_status = {"progress": 100, "status": "initializing", "message": "正準備下載模型..."}
 whisper_model = None
 
-# MediaPipe Initialization
-# MediaPipe Initialization
+# MediaPipe Initialization (New Tasks API for v0.10+)
+face_detector = None
+mp_face_detection = None
+
 try:
-    if not hasattr(mp, 'solutions'):
-        import mediapipe.python.solutions as mp_solutions
-        mp_face_detection = mp_solutions.face_detection
-    else:
-        mp_face_detection = mp.solutions.face_detection
+    # Try new MediaPipe Tasks API first (v0.10+)
+    from mediapipe.tasks.python.vision import FaceDetector, FaceDetectorOptions
+    from mediapipe.tasks.python import BaseOptions
+    import urllib.request
     
-    face_detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
-    print("✅ MediaPipe Face Detection Ready")
+    # Download the face detection model if not present
+    model_path = "blaze_face_short_range.tflite"
+    if not os.path.exists(model_path):
+        print("📥 Downloading MediaPipe Face Detection model...")
+        url = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"
+        urllib.request.urlretrieve(url, model_path)
+    
+    options = FaceDetectorOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        min_detection_confidence=0.5
+    )
+    face_detector = FaceDetector.create_from_options(options)
+    print("✅ MediaPipe Face Detection Ready (Tasks API)")
 except Exception as e:
-    print(f"⚠️ MediaPipe Init Failed: {e}")
-    # Initialize fallback OpenCV detector as last resort
+    print(f"⚠️ MediaPipe Tasks API Init Failed: {e}")
+    # Try legacy solutions API
     try:
-        import cv2
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        face_detector = "opencv_fallback"
-        print("⚠️ Used OpenCV Haar Classifier as fallback")
-    except:
-        face_detector = None
+        import mediapipe as mp
+        if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_detection'):
+            mp_face_detection = mp.solutions.face_detection
+            face_detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+            print("✅ MediaPipe Face Detection Ready (Legacy API)")
+        else:
+            raise ImportError("No solutions API available")
+    except Exception as e2:
+        print(f"⚠️ MediaPipe Legacy Init Also Failed: {e2}")
+        # Initialize fallback OpenCV detector as last resort
+        try:
+            import cv2
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            face_detector = "opencv_fallback"
+            print("⚠️ Used OpenCV Haar Classifier as fallback")
+        except:
+            face_detector = None
 
 # Studio Sound (DFN3)
 try:
@@ -250,9 +305,9 @@ def download_whisper_model(model_name="turbo"):
         model_status = {"progress": 50, "status": "downloading", "message": f"正在載入 Whisper {model_name} 模型..."}
         print(f"📥 Loading Whisper model: {model_name}...")
         
-        # Use official whisper API - it handles download automatically
-        # Fallback order: turbo -> large-v3 -> medium -> base
-        model_options = [model_name, "large-v3", "medium", "base"]
+        # Use official whisper API
+        # Priority: turbo -> large-v3 -> medium
+        model_options = ["turbo", "large-v3", "medium", "base"]
         
         loaded_model = None
         for try_model in model_options:
@@ -282,9 +337,16 @@ threading.Thread(target=download_whisper_model, args=("turbo",), daemon=True).st
 
 app = FastAPI()
 
+# Global Job Status
+current_job_status = {"progress": 0, "message": "Idle", "step": "idle"}
+
 @app.get("/model-status")
 async def get_model_status():
     return model_status
+
+@app.get("/job-status")
+async def get_job_status():
+    return current_job_status
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -295,8 +357,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enable Static Access to Exports for Preview (Placed here after app init)
+# Enable Static Access to Exports & Uploads for Preview
 app.mount("/exports", StaticFiles(directory=OUTPUT_DIR), name="exports")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -372,320 +435,8 @@ def parse_time(value):
     print(f"⚠️ Could not parse time: {value}, defaulting to 0")
     return 0.0
 
-# --- Helper for Smart Cropping ---
-def get_smart_crop_center(clip, width, height, target_w):
-    """
-    Robust face detection to find the best horizontal center for cropping.
-    Uses median of multiple frames to ignore outliers.
-    """
-    import cv2
-    import numpy as np
-
-    # Try improved cascade first, fall back to default
-    cascades = [
-        'haarcascade_frontalface_alt2.xml',
-        'haarcascade_frontalface_default.xml'
-    ]
-    face_cascade = None
-    for c_name in cascades:
-        try:
-            path = cv2.data.haarcascades + c_name
-            if os.path.exists(path):
-                face_cascade = cv2.CascadeClassifier(path)
-                break
-        except: pass
-    
-    # Fallback if cv2 data not found or error
-    if face_cascade is None or face_cascade.empty():
-        print("⚠️ Smart Crop: No valid cascade found, defaulting to center.")
-        return width / 2
-
-    # Sample 7 frames for robust preview/export
-    start_t = 0 # Preview clip is already cut, so relative 0 is start
-    end_t = clip.duration
-    duration = end_t - start_t
-    
-    count = 7
-    detected_centers = []
-    
-    print(f"🤖 Analyzing {count} frames for smart crop...")
-    
-    for i in range(count):
-        t = start_t + (duration * i) / (count - 1)
-        # Avoid end of video (black frame)
-        if t >= clip.duration: t = clip.duration - 0.1
-        
-        try:
-            frame = clip.get_frame(t)
-            gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-            
-            # Min size: 10% of height (filtering noise like lamps)
-            min_size = int(height * 0.1)
-            
-            # Detect
-            faces = face_cascade.detectMultiScale(
-                gray, 
-                scaleFactor=1.1, 
-                minNeighbors=6, # Higher = less false positives
-                minSize=(min_size, min_size)
-            )
-            
-            if len(faces) > 0:
-                # Pick largest face
-                fx, fy, fw, fh = max(faces, key=lambda r: r[2]*r[3])
-                center_x = fx + (fw / 2)
-                detected_centers.append(center_x)
-        except Exception as e:
-            pass
-
-    if not detected_centers:
-        print("🤖 Smart Crop: No faces found. Defaulting to center.")
-        return width / 2
-    
-    # Use Median to reject outliers (e.g. lamp detected once)
-    detected_centers.sort()
-    median_center = detected_centers[len(detected_centers) // 2]
-    
-    # Additional smoothing/clamping
-    safe_min = target_w / 2
-    safe_max = width - (target_w / 2)
-    final_center = max(safe_min, min(median_center, safe_max))
-    
-    print(f"🤖 Smart Crop: Locked on x={final_center:.1f} (Median of {detected_centers})")
-    return final_center
-
-# --- Helper for Smart Cropping (v6: Anti-Ghosting & High Confidence) ---
-# --- Helper for Smart Cropping (v6: Anti-Ghosting & High Confidence) ---
-def get_smart_crop_plan(clip, width, height, target_w, speaker_weight=5.0, stickiness_weight=2.0, min_shot_duration=2.0):
-    """
-    Analyzes the clip using OpenCV (Industrial Standard) for robust face tracking.
-    Fallback from MediaPipe due to environment incompatibility.
-    v7.2: Pure Visual Tracking (Size Priority).
-    """
-    import cv2
-    import numpy as np
-
-    try:
-        # Load Haar Cascade
-        try:
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            face_cascade = cv2.CascadeClassifier(cascade_path)
-        except:
-            print("⚠️ Failed to load Haar Cascade. Tracking disabled.")
-            return [(0, width/2), (clip.duration, width/2)]
-        
-        step_sec = 0.2
-        times = np.arange(0, clip.duration, step_sec)
-        
-        robust_faces = [] 
-        
-        print(f"🤖 AI Tracking v7.2 (OpenCV): High-Confidence Analysis...")
-        
-        for t in times:
-            try:
-                frame = clip.get_frame(t)
-                if frame is None: continue
-                
-                # Convert to Gray
-                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-                
-                if face_detector == "opencv_fallback":
-                     # OpenCV Haar Cascade Logic
-                     faces = face_cascade.detectMultiScale(gray, 1.1, 5)
-                     for (fx, fy, fw, fh) in faces:
-                         fx_center = fx + fw / 2
-                         robust_faces.append({
-                             't': t, 'x': fx_center, 'w': fw, 'area': fw*fh
-                         })
-                         break # One face enough
-                elif face_detector:
-                     # MediaPipe Logic
-                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # Actually clip.get_frame usually returns RGB
-                     # Only convert if using raw cv2 capture
-                     # Clip.get_frame returns numpy array RGB usually
-                     results = face_detector.process(frame) 
-                     
-                     if results.detections:
-                         for detection in results.detections:
-                             bbox = detection.location_data.relative_bounding_box
-                             fw = bbox.width * width
-                             fh = bbox.height * height
-                             fx_center = (bbox.xmin + bbox.width/2) * width
-                             
-                             robust_faces.append({
-                                 't': t, 'x': fx_center, 'w': fw, 'area': fw*fh
-                             })
-                             break
-            except Exception as e:
-                # print(f"Frame analysis error: {e}")
-                pass
-                
-        if not robust_faces:
-            print("⚠️ No faces found in clip (or tracking failed). Defaulting to center.")
-            return [(0, width/2), (clip.duration, width/2)]
-
-        # --- 3. Build Safe Timeline ---
-        
-        def get_faces_at(t_query):
-            return [f for f in robust_faces if abs(f['t'] - t_query) < step_sec * 0.8]
-            
-        trajectory = []
-        
-        # Init center
-        start_candidates = [f for f in robust_faces if f['t'] < 1.0]
-        if not start_candidates: start_candidates = robust_faces[:5]
-        
-        current_target_x = width/2
-        if start_candidates:
-            best_start = max(start_candidates, key=lambda f: f['area'])
-            current_target_x = best_start['x']
-            print(f"🤖 Trace Start: Locking on Main Subject (Area {best_start['area']:.0f}) at X={current_target_x:.1f}")
-        
-        # --- Shot Logic (Cut Switching) ---
-        print("✂️ Generating Cut-Based Camera Plan...")
-        
-        # Deadband Logic (Dynamic Stability)
-        normalized_stickiness = max(0, min(stickiness_weight, 10)) / 10.0
-        deadband = width * (0.05 + 0.45 * normalized_stickiness)
-        min_dur = float(min_shot_duration)
-        last_cut_t = -999 
-        
-        for t in times:
-            faces_now = get_faces_at(t)
-            
-            if not faces_now:
-                trajectory.append((t, current_target_x))
-                continue
-                
-            best_face = None
-            highest_score = -1
-            
-            for face in faces_now:
-                # Score: Size Priority
-                area_score = (face['area'] / (width * height)) * float(speaker_weight)
-                
-                # Stickiness
-                stickiness = 0
-                if abs(face['x'] - current_target_x) < width * 0.1:
-                    stickiness = float(stickiness_weight)
-                    
-                total_score = area_score + stickiness
-                
-                if total_score > highest_score:
-                    highest_score = total_score
-                    best_face = face
-            
-            if best_face:
-                dist = abs(best_face['x'] - current_target_x)
-                time_since_cut = t - last_cut_t
-                
-                if dist > deadband and time_since_cut >= min_dur:
-                    current_target_x = best_face['x'] # CUT!
-                    last_cut_t = t
-            
-            trajectory.append((t, current_target_x))
-            
-        return trajectory
-
-    except Exception as e:
-        print(f"❌ Smart Crop Logic Failed (Global): {e}")
-        return [(0, width/2), (clip.duration, width/2)]
-    
-
-
-# --- Shared Logic for Reframing (v7) ---
-def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode_legacy="false", viz_tracking="false", track_zoom=1.5, track_weight=5.0, track_stickiness=2.0, min_shot_duration=2.0):
-    w, h = clip.size
-    should_track = (face_tracking == "true")
-    print(f"🎥 Smart Reframing Config: Ratio={aspect_ratio}, Track={should_track}, Viz={viz_tracking}, Zoom={track_zoom}, Weight={track_weight}")
-    # Interpret 9:16 request
-    is_vertical_9_16 = (aspect_ratio == "9:16") or (vertical_mode_legacy == "true")
-    
-    target_w = w
-    target_h = h
-    do_resize_back = False
-    
-    if is_vertical_9_16:
-         target_w = h * (9/16)
-    
-    if should_track:
-         # If 16:9 and Tracking, apply Zoom to allow panning
-         if not is_vertical_9_16:
-             zoom_factor = float(track_zoom)
-             print(f"🎥 16:9 AI Tracking: Zoom {zoom_factor}x Active")
-             target_w = w / zoom_factor
-             target_h = h / zoom_factor
-             do_resize_back = True
-         
-         # AI Trajectory
-         trajectory = get_smart_crop_plan(clip, w, h, target_w, speaker_weight=float(track_weight), stickiness_weight=float(track_stickiness), min_shot_duration=float(min_shot_duration))
-         
-         import numpy as np
-         times = [p[0] for p in trajectory]
-         centers = [p[1] for p in trajectory]
-         
-         # --- VISUALIZE MODE (Debug) ---
-         if viz_tracking == "true":
-             print("👁️ Visualizing Tracking Path...")
-             def viz_render(get_frame, t):
-                 frame = get_frame(t).copy()
-                 hf, wf = frame.shape[:2]
-                 if frame is None: return frame
-                 
-                 current_center_x = np.interp(t, times, centers)
-                 tw, th = int(target_w), int(target_h)
-                 x1 = int(current_center_x - tw / 2)
-                 y1 = int((hf - th) / 2)
-                 x1 = max(0, min(x1, wf - tw))
-                 y1 = max(0, min(y1, hf - th))
-                 
-                 import cv2
-                 # Draw Green Box
-                 cv2.rectangle(frame, (x1, y1), (x1+tw, y1+th), (0, 255, 0), 5)
-                 cv2.putText(frame, "AI TRACKING", (x1+10, y1+40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                 return frame
-             return clip.fl(viz_render)
-         
-         def pan_crop(get_frame, t):
-             frame = get_frame(t)
-             if frame is None: return frame
-             
-             # Step Interpolation (Jump Cuts) for "Cut Reframing"
-             idx = np.searchsorted(times, t, side='right') - 1
-             idx = max(0, min(idx, len(centers)-1))
-             current_center_x = centers[idx]
-             
-             hf, wf = frame.shape[:2]
-             tw = int(target_w)
-             th = int(target_h)
-             
-             x1 = int(current_center_x - tw / 2)
-             y1 = int((hf - th) / 2) # Center Vertically default
-             
-             # Clamping
-             x1 = max(0, min(x1, wf - tw))
-             y1 = max(0, min(y1, hf - th))
-             
-             cropped = frame[y1:y1+th, x1:x1+tw]
-             
-             # Resize back if needed (Virtual Zoom)
-             if do_resize_back:
-                 import cv2
-                 return cv2.resize(cropped, (wf, hf), interpolation=cv2.INTER_LINEAR)
-             return cropped
-
-         new_clip = clip.fl(pan_crop, apply_to=['mask'])
-         if not do_resize_back:
-             # Fix: Do not set .w/.h directly as they are read-only properties
-             new_clip.size = (int(target_w), int(target_h))
-         return new_clip
-         
-    elif is_vertical_9_16:
-         # Static Vertical Crop (Center)
-         x1 = w/2 - target_w/2
-         return clip.crop(x1=x1, y1=0, width=target_w, height=h)
-         
-    return clip
+# --- All legacy MoviePy/OpenCV reframing logic removed ---
+# Video processing is now handled via Remotion in 'process_video' endpoint.
 
 @app.post("/analyze-video")
 async def analyze_video(
@@ -728,22 +479,22 @@ async def analyze_video(
 
         # Explicit Prompt aimed at JSON structure
         constraint_text = ""
+        constraint_text = ""
         if target_count:
-            constraint_text += f"\n- Please find exactly {target_count} clips."
+            constraint_text += f"\n- MANDATORY: You MUST find exactly {target_count} clips. No more, no less."
         if target_duration:
-            constraint_text += f"\n- Each clip should be approximately {target_duration} seconds long."
+            constraint_text += f"\n- MANDATORY: Each clip MUST be exactly {target_duration} seconds long (end - start = {target_duration})."
+            constraint_text += f"\n- STRICTLY ADHERE to the duration of {target_duration}s. If a scene is longer, cut it at the {target_duration}s mark."
 
         prompt = f"""
-        You are a professional video editor. Analyze the video and extract clips based on this instruction:
+        You are a professional video editor. Analyze the video and extract exactly the best clips based on this instruction:
         "{instruction}"
         {constraint_text}
         
         Return the result strictly as a JSON list of objects.
-        
-        Return the result strictly as a JSON list of objects.
         Each object must have:
         - "start": start time in SECONDS (number, e.g., 12.5) . DO NOT use MM:SS format.
-        - "end": end time in SECONDS (number, e.g., 25.0). DO NOT use MM:SS format.
+        - "end": end time in SECONDS (number, e.g., 25.0). MUST be start + {target_duration if target_duration else "duration"}.
         - "label": A short description of the clip in Traditional Chinese.
         
         Example:
@@ -799,11 +550,15 @@ async def analyze_video(
         try:
             cuts = json.loads(response.text)
             
-            # Post-processing: Normalize times using smart parser
+            # Post-processing: Normalize times and ENFORCE target_duration if specified
             if isinstance(cuts, list):
                 for cut in cuts:
-                    cut["start"] = parse_time(cut.get("start", 0))
-                    cut["end"] = parse_time(cut.get("end", 0))
+                    start_t = parse_time(cut.get("start", 0))
+                    cut["start"] = start_t
+                    if target_duration and target_duration > 0:
+                        cut["end"] = round(start_t + target_duration, 2)
+                    else:
+                        cut["end"] = parse_time(cut.get("end", 0))
             
         except json.JSONDecodeError as je:
              raise ValueError(f"AI returned invalid JSON: {response.text}")
@@ -812,27 +567,259 @@ async def analyze_video(
         genai.delete_file(video_file.name)
         
         return cuts
-
     except Exception as e:
-        print(f"❌ Analysis Error: {e}")
-        # Return the actual error message to frontend
+        print(f"❌ Analysis error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'video_path' in locals() and os.path.exists(video_path):
+            os.remove(video_path)
+
+
+@app.post("/transcribe")
+def transcribe_only(
+    file: UploadFile = File(...),
+    whisper_language: str = Form("zh"),
+    subtitle_chars_per_line: int = Form(7),
+    translate_to_chinese: str = Form("false"),
+    api_key: str = Form(None),
+    cuts_json: str = Form(None)
+):
+    try:
+        temp_path = os.path.join(UPLOAD_DIR, f"transcribe_{int(time.time())}_{file.filename}")
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Extract Audio
+        video_clip = VideoFileClip(temp_path)
+        if video_clip.audio is None:
+            video_clip.close()
+            if os.path.exists(temp_path): os.remove(temp_path)
+            return JSONResponse(status_code=400, content={"detail": "影片沒有音軌，無法進行語音轉文字。"})
+
+        # Determine segments to transcribe
+        cuts = []
+        if cuts_json:
+            try:
+                cuts = json.loads(cuts_json)
+            except: pass
+
+        # Whisper Options
+        transcribe_options = {}
+        if whisper_language and whisper_language != "auto":
+            lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
+            transcribe_options["language"] = lang_arg
+            if whisper_language == "zh" or whisper_language == "zh-tw":
+                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
+
+        full_segments_raw = []
+
+        if cuts and len(cuts) > 0:
+            print(f"🗣️ Transcribing {len(cuts)} selected segments...")
+            for idx, cut in enumerate(cuts):
+                c_start = float(cut.get('start', 0))
+                c_end = float(cut.get('end', 0))
+                if c_end <= c_start: continue
+                
+                temp_segment_audio = os.path.join(UPLOAD_DIR, f"seg_trans_{idx}_{int(time.time())}.mp3")
+                try:
+                    audio_sub = video_clip.audio.subclip(c_start, c_end)
+                    audio_sub.write_audiofile(temp_segment_audio, logger=None)
+                    
+                    if os.path.exists(temp_segment_audio) and os.path.getsize(temp_segment_audio) > 1000:
+                        result = whisper_model.transcribe(temp_segment_audio, **transcribe_options)
+                        for seg in result["segments"]:
+                            seg['start'] += c_start
+                            seg['end'] += c_start
+                            full_segments_raw.append(seg)
+                except Exception as e:
+                    print(f"⚠️ Segment {idx} transcription skipped: {e}")
+                finally:
+                    if os.path.exists(temp_segment_audio): os.remove(temp_segment_audio)
+        else:
+            print(f"🗣️ Transcribing full video...")
+            temp_audio = os.path.join(UPLOAD_DIR, f"full_{int(time.time())}.mp3")
+            video_clip.audio.write_audiofile(temp_audio, logger=None)
+            result = whisper_model.transcribe(temp_audio, **transcribe_options)
+            full_segments_raw = result["segments"]
+            if os.path.exists(temp_audio): os.remove(temp_audio)
+
+        video_clip.close()
+
+        raw_segments = optimize_segments(full_segments_raw, max_chars=subtitle_chars_per_line)
+        full_subtitles = []
+        for i, seg in enumerate(raw_segments):
+            full_subtitles.append({
+                "id": str(i),
+                "start": seg['start'],
+                "end": seg['end'],
+                "text": seg['text'].strip()
+            })
+
+        # Translation Logic
+        if str(translate_to_chinese).lower() == "true":
+            full_subtitles = translate_subtitles(full_subtitles, api_key)
+
+        # Cleanup
+        if os.path.exists(temp_path): os.remove(temp_path)
+
+        return full_subtitles
+    except Exception as e:
+        print(f"❌ Transcribe Error: {e}")
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
-@app.post("/preview-clip")
-async def preview_clip(
+@app.post("/process-preview-pipeline")
+async def process_preview_pipeline(
     file: UploadFile = File(...),
     start: float = Form(...),
     end: float = Form(...),
-    vertical_mode: str = Form("false"),
-    aspect_ratio: str = Form("9:16"),
-    face_tracking: str = Form("true"),
-    viz_tracking: str = Form("false"),
-    track_zoom: float = Form(1.5),
-    track_weight: float = Form(5.0),
-    track_stickiness: float = Form(2.0),
-    min_shot_duration: float = Form(2.0),
-    dynamic_zoom: str = Form("false"),
+    
+    # Configs
+    is_denoise: str = Form("false"),
+    is_silence_removal: str = Form("false"),
+    silence_threshold: float = Form(0.3),
+    is_auto_caption: str = Form("false"),
+    subtitle_config: str = Form(None), # JSON string
+    is_face_tracking: str = Form("false"),
+    
+    # Whisper
+    whisper_language: str = Form("zh"),
     translate_to_chinese: str = Form("false"),
+    api_key: str = Form(None)
+):
+    # 1. Save Temp Chunk synchronously first
+    ts = int(time.time())
+    temp_video_path = os.path.join(UPLOAD_DIR, f"preview_chunk_{ts}_{file.filename}")
+    with open(temp_video_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return StreamingResponse(
+        preview_pipeline_generator(
+            temp_video_path, start, end,
+            is_denoise, is_silence_removal, silence_threshold,
+            is_auto_caption, subtitle_config, is_face_tracking,
+            whisper_language, translate_to_chinese, api_key
+        ),
+        media_type="application/x-ndjson"
+    )
+
+def preview_pipeline_generator(
+    temp_video_path, start, end,
+    is_denoise, is_silence_removal, silence_threshold,
+    is_auto_caption, subtitle_config, is_face_tracking,
+    whisper_language, translate_to_chinese, api_key
+):
+    try:
+        ts = int(time.time())
+        yield json.dumps({"status": "progress", "message": "正在前處理與依需求切割...", "percent": 10}) + "\n"
+
+        # Extract Subclip
+        clip = VideoFileClip(temp_video_path)
+        if start < 0: start = 0
+        if end > clip.duration: end = clip.duration
+        
+        sub = clip.subclip(start, end)
+        temp_sub_path = os.path.join(UPLOAD_DIR, f"sub_{ts}.mp4")
+        sub.write_videofile(temp_sub_path, audio_codec='aac', logger=None)
+        
+        # Audio Extraction
+        temp_audio_path = os.path.join(UPLOAD_DIR, f"audio_{ts}.mp3")
+        sub.audio.write_audiofile(temp_audio_path, logger=None)
+        
+        # 2. Denoise (Step 2)
+        final_audio_path = temp_audio_path
+        if str(is_denoise).lower() == 'true':
+            yield json.dumps({"status": "progress", "message": "正在執行 AI 降噪 (Step 2)...", "percent": 30}) + "\n"
+            # TODO: Integrate DFN3
+            pass
+
+        # 3. Silence Removal (Step 3) - Analysis Only
+        visual_segments = [{ "startInVideo": start, "duration": end - start, "zoom": 1.0 }]
+        if str(is_silence_removal).lower() == 'true':
+            yield json.dumps({"status": "progress", "message": "正在分析與移除氣口 (Step 3)...", "percent": 50}) + "\n"
+            # TODO: Integrate Silence Detect
+            pass
+            
+        # 4. Transcribe (Step 3/4)
+        subtitles = []
+        if str(is_auto_caption).lower() == 'true':
+            yield json.dumps({"status": "progress", "message": f"正在生成字幕 ({whisper_language})...", "percent": 70}) + "\n"
+            t_opts = {}
+            if whisper_language and whisper_language != "auto":
+                # Map zh-tw to zh for Whisper, but keep prompt
+                lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
+                t_opts["language"] = lang_arg
+                
+                if whisper_language == "zh" or whisper_language == "zh-tw":
+                    t_opts["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
+            
+            if os.path.exists(final_audio_path) and os.path.getsize(final_audio_path) > 1000:
+                res = whisper_model.transcribe(final_audio_path, **t_opts)
+            else:
+                res = {"segments": []}
+            
+            chars_limit = 14
+            if subtitle_config:
+                try:
+                    c = json.loads(subtitle_config)
+                    if 'charsPerLine' in c: chars_limit = c['charsPerLine']
+                    yield json.dumps({"status": "progress", "message": "正在套用字幕設定與每行字數...", "percent": 75}) + "\n"
+                except: pass
+            
+            segs = optimize_segments(res['segments'], max_chars=chars_limit)
+            
+            for i, s in enumerate(segs):
+                subtitles.append({
+                    "id": str(i),
+                    "start": s['start'] + start,
+                    "end": s['end'] + start,
+                    "text": s['text'].strip()
+                })
+        
+        # 5. Face Tracking (Step 6)
+        face_center = 0.5
+        if str(is_face_tracking).lower() == 'true':
+             yield json.dumps({"status": "progress", "message": "正在偵測人臉位置...", "percent": 90}) + "\n"
+             if face_detector:
+                 mid_t = (end - start) / 2
+                 sc = VideoFileClip(temp_sub_path) # Reopen strict subclip
+                 frame = sc.get_frame(sc.duration / 2)
+                 
+                 import mediapipe as mp # Ensure imported
+                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+                 detect_res = face_detector.detect(image)
+                 if detect_res.detections:
+                     box = detect_res.detections[0].bounding_box
+                     face_center = (box.origin_x + box.width / 2) / frame.shape[1]
+                 sc.close()
+
+        # Cleanup
+        sub.close()
+        clip.close()
+        if os.path.exists(temp_video_path): os.remove(temp_video_path)
+        if os.path.exists(temp_sub_path): os.remove(temp_sub_path)
+        
+        # Prepare Audio URL
+        preview_audio_url = None
+        if os.path.exists(final_audio_path):
+             preview_audio_name = f"preview_audio_{ts}.mp3"
+             shutil.move(final_audio_path, os.path.join(UPLOAD_DIR, preview_audio_name))
+             preview_audio_url = f"http://localhost:8000/uploads/{preview_audio_name}"
+
+        result = {
+            "status": "success",
+            "subtitles": subtitles,
+            "faceCenterX": face_center,
+            "audioUrl": preview_audio_url,
+            "visualSegments": visual_segments
+        }
+        yield json.dumps({"status": "success", "data": result}) + "\n"
+
+    except Exception as e:
+        print(f"Preview Pipeline Error: {e}")
+        yield json.dumps({"status": "error", "message": str(e)}) + "\n"
+
+@app.post("/preview-clip")
+async def preview_clip_legacy(
     whisper_language: str = Form("zh"),
     burn_captions: str = Form("false"),
     subtitle_style: str = Form("classic"),
@@ -930,10 +917,12 @@ async def preview_clip(
                 # Use the upgraded Whisper Turbo model with language hint
                 transcribe_options = {}
                 if whisper_language and whisper_language != "auto":
-                     transcribe_options["language"] = whisper_language
-                     # FORCE TRADITIONAL CHINESE PROMPT
-                     if whisper_language == "zh":
-                         transcribe_options["initial_prompt"] = "以下是繁體中文的字幕。"
+                     # Map zh-tw to zh for Whisper, but keep prompt
+                     lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
+                     transcribe_options["language"] = lang_arg
+                     
+                     if whisper_language == "zh" or whisper_language == "zh-tw":
+                         transcribe_options["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
 
                 print(f"🗣️ Preview Transcribing with language: {whisper_language}")
                 
@@ -1092,8 +1081,68 @@ async def preview_clip(
         print(f"Preview Error: {e}")
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
+@app.post("/detect-face-clip")
+def detect_face_clip(
+    file: UploadFile = File(...),
+    start: float = Form(...),
+    end: float = Form(...)
+):
+    try:
+        # Save temp video
+        temp_path = f"{UPLOAD_DIR}/temp_preview_{file.filename}"
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        mid_point = start + (end - start) / 2
+        cap = cv2.VideoCapture(temp_path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, mid_point * 1000)
+        ret, frame = cap.read()
+        cap.release()
+        
+        # Cleanup
+        if os.path.exists(temp_path): os.remove(temp_path)
+        
+        if not ret:
+            return {"faceCenterX": 0.5}
+            
+        h, w, _ = frame.shape
+        face_center_x = 0.5
+        
+        # MediaPipe Tasks API
+        if hasattr(face_detector, 'detect'):
+            import mediapipe as mp
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            detection_result = face_detector.detect(mp_image)
+            if detection_result.detections:
+                bbox = detection_result.detections[0].bounding_box
+                face_center_x = (bbox.origin_x + bbox.width / 2) / w
+        
+        # Legacy API
+        elif hasattr(face_detector, 'process'):
+             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+             results = face_detector.process(rgb_frame)
+             if results.detections:
+                 bbox = results.detections[0].location_data.relative_bounding_box
+                 face_center_x = bbox.xmin + (bbox.width / 2)
+                 
+        # OpenCV Fallback
+        elif face_detector == "opencv_fallback":
+             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+             faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+             if len(faces) > 0:
+                 (x, y, wf, hf) = faces[0]
+                 face_center_x = (x + wf / 2) / w
+                 
+        print(f"👁️ Preview Face Detect: {face_center_x:.2f}")
+        return {"faceCenterX": face_center_x}
+
+    except Exception as e:
+        print(f"❌ Preview Detect Error: {e}")
+        return {"faceCenterX": 0.5}
+
 @app.post("/process-video")
-async def process_video(
+def process_video(
     file: UploadFile = File(...),
     cuts_json: str = Form(...),
     model_name: str = Form(None),
@@ -1115,38 +1164,52 @@ async def process_video(
     min_shot_duration: float = Form(2.0),
     output_mode: str = Form("zip"),
     subtitle_style: str = Form("classic"),
-    subtitle_font_size: int = Form(24),
-    subtitle_color: str = Form("&HFFFFFF"),
-    subtitle_outline_color: str = Form("&H000000"),
-    subtitle_margin_v: int = Form(220),
+    subtitle_font_size: int = Form(90),
+    subtitle_font_weight: str = Form("normal"),
+    subtitle_font_style: str = Form("normal"),
+    subtitle_text_color: str = Form("#FFFFFF"),
+    is_text_gradient: str = Form("false"),
+    text_gradient_colors: str = Form('["#FFFFFF", "#FFFFFF"]'),
+    text_gradient_direction: str = Form("to right"),
+    subtitle_shadow_blur: int = Form(0),
+    subtitle_shadow_offset_x: int = Form(3),
+    subtitle_shadow_offset_y: int = Form(3),
+    subtitle_letter_spacing: float = Form(0),
+    subtitle_line_height: float = Form(1.2),
+    subtitle_text_transform: str = Form("none"),
+    subtitle_text_align: str = Form("center"),
+    subtitle_margin_v: int = Form(600),
     subtitle_font_name: str = Form("Arial"),
-    subtitle_bold: str = Form("false"),
-    subtitle_shadow_size: int = Form(1),
-    subtitle_outline_width: int = Form(2),
-    subtitle_chars_per_line: int = Form(12),
-    subtitle_box_enabled: str = Form("false"),
-    subtitle_box_color: str = Form("#000000"),
-    subtitle_box_alpha: float = Form(0.8),
-    subtitle_box_padding: int = Form(10),
-    subtitle_box_radius: int = Form(0),
-    subtitle_margin_h: int = Form(40),
-    subtitle_italic: str = Form("false"),
-    subtitle_shadow_color: str = Form("#000000"),
-    subtitle_shadow_opacity: float = Form(0.8),
+    subtitle_chars_per_line: int = Form(7),
+    subtitle_box_opacity: int = Form(50), 
+    subtitle_box_padding_x: int = Form(10),
+    subtitle_box_padding_y: int = Form(4),
+    subtitle_box_radius: int = Form(4),
+    subtitle_shadow_opacity: int = Form(80),
     dfn3_strength: int = Form(100),
+    subtitle_box_color: str = Form("#000000"),
+    subtitle_box_enabled: str = Form("false"),
+    is_silence_removal: str = Form("false"),
+    silence_threshold: float = Form(0.5),
+    is_jump_cut_zoom: str = Form("true"),
     output_resolution: str = Form("1080p"),
-    output_quality: str = Form("high")
+    output_quality: str = Form("high"),
+    srt_json: str = Form(None),
+    subtitle_animation: str = Form("pop"),
+    subtitle_outline_width: float = Form(0),
+    subtitle_outline_color: str = Form("#000000"),
+    subtitle_shadow_color: str = Form("#000000")
 ):
+    global current_job_status
     try:
         print(f"🎬 Processing Request: Vertical={vertical_mode}, Mode={output_mode}, Style={subtitle_style}")
-        print(f"   Quality: {output_quality}, Res: {output_resolution}, BoxColor: {subtitle_box_color}, BoxAlpha: {subtitle_box_alpha}")
+        print(f"📊 DEBUG FORM DATA: Font={subtitle_font_size}, MarginV={subtitle_margin_v}, Chars={subtitle_chars_per_line}, LineHeight={subtitle_line_height}")
+        print(f"📊 DEBUG FORM DATA: Shadow={subtitle_shadow_opacity}, Outline={subtitle_outline_width}, Spacing={subtitle_letter_spacing}")
+        # print(f"   Quality: {output_quality}, Res: {output_resolution}")
         
         if output_mode == "preview_url":
-            merge_clips = "true"
-            # Force Burn-in for Preview so users can see the transcript
-            if auto_caption == "true" or auto_caption is True:
-                burn_captions = "true"
-                print("🔥 Force enabling Burn-In for Preview Mode")
+            print("ℹ️ legacy preview mode requested, ignoring...")
+
         # Configure GenAI if key provided for Smart Renaming
         if api_key and api_key != "null":
             genai.configure(api_key=api_key)
@@ -1160,475 +1223,463 @@ async def process_video(
         cuts = json.loads(cuts_json)
         
         if not cuts:
+            current_job_status = {"progress": 100, "message": "No cuts", "step": "done"}
             return {"message": "No cuts provided"}
 
-        print(f"🎬 Processing video: {file.filename}")
+        print(f"🎬 Processing video: {file.filename} with Remotion")
+        print(f"🔍 Cuts payload: {json.dumps(cuts, indent=2)}") 
+        print(f"🔍 Debug Props: FaceTracking={face_tracking}, DetectorReady={face_detector is not None}")
+        print(f"🎨 Debug Config: Outline={subtitle_outline_width}, Shadow={subtitle_shadow_opacity}")
         
-        # 3. Process video
-        processed_files = []
-        clips_for_merge = [] # Store MoviePy clips for concatenation
+        current_job_status = {"progress": 5, "message": "正在分析字幕與音訊...", "step": "transcribing"}
+
+        # 3. Analyze Audio & Transcribe (Keep AI Logic in Python)
+        full_subtitles = []
+        full_segments_raw = [] # Keep raw segments for silence detection logic
+
+        # Extract Audio for Whisper
+        transcribe_options = {}
+        if whisper_language and whisper_language != "auto":
+            # Map zh-tw to zh for Whisper, but keep prompt
+            lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
+            transcribe_options["language"] = lang_arg
+            
+            if whisper_language == "zh" or whisper_language == "zh-tw":
+                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
         
+        # Determine if we need to force word timestamps? 
+        # For better silence removal, word-level is ideal. 
+        # But standard segments usually break on pause. Let's use standard for speed MVP.
+
         try:
-            video = VideoFileClip(video_path)
-            video_duration = video.duration
-        except Exception as e:
-            print(f"❌ Failed to load video file: {e}")
-            raise ValueError(f"Could not load video: {e}")
-
-        # Clear previous exports in a safer way
-        for f in os.listdir(OUTPUT_DIR):
-            if f.endswith(".mp4") or f.endswith(".zip") or f.endswith(".txt") or f.endswith(".srt"):
-                try:
-                    os.remove(os.path.join(OUTPUT_DIR, f))
-                except: pass
-
-        for i, cut in enumerate(cuts):
-            try:
-                # Use robust parse_time for safety
-                start = parse_time(cut.get('start', 0))
-                end = parse_time(cut.get('end', 0))
-                
-                # --- 1. Define Paths ---
-                raw_label = cut.get('label', 'Clip')
-                safe_label = "".join([c for c in raw_label if c.isalnum() or c in (' ', '_', '-')]).strip().replace(' ', '_')
-                output_filename = f"Highlight_{i+1}_{safe_label}.mp4"
-                output_path = os.path.join(OUTPUT_DIR, output_filename)
-                srt_path = output_path.replace(".mp4", ".srt")
-                
-                print(f"🎬 Processing Cut {i+1}: {start}-{end}")
-
-                # --- 2. Create Subclip & Effects ---
-                new_clip = video.subclip(start, end)
-
-                if new_clip.audio is not None:
-                     from moviepy.audio.fx.all import audio_fadein, audio_fadeout
-                     # Only fade AUDIO to avoid clicks. Video should be instant cut.
-                     new_clip.audio = new_clip.audio.fx(audio_fadein, 0.15).fx(audio_fadeout, 0.15)
-
-                # --- Smart Reframing System (v7) ---
-                new_clip = apply_smart_reframing(new_clip, aspect_ratio, face_tracking, vertical_mode, viz_tracking, track_zoom, track_weight, track_stickiness, min_shot_duration)
-                if False: # Legacy Block Disabled (vertical_mode == "true"...)
-                    w, h = new_clip.size
-                    target_ratio = 9/16
-                    if w/h > target_ratio:
-                         new_w = h * target_ratio
+             # ONLY transcribe if burn_captions is true or auto_caption is explicitly on
+             is_subtitle_needed = str(burn_captions).lower() == "true" or str(auto_caption).lower() == "true"
+             
+             if is_subtitle_needed:
+                 if srt_json and srt_json != "[]":
+                     print("📄 Using provided SRT JSON...")
+                     full_subtitles = json.loads(srt_json)
+                     full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in full_subtitles]
+                 else:
+                     print("🎙️ Extracting Audio & Transcribing by Cuts...")
+                     video_clip = VideoFileClip(video_path)
+                     if video_clip.audio is None:
+                         video_clip.close()
+                         raise ValueError("影片沒有音訊軌道，無法生成字幕。")
+                     full_segments_raw = []
+                     
+                     total_cuts_count = len(cuts)
+                     
+                     for idx, cut in enumerate(cuts):
+                         c_start = float(cut['start'])
+                         c_end = float(cut['end'])
+                         print(f"   Processing Cut {idx+1}/{total_cuts_count}: {c_start}-{c_end}s")
                          
-                         # Use Global Helper for Robust Detection (Auto-Pan Plan)
-                         trajectory = get_smart_crop_plan(new_clip, w, h, new_w)
+                         current_job_status = {
+                             "progress": 10 + int((idx / total_cuts_count) * 10), 
+                             "message": f"正在轉錄片段 {idx+1}/{total_cuts_count}...", 
+                             "step": "transcribing"
+                         }
                          
-                         traj_x = [p[1] for p in trajectory]
-                         x_min, x_max = min(traj_x), max(traj_x)
+                         # Extract Audio for specific cut
+                         temp_audio_path = os.path.join(UPLOAD_DIR, f"temp_whisper_{idx}.mp3")
+                         # Use subclip.audio to avoid loading full video into RAM if possible, but VideoFileClip is efficient
+                         video_clip.audio.subclip(c_start, c_end).write_audiofile(temp_audio_path, logger=None)
                          
-                         if (x_max - x_min) < 1.0:
-                             # Static 
-                             x1 = max(0, trajectory[0][1] - new_w/2)
-                             new_clip = new_clip.crop(x1=x1, y1=0, width=new_w, height=h)
+                         # Transcribe
+                         if os.path.exists(temp_audio_path) and os.path.getsize(temp_audio_path) > 1000:
+                             result = whisper_model.transcribe(temp_audio_path, **transcribe_options)
                          else:
-                             # Dynamic Pan
-                             import numpy as np
-                             times = [p[0] for p in trajectory]
-                             centers = [p[1] for p in trajectory]
+                             result = {"segments": []}
+                         
+                         # Shift timestamps and Add
+                         for seg in result["segments"]:
+                             seg['start'] += c_start
+                             seg['end'] += c_start
+                             full_segments_raw.append(seg)
                              
-                             def pan_crop(get_frame, t):
-                                  frame = get_frame(t)
-                                  current_center = np.interp(t, times, centers)
-                                  
-                                  x1 = int(current_center - new_w / 2)
-                                  height_f, width_f = frame.shape[:2]
-                                  x1 = max(0, min(x1, width_f - int(new_w)))
-                                  return frame[0:height_f, x1:x1+int(new_w)]
-                             new_clip = new_clip.fl(pan_crop, apply_to=['mask'])
+                         # Cleanup temp file
+                         if os.path.exists(temp_audio_path):
+                             os.remove(temp_audio_path)
+                             
+                     video_clip.close()
 
-                if (dynamic_zoom == "true" or dynamic_zoom is True) and (face_tracking == "false" or face_tracking is False):
-                     # Subtler zoom (1.05x instead of 1.1x)
-                     def scroll_zoom(get_frame, t):
-                         img = get_frame(t)
-                         h, w = img.shape[:2]
-                         # Reduced zoom factor for better quality
-                         scale = 1.0 + (0.05 * (t / new_clip.duration))
-                         cw, ch = w / scale, h / scale
-                         x1, y1 = (w - cw) / 2, (h - ch) / 2
-                         import cv2
-                         x1, y1 = max(0, int(x1)), max(0, int(y1))
-                         cw, ch = min(w-x1, int(cw)), min(h-y1, int(ch))
-                         if cw < 2 or ch < 2: return img
-                         cropped = img[y1:y1+ch, x1:x1+cw]
-                         return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-                     new_clip = new_clip.fl(scroll_zoom)
+                     # Convert to Remotion Subtitle format
+                     raw_segments = optimize_segments(full_segments_raw, max_chars=subtitle_chars_per_line)
+                     for i, seg in enumerate(raw_segments):
+                         full_subtitles.append({
+                             "id": str(i),
+                             "start": seg['start'],
+                             "end": seg['end'],
+                             "text": seg['text'].strip()
+                         })
+                      
+                     # Apply Translation if requested
+                     if str(translate_to_chinese).lower() == "true":
+                         current_job_status = {"progress": 15, "message": "正在翻譯字幕...", "step": "translating"}
+                         full_subtitles = translate_subtitles(full_subtitles, api_key)
 
-                # Determine Bitrate based on Quality Setting
-                bitrate_map = {
-                    "high": "20000k",   # Upgraded to 20M as requested
-                    "medium": "8000k",
-                    "low": "4000k"
+                     if os.path.exists(temp_audio_path):
+                         os.remove(temp_audio_path)
+             else:
+                 print("⏭️ Subtitles disabled, skipping transcription")
+                 full_subtitles = []
+                 full_segments_raw = []
+        except Exception as e:
+             print(f"⚠️ Transcription failed: {e}")
+             current_job_status = {"progress": 15, "message": f"字幕生成失敗: {e}", "step": "error"}
+             full_subtitles = []
+             full_segments_raw = []
+
+        # Clear previous exports
+        for f in os.listdir(OUTPUT_DIR):
+             try: os.remove(os.path.join(OUTPUT_DIR, f))
+             except: pass
+        
+        processed_files = []
+
+        # 4. Render Each Cut using Remotion
+        # We will iterate cuts and call remotion CLI for each
+        
+        current_job_status = {"progress": 18, "message": "正在套用字幕樣式設定...", "step": "styling"}
+        print(f"DEBUG: burn_captions={burn_captions}, auto_caption={auto_caption}")
+
+        # Pre-calculate Props for Remotion
+        # Color converting & Config packing
+        try:
+             gradient_colors_list = json.loads(text_gradient_colors)
+        except:
+             gradient_colors_list = ["#FFFFFF", "#FFFFFF"] # Fallback
+
+        remotion_config = {
+            "fontSize": subtitle_font_size,
+            "fontFamily": subtitle_font_name,
+            "fontWeight": subtitle_font_weight,
+            "fontStyle": subtitle_font_style,
+            
+            "textColor": subtitle_text_color,
+            "isTextGradient": str(is_text_gradient).lower() == "true",
+            "textGradientColors": gradient_colors_list,
+            "textGradientDirection": text_gradient_direction,
+
+            "outlineWidth": subtitle_outline_width,
+            "outlineColor": subtitle_outline_color,
+            "animation": subtitle_animation,
+
+            "shadowColor": subtitle_shadow_color,
+            "shadowBlur": subtitle_shadow_blur,
+            "shadowOffsetX": subtitle_shadow_offset_x,
+            "shadowOffsetY": subtitle_shadow_offset_y,
+            "shadowOpacity": subtitle_shadow_opacity / 100.0,
+
+            "letterSpacing": subtitle_letter_spacing,
+            "lineHeight": subtitle_line_height,
+            "textTransform": subtitle_text_transform,
+            "textAlign": subtitle_text_align,
+
+            "marginBottom": int(subtitle_margin_v),
+            
+            "isUnknownBackground": str(subtitle_box_enabled).lower() == "true",
+            "backgroundColor": subtitle_box_color,
+            "backgroundOpacity": subtitle_box_opacity / 100.0,
+            "backgroundPaddingX": subtitle_box_padding_x,
+            "backgroundPaddingY": subtitle_box_padding_y,
+            "backgroundBorderRadius": subtitle_box_radius,
+            "charsPerLine": int(subtitle_chars_per_line) if subtitle_chars_per_line else 0,
+        }
+
+        # Resolve Absolute Path for Video (Remotion needs absolute or http)
+        abs_video_path = os.path.abspath(video_path)
+        
+        total_cuts = len(cuts)
+        for i, cut in enumerate(cuts):
+            # Update Progress (20% to 90%)
+            progress_pct = 20 + int((i / total_cuts) * 70)
+            current_job_status = {
+                "progress": progress_pct, 
+                "message": f"正在渲染片段 {i+1} / {total_cuts}...", 
+                "step": "rendering"
+            }
+            
+            start = float(cut.get('start', 0))
+            end = float(cut.get('end', 0))
+            print(f"✂️ Processing Cut {i+1}: Start={start}s, End={end}s, Duration={end-start}s")
+            raw_label = cut.get('label', f'Clip{i+1}')
+            safe_label = "".join([c for c in raw_label if c.isalnum() or c in (' ', '_', '-')]).strip().replace(' ', '_')
+            
+            output_filename = f"Highlight_{i+1}_{safe_label}.mp4"
+            output_app_path = os.path.join(OUTPUT_DIR, output_filename)
+            abs_output_path = os.path.abspath(output_app_path)
+            
+            # Filter subtitles for this specific clip range
+            # ONLY pass to Remotion if burn_captions is True
+            clip_subs = []
+            if str(burn_captions).lower() == "true":
+                clip_subs = [s for s in full_subtitles if s['start'] < end and s['end'] > start]
+            
+            # --- Silence Removal Logic ---
+            visual_segments = []
+            final_duration = end - start
+            
+            # --- Face Tracking Logic ---
+            face_center_x = 0.5 # Default center
+            is_tracking_enabled = str(face_tracking).lower() in ["true", "1", "yes", "on"]
+            
+            if is_tracking_enabled and face_detector:
+                current_job_status = {
+                    "progress": 20 + int((i / total_cuts) * 70), 
+                    "message": f"正在分析人臉位置 (片段 {i+1}/{total_cuts})...", 
+                    "step": "face_tracking"
                 }
-                target_bitrate = bitrate_map.get(output_quality, "8000k")
-                
-                # --- Handle Output Resolution (Vertical 9:16) ---
-                resolution_map = {
-                    "1080x1920": (1080, 1920),
-                    "720x1280": (720, 1280),
-                    "1080p": (1080, 1920),  # Legacy support
-                    "720p": (720, 1280),    # Legacy support
-                }
-                if output_resolution in resolution_map:
-                    target_w, target_h = resolution_map[output_resolution]
-                    current_w, current_h = new_clip.size
-                    if (current_w, current_h) != (target_w, target_h):
-                        print(f"📐 Scaling output: {current_w}x{current_h} → {target_w}x{target_h}")
-                        new_clip = new_clip.resize(newsize=(target_w, target_h))
-
-                # --- 3. Write RAW Video First (Required for FFmpeg Burning) ---
                 try:
-                    new_clip.write_videofile(
-                        output_path, 
-                        codec="libx264", 
-                        audio_codec="aac",
-                        bitrate=target_bitrate,
-                        audio_bitrate="192k",
-                        preset="fast",
-                        logger=None,
-                        threads=4
-                    )
-                except Exception as write_err:
-                    print(f"⚠️ MoviePy Write Error: {write_err}. Switching to Fallback...")
-                    success = fallback_cut_video(video_path, output_path, start, end)
-                    if not success:
-                        raise ValueError(f"Both MoviePy and FFmpeg fallback failed for this clip.")
-                    try: 
-                        new_clip.close()
-                        new_clip = VideoFileClip(output_path)
-                    except: pass
-                
-                # --- 4. Transcription & SRT Generation ---
-                has_audio = new_clip.audio is not None
-                if (auto_caption == "true" or auto_caption is True or burn_captions == "true" or burn_captions is True) and has_audio:
+                    import cv2
+                    import mediapipe as mp
+                    
+                    # Analyze the middle frame of the clip for face position
+                    mid_point = start + (final_duration / 2)
+                    
+                    # DIRECT OPENCV CAPTURE (Faster & Safer)
+                    rgb_frame = None
                     try:
-                        print(f"🎙️ Transcribing clip {i+1}... (Burn={burn_captions})")
+                        cap = cv2.VideoCapture(abs_video_path)
+                        if cap.isOpened():
+                            cap.set(cv2.CAP_PROP_POS_MSEC, mid_point * 1000)
+                            ret, frame = cap.read()
+                            if ret:
+                                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            cap.release()
+                    except Exception as ve:
+                         print(f"⚠️ OpenCV Frame Extract Failed: {ve}")
+
+                    # Fallback to FFmpeg ONLY if OpenCV failed
+                    if rgb_frame is None:
+                        print("⚠️ OpenCV failed to grab frame, falling back to FFmpeg CLI...")
+                        temp_frame_path = os.path.join(UPLOAD_DIR, f"temp_face_{i}_{int(time.time())}.jpg")
+                        try:
+                            cmd = [
+                                "ffmpeg", "-y", 
+                                "-ss", str(mid_point),
+                                "-i", abs_video_path,
+                                "-frames:v", "1",
+                                "-q:v", "2",
+                                "-update", "1", # Ensure single image update
+                                temp_frame_path
+                            ]
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                            
+                            if os.path.exists(temp_frame_path):
+                                bgr_frame = cv2.imread(temp_frame_path)
+                                if bgr_frame is not None:
+                                    rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+                                os.remove(temp_frame_path)
+                        except Exception as fe:
+                             print(f"⚠️ FFmpeg Fallback also failed: {fe}")
+
+                    if rgb_frame is not None:
+                        h, w, _ = rgb_frame.shape
                         
-                        # 4a. Run Whisper (Only Once)
-                        # Use temp audio for speed and to avoid codec issues in direct transcription
-                        temp_audio_path = os.path.join(OUTPUT_DIR, f"temp_audio_{i}.mp3")
-                        new_clip.audio.write_audiofile(temp_audio_path, logger=None)
-                        new_clip.audio.write_audiofile(temp_audio_path, logger=None)
-                        # Use the upgraded Whisper Turbo model with language hint
-                        transcribe_options = {}
-                        if whisper_language and whisper_language != "auto":
-                             transcribe_options["language"] = whisper_language
-                             # FORCE TRADITIONAL CHINESE PROMPT
-                             if whisper_language == "zh":
-                                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕。"
-
-                        print(f"🗣️ Transcribing with language: {whisper_language}")
-                        result = whisper_model.transcribe(temp_audio_path, **transcribe_options)
+                        # Use Tasks API or Legacy or OpenCV
+                        if hasattr(face_detector, 'detect'): # Tasks API
+                            # MoviePy returns RGB, perfect for MediaPipe
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                            detection_result = face_detector.detect(mp_image)
+                            if detection_result.detections:
+                                bbox = detection_result.detections[0].bounding_box
+                                center = bbox.origin_x + (bbox.width / 2)
+                                face_center_x = center / w
+                                print(f"👤 Face detected (Tasks API) at X={face_center_x:.2f}")
+                            else:
+                                print(f"👤 No face detected (Tasks API) in frame")
                         
-                        # --- OPTIMIZE SEGMENTS FOR VERTICAL VIDEO ---
-                        # Force split long segments to avoid "subtitle wall"
-                        opt_max_chars = 18 if aspect_ratio == "9:16" or output_resolution == "1080x1920" else 30
-                        optimized_segments = optimize_segments(result["segments"], max_chars=opt_max_chars)
-                        
-                        # 4b. AI Translation (Gemini)
-                        if (translate_to_chinese == "true" or translate_to_chinese is True) and api_key and api_key != "null":
-                             try:
-                                 print(f"🇨🇳 Translating SRT for clip {i+1} using Gemini...")
-                                 segments_text = ""
-                                 for idx, s in enumerate(optimized_segments):
-                                     segments_text += f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{s['text']}\n\n"
-                                 
-                                 target_model = model_name if model_name else "gemini-2.0-flash-exp"
-                                 ver_model = genai.GenerativeModel(target_model)
-                                 prompt = f"Translate the following SRT subtitles into Traditional Chinese (Taiwan). Keep the format exactly: \n{segments_text}"
-                                 resp = ver_model.generate_content(prompt)
-                                 translated_text = resp.text.strip().replace("```srt", "").replace("```", "")
-                                 
-                                 if "-->" in translated_text:
-                                      with open(srt_path, "w", encoding="utf-8") as f:
-                                          f.write(translated_text)
-                                      print("✅ Translation applied.")
-                                 else:
-                                      # Fallback: Save original
-                                      with open(srt_path, "w", encoding="utf-8") as f:
-                                          f.write(segments_text)
-                             except Exception as te:
-                                 print(f"⚠️ Translation failed: {te}")
-                                 with open(srt_path, "w", encoding="utf-8") as f:
-                                     for idx, s in enumerate(optimized_segments):
-                                         wrapped = wrap_text(s['text'], max_chars=subtitle_chars_per_line)
-                                         f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{wrapped}\n\n")
-                        else:
-                             # Just save original SRT
-                             with open(srt_path, "w", encoding="utf-8") as f:
-                                 # Smart Wrap (Same as preview)
-                                 total_w_units = 608 if aspect_ratio == "9:16" else 1920
-                                 
-                                 # CRITICAL: Force wrap for 9:16 to avoid "exploded" text
-                                 if aspect_ratio == "9:16" or output_resolution == "1080x1920":
-                                     # Force strict limit for vertical video
-                                     effective_chars = min(int(subtitle_chars_per_line), 10) if int(subtitle_chars_per_line) > 0 else 10
-                                 else:
-                                     available_w = total_w_units - (int(subtitle_margin_h) * 2)
-                                     max_safe_chars = max(1, int(available_w / (float(subtitle_font_size) * 0.9)))
-                                     effective_chars = min(int(subtitle_chars_per_line), max_safe_chars) if int(subtitle_chars_per_line) > 0 else max_safe_chars
+                        elif hasattr(face_detector, 'process'): # Legacy API
+                            results = face_detector.process(rgb_frame)
+                            if results.detections:
+                                bboxC = results.detections[0].location_data.relative_bounding_box
+                                face_center_x = bboxC.xmin + (bboxC.width / 2)
+                                print(f"👤 Face detected at X={face_center_x:.2f}")
+                                
+                        elif face_detector == "opencv_fallback": # OpenCV
+                            # Convert RGB back to BGR/GRAY for OpenCV
+                            gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+                            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                            if len(faces) > 0:
+                                (x, y, w_f, h_f) = faces[0]
+                                face_center_x = (x + w_f / 2) / w
+                                print(f"👤 Face detected (OpenCV) at X={face_center_x:.2f}")
+                            else:
+                                print(f"👤 No face detected (OpenCV) in frame")
+                    else:
+                        print(f"⚠️ Could not read frame at {mid_point}s")
 
-                                 for idx, s in enumerate(optimized_segments):
-                                     # Extra safety: Ensure max 2 lines
-                                     wrapped = wrap_text(s['text'], max_chars=effective_chars)
-                                     lines = wrapped.split('\n')
-                                     if len(lines) > 2:
-                                          # Re-wrap aggressively if too many lines
-                                          wrapped = wrap_text(s['text'], max_chars=effective_chars + 2)
-                                     
-                                     f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{wrapped}\n\n")
+                except Exception as e:
+                    print(f"⚠️ Face detection ERROR for clip {i}: {e}")
+            else:
+                 print(f"ℹ️ Face tracking skipped. Enabled: {face_tracking}, Detector: {face_detector is not None}")
 
-                        try: os.remove(temp_audio_path)
-                        except: pass
-                        
-                        # --- 5. Burn Captions (Optimized Quality & Style) ---
-                        if (burn_captions == "true" or burn_captions is True) and os.path.exists(srt_path):
-                            try:
-                                print(f"🔥 Burning captions for clip {i+1} using {subtitle_style} (Size: {subtitle_font_size})...")
-                                
-                                # Use Consistent Global hex_to_ass calculations
-                                bold_val = 1 if str(subtitle_bold).lower() == "true" else 0
-                                italic_val = 1 if str(subtitle_italic).lower() == "true" else 0
-                                final_color_ass = hex_to_ass(subtitle_color)
-                                box_color_ass = hex_to_ass(subtitle_box_color, float(subtitle_box_alpha))
-                                outline_color_ass = hex_to_ass(subtitle_outline_color)
-                                
-                                # Custom Shadow
-                                shadow_color_ass = hex_to_ass(subtitle_shadow_color, float(subtitle_shadow_opacity))
-
-                                is_box = (subtitle_box_enabled == "true") or (subtitle_style == "box") or (subtitle_box_enabled == "on")
-                                border_style = 3 if is_box else 1
-                                
-                                try: box_pad_int = int(subtitle_box_padding)
-                                except: box_pad_int = 10
-                                try: outline_width_int = int(subtitle_outline_width)
-                                except: outline_width_int = 2
-                                
-                                # Boost outline for visibility if white-on-white risk
-                                if final_color_ass == "&H00FFFFFF" and outline_width_int < 2:
-                                    outline_width_int = 3
-
-                                outline_val = box_pad_int if is_box else outline_width_int
-                                shadow_val = 0 if is_box else int(subtitle_shadow_size)
-                                
-                                # Standard ASS Style String
-                                # FIX: PlayResY should match video height (e.g. 1920 for 9:16)
-                                target_res_y = 1080
-                                if output_resolution == "1080x1920" or aspect_ratio == "9:16":
-                                     target_res_y = 1920
-                                elif output_resolution == "720x1280":
-                                     target_res_y = 1280
-                                
-                                # FIX: Fontname escaping logic
-                                escaped_font = subtitle_font_name.replace("'", "").replace(":", "") 
-                                
-                                # FIX: Scale Params for Consistency
-                                # Frontend likely designs based on ~1080p visual height.
-                                # If output is 1920p (vertical), we must scale up margins and fonts to assume same relative position.
-                                scale_factor = target_res_y / 1080.0
-                                
-                                # CRITICAL FIX: MarginV is 0-200 relative value from Frontend (100 = 50% height)
-                                raw_scaled_margin = int(target_res_y * (float(subtitle_margin_v) / 200.0))
-                                # CLAMP: Ensure it doesn't fly off screen
-                                scaled_margin_v = min(raw_scaled_margin, int(target_res_y * 0.9))
-                                
-                                # Font size is 1080p-based pixels
-                                scaled_fontsize = int(float(subtitle_font_size) * scale_factor)
-                                scaled_outline = int(outline_val * scale_factor)
-                                scaled_shadow = int(shadow_val * scale_factor)
-                                
-                                # FIX: Use Real Family Name for ASS
-                                real_family = FONT_FILE_MAP.get(subtitle_font_name, subtitle_font_name)
-                                escaped_font = real_family.replace("'", "").replace(":", "") 
-                                
-                                style_parts = [
-                                    f"PlayResY={target_res_y}", f"Fontname={escaped_font}", f"Fontsize={scaled_fontsize}",
-                                    f"PrimaryColour={final_color_ass}", f"SecondaryColour={final_color_ass}",
-                                    f"OutlineColour={outline_color_ass if not is_box else box_color_ass}",
-                                    f"BackColour={shadow_color_ass if not is_box else box_color_ass}",
-                                    f"BorderStyle={border_style}", f"Outline={scaled_outline}", f"Shadow={scaled_shadow}",
-                                    f"MarginV={scaled_margin_v}", f"MarginL={subtitle_margin_h}", f"MarginR={subtitle_margin_h}",
-                                    "Alignment=2", f"Bold={bold_val}", f"Italic={italic_val}"
-                                ]
-                                force_style_arg = ",".join(style_parts)
-                                
-                                # Define absolute paths clearly (FIX: Ensure all path vars are defined)
-                                burned_output_path = output_path.replace(".mp4", "_burned.mp4")
-                                abs_input_path = os.path.abspath(output_path)
-                                abs_output_path = os.path.abspath(burned_output_path)
-                                abs_srt_path = os.path.abspath(srt_path)
-                                abs_fonts = os.path.abspath(FONTS_DIR)
-                                
-                                # Use proper path formatting
-                                abs_srt_path_f = abs_srt_path.replace("\\", "/").replace(":", "\\:")
-                                abs_fonts_f = abs_fonts.replace("\\", "/").replace(":", "\\:")
-
-                                # SMART FONT HANDLING:
-                                # Only use fontsdir if the font file actually exists there.
-                                # Otherwise, let ffmpeg use fontconfig to find system fonts.
-                                font_in_dir = False
-                                for ext in [".ttf", ".otf", ".ttc"]:
-                                    if os.path.exists(os.path.join(FONTS_DIR, subtitle_font_name + ext)):
-                                        font_in_dir = True
-                                        break
-                                
-                                vf_string = f"subtitles='{abs_srt_path_f}':force_style='{force_style_arg}'"
-                                if font_in_dir:
-                                     # Only append fontsdir if we have the file
-                                     vf_string = f"subtitles='{abs_srt_path_f}':fontsdir='{abs_fonts_f}':force_style='{force_style_arg}'"
-                                else:
-                                     print(f"ℹ️ Font '{subtitle_font_name}' not found in local dir, trying system fonts...")
-
-                                cmd = [
-                                    imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", abs_input_path,
-                                    "-vf", vf_string,
-                                    "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_output_path
-                                ]
-                                
-                                try:
-                                    # Attempt 1
-                                    subprocess.run(cmd, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                                    if os.path.exists(burned_output_path):
-                                        os.remove(output_path)
-                                        os.rename(burned_output_path, output_path)
-                                except subprocess.CalledProcessError as e:
-                                    err_msg = e.stderr.decode() if e.stderr else "Unknown"
-                                    print(f"⚠️ Primary burn failed for clip {i+1}: {err_msg}")
-                                    print("🔄 Retrying with system fonts fallback...")
-                                    
-                                    # Fallback: Simple subtitles filter (without fontsdir)
-                                    vf_simple = f"subtitles='{abs_srt_path_f}':force_style='{force_style_arg}'"
-                                    cmd_fallback = [
-                                        imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", abs_input_path,
-                                        "-vf", vf_simple,
-                                        "-c:a", "copy", "-c:v", "libx264", "-crf", "17", "-preset", "slow", abs_output_path
-                                    ]
-                                    
-                                    subprocess.run(cmd_fallback, check=True, env=os.environ, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                                    if os.path.exists(burned_output_path):
-                                        os.remove(output_path)
-                                        os.rename(burned_output_path, output_path)
-                                        print(f"✅ Fallback burn succeeded for clip {i+1}")
-
-                                except Exception as e:
-                                    print(f"⚠️ Burn exception for clip {i+1}: {e}")
-                                else:
-                                    print(f"✅ Captions burned for clip {i+1}")
-                            except Exception as outer_e:
-                                print(f"🔥 Critical burn error clip {i+1}: {outer_e}")
-                                
-                    except Exception as we:
-                        print(f"⚠️ Transcription process failed: {we}")
-
-                # --- 6. Studio Sound (DeepFilterNet 3) ---
-                if studio_sound == "true" or studio_sound is True:
-                     try:
-                        print(f"🎙️ DFN3 AI Audio Enhancement for clip {i+1}...")
-                        audio_path = "temp_audio_dfn.wav"
-                        video.audio.write_audiofile(audio_path, logger=None)
-                        
-                        audio, spec_orig = load_audio(audio_path, sr=df_state.sr())
-                        enhanced = enhance(df_model, df_state, audio)
-                        save_audio("enhanced_dfn.wav", enhanced, sr=df_state.sr())
-                        
-                        optimized_path = output_path.replace(".mp4", "_studio.mp4")
-                        cmd = [
-                            imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", output_path, "-i", "enhanced_dfn.wav",
-                            "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", optimized_path
-                        ]
-                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        if os.path.exists(optimized_path):
-                            os.remove(output_path)
-                            os.rename(optimized_path, output_path)
-                        
-                        # Cleanup
-                        for f in [audio_path, "enhanced_dfn.wav"]:
-                            if os.path.exists(f): os.remove(f)
-                        print(f"✅ Studio Sound (DFN3) Ready")
-                     except Exception as dfne:
-                        print(f"⚠️ Studio Sound failed: {dfne}")
-
-                # Finalize
-                processed_files.append(output_path)
-                if (auto_caption == "true" or auto_caption is True) and os.path.exists(srt_path):
-                     processed_files.append(srt_path)
-
-                if merge_clips == "true" or merge_clips is True:
-                     clips_for_merge.append(VideoFileClip(output_path))
+            if str(is_silence_removal).lower() == "true":
+                # Find segments within this cut [start, end]
+                # We use raw segments from Whisper because they represent "Speech Activity"
+                active_segments = []
+                for seg in full_segments_raw:
+                    # Check overlap
+                    s_ov = max(start, seg['start'])
+                    e_ov = min(end, seg['end'])
+                    if e_ov > s_ov:
+                        active_segments.append({'start': s_ov, 'end': e_ov})
                 
-                # Cleanup leftover SRT if not needed in ZIP
-                if not (auto_caption == "true" or auto_caption is True) and os.path.exists(srt_path):
-                     try: os.remove(srt_path)
-                     except: pass
+                # If no speech found, backup to full clip
+                if not active_segments:
+                    visual_segments = [{'startInVideo': start, 'duration': end - start, 'zoom': 1.0}]
+                else:
+                    # Construct keep intervals based on speech
+                    # Logic: Fill the timeline with speech blocks. 
+                    # If gap between blocks > silence_threshold, it's a gap (jump cut). 
+                    # If gap < silence_threshold, we bridge it (keep as one block).
+                    
+                    merged_blocks = []
+                    if active_segments:
+                        current_block = active_segments[0].copy()
+                        
+                        for i in range(1, len(active_segments)):
+                            next_seg = active_segments[i]
+                            gap = next_seg['start'] - current_block['end']
+                            
+                            if gap <= silence_threshold:
+                                # Bridge small gap
+                                current_block['end'] = next_seg['end']
+                            else:
+                                # Finalize current block
+                                merged_blocks.append(current_block)
+                                current_block = next_seg.copy()
+                        merged_blocks.append(current_block)
+                    
+                    # Convert blocks to Remotion visual segments
+                    # Alternate Zoom for Jump Cuts
+                    zoom_level = 1.0
+                    total_dur = 0
+                    
+                    for block in merged_blocks:
+                        dur = block['end'] - block['start']
+                        visual_segments.append({
+                            'startInVideo': block['start'],
+                            'duration': dur,
+                            'zoom': zoom_level
+                        })
+                        total_dur += dur
+                        
+                        # Toggle zoom if enabled
+                        if str(is_jump_cut_zoom).lower() == "true":
+                            zoom_level = 1.15 if zoom_level == 1.0 else 1.0
+                            
+                    final_duration = total_dur
+            else:
+                 # Default: One single continuous segment
+                 visual_segments = [{'startInVideo': start, 'duration': end - start, 'zoom': 1.0}]
 
-            except Exception as e:
-                print(f"❌ Error processing clip {i}: {e}")
-                continue
+            print(f"🚀 Rendering Clip {i+1}: {safe_label} (Dur: {final_duration:.2f}s, Segments: {len(visual_segments)})")
 
-        video.close()
-        
-        # FAIL-SAFE: Check if any output exists
-        valid_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.mp4') and not f.startswith('temp_')]
-        if not valid_files:
-             # Look for the last error in logs or just raise generic
-             raise ValueError("所有片段處理失敗 (All clips failed). 請檢查後端 Log 或參數設定。")
-        
-        # --- 3. PROFESSIONAL FEATURE: MERGE ALL ---
-        if (merge_clips == "true" or merge_clips is True) and clips_for_merge:
-            print(f"🔗 Merging {len(clips_for_merge)} clips...")
+            # Construct Input Props
+            # Use UUID based filename for public access (Handled below)
+            video_filename = os.path.basename(video_path)
+            
+            # === Copy video to public folder for Remotion access ===
+            public_dir = os.path.abspath("public")
+            os.makedirs(public_dir, exist_ok=True)
+            
+            # Use a simple sanitized filename to avoid URL encoding issues
+            import uuid
+            unique_id = str(uuid.uuid4())
+            sanitized_video_name = f"render_source_{unique_id}.mp4"
+            public_video_path = os.path.join(public_dir, sanitized_video_name)
+            
+            # Copy video to public folder if not already there
+            if not os.path.exists(public_video_path):
+                shutil.copy2(video_path, public_video_path)
+            
+            # Use staticFile path for Remotion
+            input_props = {
+                "videoUrl": sanitized_video_name,  # Remotion will use staticFile() for this
+                "startFrom": start,
+                "visualSegments": visual_segments,
+                "duration": final_duration, 
+                "subtitles": clip_subs,
+                "subtitleConfig": remotion_config,
+                "isFaceTracking": is_tracking_enabled,
+                "faceCenterX": face_center_x,
+                "durationInFrames": int(final_duration * 30) # Explicitly pass frames for metadata
+            }
+
+            print(f"📦 Debug Input Props: FaceTracking={input_props['isFaceTracking']}, Center={input_props['faceCenterX']}")
+            print(f"📦 Debug Config: {json.dumps(remotion_config)}")
+            
+            # Write props to temp file
+            props_file = os.path.abspath(f"temp_props_{unique_id}.json")
+            with open(props_file, "w") as pf:
+                json.dump(input_props, pf)
+
+            # Calculate Duration in Frames (30fps)
+            dur_in_frames = int(final_duration * 30)
+            print(f"⏱️ Calculated Duration: {final_duration}s -> {dur_in_frames} frames")
+            
+            # Build Remotion Command
+            cmd = [
+                "npx", "remotion", "render",
+                "src/remotion/index.ts",
+                "MainComposition",
+                abs_output_path,
+                f"--props={props_file}",
+                f"--duration={dur_in_frames}",
+                "--log=verbose",
+                "--concurrency=1",
+                "--timeout=120000"
+            ]
+            
+            # Execute Remotion
             try:
-                final_concatenated = concatenate_videoclips(clips_for_merge)
-                merge_filename = "Full_Highlight_Reel.mp4"
-                merge_output_path = os.path.join(OUTPUT_DIR, merge_filename)
-                
-                # HIGH QUALITY MERGE (Medium Preset for speed/stability)
-                final_concatenated.write_videofile(merge_output_path, codec="libx264", audio_codec="aac", bitrate="8000k", audio_bitrate="192k", preset="medium", logger=None)
-                processed_files.append(merge_output_path)
-                
-                # Clean up temps
-                for c in clips_for_merge: c.close()
-                for i in range(len(cuts)):
-                    try: os.remove(os.path.join(OUTPUT_DIR, f"temp_merge_{i}.mp4"))
-                    except: pass
-            except Exception as me:
-                print(f"⚠️ Merge failed: {me}")
-        
-        # Generate Summary
-        summary_path = os.path.join(OUTPUT_DIR, "summary.txt")
-        # ... (summary writing logic)
-        processed_files.append(summary_path) # Dummy append to ensure list logic works
+                subprocess.run(cmd, check=True, cwd=os.getcwd())
+                processed_files.append(output_app_path)
+                print(f"✅ Rendered: {output_filename}")
+            except subprocess.CalledProcessError as e:
+                print(f"❌ Remotion render failed for clip {i}: {e}")
+            finally:
+                if os.path.exists(props_file): os.remove(props_file)
+                # Cleanup public video copy
+                if os.path.exists(public_video_path): os.remove(public_video_path)
 
-        if output_mode == "preview_url":
-             merge_path = os.path.join(OUTPUT_DIR, "Full_Highlight_Reel.mp4")
-             if os.path.exists(merge_path):
-                 return JSONResponse({
-                     "status": "success",
-                     "preview_url": "http://localhost:8000/exports/Full_Highlight_Reel.mp4",
-                     "message": "渲染完成 (Preview Ready)"
-                 })
+        # 5. Generate global SRT file if auto_caption or burn_captions is on
+        if full_subtitles:
+            srt_filename = "transcription.srt"
+            srt_path = os.path.join(OUTPUT_DIR, srt_filename)
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for idx, s in enumerate(full_subtitles):
+                    # Use the same format_timestamp helper
+                    f.write(f"{idx+1}\n{format_timestamp(s['start'])} --> {format_timestamp(s['end'])}\n{s['text']}\n\n")
+            processed_files.append(srt_path)
 
-        # 4. Zip results
-        if len(processed_files) == 0:
-             print("⚠️ No video files generated!")
-             # Create a dummy file to avoid empty zip error
-             dummy_path = os.path.join(OUTPUT_DIR, "error_log.txt")
-             with open(dummy_path, "w") as f: f.write("No clips were successfully generated. Check console logs.")
-             processed_files.append(dummy_path)
-        
+        # 6. Zip results
+        if not processed_files:
+             raise ValueError("Render failed: No files generated.")
+
         zip_filename = f"Antigravity_Shorts_{len(cuts)}_Clips.zip"
         zip_path = os.path.join(OUTPUT_DIR, zip_filename)
         
+        print(f"📦 Packaging {len(processed_files)} clips into: {zip_path}")
         with zipfile.ZipFile(zip_path, 'w') as zipf:
             for file in processed_files:
-                if os.path.exists(file) and os.path.getsize(file) > 0:
+                if os.path.exists(file):
                     zipf.write(file, os.path.basename(file))
+        
+        current_job_status = {"progress": 100, "message": "處理完成！", "step": "done"}
                 
-        return FileResponse(zip_path, filename=zip_filename, media_type='application/zip')
+        # Return JSON with download URL instead of FileResponse for better flexibility
+        return {
+            "status": "success",
+            "download_url": f"/exports/{zip_filename}",
+            "filename": zip_filename
+        }
 
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+        print(f"💥 CRITICAL ERROR: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
