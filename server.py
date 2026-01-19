@@ -46,6 +46,7 @@ from moviepy.editor import VideoFileClip, concatenate_videoclips
 import whisper
 import datetime
 import google.generativeai as genai
+from opencc import OpenCC
 import time
 import subprocess
 import mediapipe as mp
@@ -143,90 +144,191 @@ def wrap_text(text, max_chars=12):
     return "\n".join(new_lines)
 
 
-def optimize_segments(segments, max_chars=7):
+def optimize_segments(segments, max_chars=14, remove_punctuation=True):
     """
     Splits long whisper segments into shorter ones based on character count and duration.
-    Essential for vertical video to prevent subtitle walls.
+    MERGES tiny segments unless there is a strong sentence pause (smart segmentation).
+    Uses punctuation cues for better splitting before optionally removing them.
     """
-    new_segments = []
+    if not segments: return []
+    
+    print(f"🛠️ optimize_segments: input={len(segments)} segs, max_chars={max_chars}, remove_punc={remove_punctuation}")
+    
     import re
+    import math
+
+    # Define Punctuation groups
+    CJK_STOPS = r'[。？！]'
+    CJK_PAUSES = r'[，、：；]'
+    ENG_STOPS = r'[.?!]' 
+    ENG_PAUSES = r'[,:;]'
+    
+    ALL_STOPS = CJK_STOPS + r'|' + ENG_STOPS
+
+    # 1. PREPARE (Keep raw text for now)
+    # Just filter empty
+    working_segs = []
     for s in segments:
         text = s['text'].strip()
-        if not text: continue
+        if text:
+            working_segs.append({"start": s['start'], "end": s['end'], "text": text})
+
+    if not working_segs: return []
+
+    # 2. SMART MERGE
+    # Merge if: Total Len <= Max AND Previous segment didn't end with a "Stop" (Period)
+    merged = []
+    current = working_segs[0].copy()
+    
+    for i in range(1, len(working_segs)):
+        next_seg = working_segs[i]
+        curr_text = current['text']
         
-        # CLEANUP: Remove punctuation for cleaner short-video subtitles
-        text = re.sub(r'[，。、？！：；,.?!:;"\']', ' ', text)
-        text = re.sub(r'\s+', ' ', text).strip() # Collapse spaces
+        # Check for Strong Stop in current text end
+        has_stop = re.search(ALL_STOPS + r'$', curr_text.strip())
         
-        if not text: continue
+        # Calculate combined length (approximate)
+        # We assume standard joining (space for EN, none for CJK usually, but here we just blindly join to check length)
+        combined_len = len(curr_text) + len(next_seg['text'])
         
-        # Threshold: if text is longer than max_chars (e.g. 20 for vertical)
-        if len(text) > max_chars:
-            # Simple split strategy: Split into N parts
-            num_parts = (len(text) // max_chars) + 1
-            duration = s['end'] - s['start']
-            time_per_part = duration / num_parts
-            chars_per_part = len(text) // num_parts
+        if not has_stop and combined_len <= max_chars:
+            # Merge!
+            # Smart Join: Add space if neither side is CJK punctuation/char? 
+            # Actually Whisper raw usually has spaces for English. 
+            # For CJK, current might be "你好，" next "我是". We just concat.
             
-            for i in range(num_parts):
-                start_t = s['start'] + (i * time_per_part)
-                end_t = s['start'] + ((i + 1) * time_per_part)
-                
-                # Slicing text safely
-                start_char = i * chars_per_part
-                # Make sure last part gets the rest
-                if i == num_parts - 1:
-                    sub_text = text[start_char:]
+            # Simple heuristic: If current ends with alphanumeric and next starts with alphanumeric, add space.
+            # Otherwise (CJK or Punctuation involved), just concat.
+            t1_end = curr_text[-1]
+            t2_start = next_seg['text'][0]
+            
+            is_latin_bound = re.match(r'[a-zA-Z0-9]', t1_end) and re.match(r'[a-zA-Z0-9]', t2_start)
+            joiner = " " if is_latin_bound else ""
+            
+            current['text'] = curr_text + joiner + next_seg['text']
+            current['end'] = next_seg['end']
+        else:
+            merged.append(current)
+            current = next_seg.copy()
+    merged.append(current)
+
+    # 3. SMART SPLIT
+    new_segments = []
+    tolerance_factor = 1.2 
+    soft_limit = max_chars * tolerance_factor
+    
+    # Regex to find good split points (Punctuation or Space)
+    # We prioritize: Stops > Pauses > Spaces
+    # But for a single sentence over-length, we just want ANY good break point.
+    SPLIT_PATTERN = re.compile(r'([，。、？！：；,.?!:;"\'\s])') 
+
+    for s in merged:
+        text = s['text']
+        
+        # If text is too long, we must split
+        if len(text) > soft_limit:
+            duration = s['end'] - s['start']
+            
+            # Tokenize by potential splitters, keeping the delimiter
+            # "Hello, world." -> ["Hello", ",", " world", "."]
+            tokens = SPLIT_PATTERN.split(text)
+            # Re-assemble into chunks < max_chars
+            
+            current_chunk = ""
+            chunks = []
+            
+            for token in tokens:
+                if not token: continue
+                # If adding this token exceeds max, push current chunk and start new
+                if len(current_chunk) + len(token) > max_chars and len(current_chunk) > 0:
+                    # But wait, if token is just a punctuation mark, we often want it attached to previous!
+                    # "Hello" (5) + "," (1). If Limit 5. Result "Hello," (6). It's okay to exceed slightly (tolerance).
+                    
+                    is_punc = SPLIT_PATTERN.match(token)
+                    if is_punc and len(current_chunk) + len(token) <= soft_limit:
+                        current_chunk += token
+                    else:
+                        chunks.append(current_chunk)
+                        current_chunk = token
                 else:
-                    sub_text = text[start_char : start_char + chars_per_part]
-                
-                new_segments.append({
-                    "start": start_t,
-                    "end": end_t,
-                    "text": sub_text.strip()
-                })
+                    current_chunk += token
+            
+            if current_chunk: chunks.append(current_chunk)
+            
+            # Redistribute time
+            total_chars = sum(len(c) for c in chunks)
+            curr_t = s['start']
+            for c in chunks:
+                if not c.strip(): continue
+                c_len = len(c)
+                c_dur = (c_len / total_chars) * duration if total_chars > 0 else 0
+                new_segments.append({"start": curr_t, "end": curr_t + c_dur, "text": c})
+                curr_t += c_dur
         else:
             new_segments.append(s)
-    return new_segments
-    return new_segments
+
+    # 4. CLEANUP (If requested)
+    # Now we strip punctuation if the user wanted "Remove Punctuation"
+    final_output = []
+    for s in new_segments:
+        final_text = s['text']
+        if remove_punctuation:
+            # Smart Strip:
+            # 1. CJK Punctuation -> Remove completely (Compact)
+            # Remove: 。 ， 、 ？ ！ ： ；
+            final_text = re.sub(r'[，。、？！：；]', '', final_text)
+            
+            # 2. English Punctuation -> PRESERVE ALL
+            # User request: Keep English punctuation (.,?!:;) as they are important for math/code/english parts.
+            # We ONLY remove CJK punctuation.
+            
+            # Collapse Spaces first (just in case CJK removal left holes)
+            final_text = re.sub(r'\s+', ' ', final_text).strip()
+            
+            # Special Fix for CJK/Math Spacing Issues:
+            # 0. Repair broken decimals FIRST: "1. 39" -> "1.39", "1 .39" -> "1.39"
+            final_text = re.sub(r'(?<=[\d])\s*\.\s*(?=[\d])', '.', final_text)
+            
+            # 1. Remove space between digits "1 39" -> "139" (if no dot was there)
+            final_text = re.sub(r'(?<=[\d])\s+(?=[\d])', '', final_text)
+            
+            # 2. Remove space between CJK and CJK "你 好" -> "你好"
+            final_text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', final_text)
+            
+            # 3. Remove space between CJK and Digit "第 1" -> "第1"
+            final_text = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\d])', '', final_text)
+            final_text = re.sub(r'(?<=[\d])\s+(?=[\u4e00-\u9fff])', '', final_text)
+        else:
+            final_text = final_text.strip()
+            
+        if final_text:
+            s['text'] = final_text
+            final_output.append(s)
+            
+    print(f"✅ optimize_segments: output={len(final_output)} segs")
+    return final_output
 
 def translate_subtitles(full_subtitles, api_key):
-    """Translate list of subtitle dicts using Gemini"""
-    if not api_key or api_key == "null" or not full_subtitles:
+    """Convert subtitles from Simplified to Traditional Chinese using OpenCC"""
+    if not full_subtitles:
         return full_subtitles
         
-    print("🤖 Translating transcription with Gemini...")
+    print(f"変換 🔀 Converting {len(full_subtitles)} segments to Traditional Chinese...")
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash") # Use fast model for translation
-        
-        # Translate in batches to avoid rate limits/prompt length issues
-        batch_size = 20
-        for i in range(0, len(full_subtitles), batch_size):
-            batch = full_subtitles[i : i+batch_size]
-            text_to_translate = "\n".join([f"{idx}: {s['text']}" for idx, s in enumerate(batch)])
+        # Try s2tw (Simplified to Traditional Taiwan) or fallback to s2t
+        try:
+            cc = OpenCC('s2tw')
+        except:
+            cc = OpenCC('s2t')
             
-            prompt = f"請將以下逐字稿內容翻譯成繁體中文（台灣習慣用語），保持簡短與原始意思。只回傳翻譯內容，格式為 '索引: 翻譯'：\n{text_to_translate}"
-            try:
-                response = model.generate_content(prompt)
-                # Parse response (expected each line: "0: translated text")
-                for line in response.text.strip().split('\n'):
-                    if ':' in line:
-                        idx_str, trans = line.split(':', 1)
-                        try:
-                            # Use regex to find index and text
-                            import re
-                            m = re.match(r'(\d+)\s*:\s*(.*)', line)
-                            if m:
-                                b_idx = int(m.group(1).strip())
-                                trans_val = m.group(2).strip()
-                                if b_idx < len(batch):
-                                    batch[b_idx]['text'] = trans_val
-                        except: pass
-            except Exception as te:
-                print(f"⚠️ Translation batch {i} failed: {te}")
+        for i, sub in enumerate(full_subtitles):
+            if 'text' in sub:
+                old_text = sub['text']
+                sub['text'] = cc.convert(sub['text'])
+                if i == 0:
+                    print(f"   [DEBUG] Conversion Sample: '{old_text}' -> '{sub['text']}'")
     except Exception as e:
-        print(f"⚠️ Global translation failed: {e}")
+        print(f"⚠️ OpenCC conversion failed: {e}")
     
     return full_subtitles
 # Fallback logic removed as we use Remotion
@@ -293,8 +395,10 @@ except Exception as e:
     print(f"⚠️ DFN3 Init Failed: {e}")
     df_model = None
 
+CURRENT_WHISPER_NAME = "turbo"
 def download_whisper_model(model_name="turbo"):
-    global whisper_model, model_status
+    global whisper_model, model_status, CURRENT_WHISPER_NAME
+    CURRENT_WHISPER_NAME = model_name
     
     try:
         # Check if model is already cached
@@ -305,16 +409,21 @@ def download_whisper_model(model_name="turbo"):
         model_status = {"progress": 50, "status": "downloading", "message": f"正在載入 Whisper {model_name} 模型..."}
         print(f"📥 Loading Whisper model: {model_name}...")
         
-        # Use official whisper API
-        # Priority: turbo -> large-v3 -> medium
-        model_options = ["turbo", "large-v3", "medium", "base"]
+        # Priority search starting with the requested model
+        model_options = [model_name, "turbo", "large-v3", "medium", "small", "base"]
+        # Remove duplicates while preserving order
+        unique_options = []
+        for opt in model_options:
+            if opt not in unique_options: unique_options.append(opt)
         
         loaded_model = None
-        for try_model in model_options:
+        current_loaded_name = ""
+        for try_model in unique_options:
             try:
                 print(f"🔄 Trying model: {try_model}...")
                 loaded_model = whisper.load_model(try_model)
                 print(f"✅ Successfully loaded: {try_model}")
+                current_loaded_name = try_model
                 break
             except Exception as model_err:
                 print(f"⚠️ Failed to load {try_model}: {model_err}")
@@ -322,7 +431,8 @@ def download_whisper_model(model_name="turbo"):
         
         if loaded_model:
             whisper_model = loaded_model
-            model_status = {"progress": 100, "status": "ready", "message": f"Whisper 模型載入成功！"}
+            CURRENT_WHISPER_NAME = current_loaded_name
+            model_status = {"progress": 100, "status": "ready", "message": f"Whisper {current_loaded_name} 模型載入成功！"}
         else:
             model_status = {"progress": 0, "status": "error", "message": "所有模型載入失敗"}
             print("❌ All Whisper model options failed to load")
@@ -330,6 +440,65 @@ def download_whisper_model(model_name="turbo"):
     except Exception as e:
         model_status = {"progress": 0, "status": "error", "message": f"下載失敗: {str(e)}"}
         print(f"❌ Download error: {e}")
+
+def ensure_whisper_model(requested_model="turbo"):
+    """Check if model matches requested, if not reload"""
+    global CURRENT_WHISPER_NAME
+    if whisper_model is None or (requested_model and requested_model != CURRENT_WHISPER_NAME):
+        print(f"🔄 Model Switch Requested: {CURRENT_WHISPER_NAME} -> {requested_model}")
+        download_whisper_model(requested_model)
+    return whisper_model
+
+def get_transcribe_options(
+    lang, beam_size, temperature=0, 
+    no_speech_threshold=0.6, condition_on_previous_text=True,
+    best_of=5, patience=1.0, compression_ratio_threshold=2.4, logprob_threshold=-1.0,
+    fp16=True
+):
+    """Helper to build whisper transcribe options dictionary with high-end parameters"""
+    opts = {}
+    if lang and lang != "auto":
+        # Standardize zh-tw to zh for whisper core
+        lang_arg = "zh" if lang == "zh-tw" else lang
+        opts["language"] = lang_arg
+    
+    # Casting to ensure types are correct for whisper core
+    try: opts["beam_size"] = int(beam_size) if beam_size else 5
+    except: opts["beam_size"] = 5
+    
+    try: opts["temperature"] = float(temperature) if temperature is not None else 0
+    except: opts["temperature"] = 0
+        
+    try: opts["no_speech_threshold"] = float(no_speech_threshold) if no_speech_threshold is not None else 0.6
+    except: opts["no_speech_threshold"] = 0.6
+        
+    try:
+        val = str(condition_on_previous_text).lower() == "true" if isinstance(condition_on_previous_text, str) else bool(condition_on_previous_text)
+        opts["condition_on_previous_text"] = val
+    except: opts["condition_on_previous_text"] = True
+
+    try: opts["best_of"] = int(best_of) if best_of else 5
+    except: opts["best_of"] = 5
+
+    try: opts["patience"] = float(patience) if patience else 1.0
+    except: opts["patience"] = 1.0
+
+    try: opts["compression_ratio_threshold"] = float(compression_ratio_threshold) if compression_ratio_threshold else 2.4
+    except: opts["compression_ratio_threshold"] = 2.4
+
+    try: opts["logprob_threshold"] = float(logprob_threshold) if logprob_threshold else -1.0
+    except: opts["logprob_threshold"] = -1.0
+
+    try:
+        val_fp16 = str(fp16).lower() == "true" if isinstance(fp16, str) else bool(fp16)
+        opts["fp16"] = val_fp16
+    except: opts["fp16"] = True
+            
+    # User requested NO initial prompt (relying on regex post-processing)
+    # if lang in ["zh", "zh-tw"]:
+    #    opts["initial_prompt"] = "..." 
+
+    return opts
 
 # Start loading in background thread (starting with turbo)
 import threading
@@ -495,7 +664,7 @@ async def analyze_video(
         Each object must have:
         - "start": start time in SECONDS (number, e.g., 12.5) . DO NOT use MM:SS format.
         - "end": end time in SECONDS (number, e.g., 25.0). MUST be start + {target_duration if target_duration else "duration"}.
-        - "label": A short description of the clip in Traditional Chinese.
+        - "label": A short description of the clip in Traditional Chinese (STRICTLY MAX 10 characters).
         
         Example:
         [
@@ -555,6 +724,10 @@ async def analyze_video(
                 for cut in cuts:
                     start_t = parse_time(cut.get("start", 0))
                     cut["start"] = start_t
+                    label = cut.get("label", "片段")
+                    if len(label) > 10:
+                        cut["label"] = label[:10]
+                    
                     if target_duration and target_duration > 0:
                         cut["end"] = round(start_t + target_duration, 2)
                     else:
@@ -579,7 +752,19 @@ async def analyze_video(
 def transcribe_only(
     file: UploadFile = File(...),
     whisper_language: str = Form("zh"),
-    subtitle_chars_per_line: int = Form(7),
+    whisper_model_size: str = Form("turbo"),
+    whisper_beam_size: int = Form(5),
+    whisper_temperature: float = Form(0.0),
+    whisper_no_speech_threshold: float = Form(0.6),
+    whisper_condition_on_previous_text: str = Form("true"),
+    whisper_remove_punctuation: str = Form("true"),
+    whisper_best_of: int = Form(5),
+    whisper_patience: float = Form(1.0),
+    whisper_compression_ratio_threshold: float = Form(2.4),
+    whisper_logprob_threshold: float = Form(-1.0),
+    whisper_fp16: str = Form("true"),
+    whisper_chars_per_line: int = Form(14),
+    subtitle_chars_per_line: int = Form(9),
     translate_to_chinese: str = Form("false"),
     api_key: str = Form(None),
     cuts_json: str = Form(None)
@@ -604,12 +789,13 @@ def transcribe_only(
             except: pass
 
         # Whisper Options
-        transcribe_options = {}
-        if whisper_language and whisper_language != "auto":
-            lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
-            transcribe_options["language"] = lang_arg
-            if whisper_language == "zh" or whisper_language == "zh-tw":
-                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
+        model = ensure_whisper_model(whisper_model_size)
+        transcribe_options = get_transcribe_options(
+            whisper_language, whisper_beam_size, 
+            whisper_temperature, whisper_no_speech_threshold, 
+            whisper_condition_on_previous_text
+        )
+        remove_punc = str(whisper_remove_punctuation).lower() == "true"
 
         full_segments_raw = []
 
@@ -645,7 +831,7 @@ def transcribe_only(
 
         video_clip.close()
 
-        raw_segments = optimize_segments(full_segments_raw, max_chars=subtitle_chars_per_line)
+        raw_segments = optimize_segments(full_segments_raw, max_chars=whisper_chars_per_line)
         full_subtitles = []
         for i, seg in enumerate(raw_segments):
             full_subtitles.append({
@@ -680,12 +866,26 @@ async def process_preview_pipeline(
     is_auto_caption: str = Form("false"),
     subtitle_config: str = Form(None), # JSON string
     is_face_tracking: str = Form("false"),
+    srt_json: str = Form(None),
     
     # Whisper
     whisper_language: str = Form("zh"),
+    whisper_model_size: str = Form("turbo"),
+    whisper_beam_size: int = Form(5),
+    whisper_temperature: float = Form(0.0),
+    whisper_no_speech_threshold: float = Form(0.6),
+    whisper_condition_on_previous_text: str = Form("true"),
+    whisper_remove_punctuation: str = Form("true"),
+    whisper_best_of: int = Form(5),
+    whisper_patience: float = Form(1.0),
+    whisper_compression_ratio_threshold: float = Form(2.4),
+    whisper_logprob_threshold: float = Form(-1.0),
+    whisper_fp16: str = Form("true"),
+    whisper_chars_per_line: int = Form(14),
     translate_to_chinese: str = Form("false"),
     api_key: str = Form(None)
 ):
+    print(f"📡 Preview: cap={is_auto_caption}, trans={translate_to_chinese}, lang={whisper_language}, has_srt={bool(srt_json)}")
     # 1. Save Temp Chunk synchronously first
     ts = int(time.time())
     temp_video_path = os.path.join(UPLOAD_DIR, f"preview_chunk_{ts}_{file.filename}")
@@ -697,7 +897,12 @@ async def process_preview_pipeline(
             temp_video_path, start, end,
             is_denoise, is_silence_removal, silence_threshold,
             is_auto_caption, subtitle_config, is_face_tracking,
-            whisper_language, translate_to_chinese, api_key
+            whisper_language, whisper_model_size, whisper_beam_size, 
+            whisper_temperature, whisper_no_speech_threshold, whisper_condition_on_previous_text,
+            whisper_best_of, whisper_patience, whisper_compression_ratio_threshold,
+            whisper_logprob_threshold, whisper_fp16,
+            whisper_remove_punctuation, whisper_chars_per_line,
+            translate_to_chinese, api_key, srt_json
         ),
         media_type="application/x-ndjson"
     )
@@ -706,11 +911,16 @@ def preview_pipeline_generator(
     temp_video_path, start, end,
     is_denoise, is_silence_removal, silence_threshold,
     is_auto_caption, subtitle_config, is_face_tracking,
-    whisper_language, translate_to_chinese, api_key
+    whisper_language, whisper_model_size, whisper_beam_size, 
+    whisper_temperature, whisper_no_speech_threshold, whisper_condition_on_previous_text,
+    whisper_best_of, whisper_patience, whisper_compression_ratio_threshold,
+    whisper_logprob_threshold, whisper_fp16,
+    whisper_remove_punctuation, whisper_chars_per_line,
+    translate_to_chinese, api_key, srt_json=None
 ):
     try:
         ts = int(time.time())
-        yield json.dumps({"status": "progress", "message": "正在前處理與依需求切割...", "percent": 10}) + "\n"
+        yield json.dumps({"status": "progress", "message": "正在啟動 AI 智慧預覽 (降噪/人臉/字幕)...", "percent": 10}) + "\n"
 
         # Extract Subclip
         clip = VideoFileClip(temp_video_path)
@@ -739,58 +949,99 @@ def preview_pipeline_generator(
             # TODO: Integrate Silence Detect
             pass
             
-        # 4. Transcribe (Step 3/4)
+        # 4. Subtitles (Step 3/4)
         subtitles = []
-        if str(is_auto_caption).lower() == 'true':
-            yield json.dumps({"status": "progress", "message": f"正在生成字幕 ({whisper_language})...", "percent": 70}) + "\n"
-            t_opts = {}
-            if whisper_language and whisper_language != "auto":
-                # Map zh-tw to zh for Whisper, but keep prompt
-                lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
-                t_opts["language"] = lang_arg
-                
-                if whisper_language == "zh" or whisper_language == "zh-tw":
-                    t_opts["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
+        is_subtitle_needed = str(is_auto_caption).lower() == 'true'
+        
+        if is_subtitle_needed:
+            full_segments_raw = []
+            remove_punc = str(whisper_remove_punctuation).lower() == "true"
             
-            if os.path.exists(final_audio_path) and os.path.getsize(final_audio_path) > 1000:
-                res = whisper_model.transcribe(final_audio_path, **t_opts)
-            else:
-                res = {"segments": []}
-            
-            chars_limit = 14
-            if subtitle_config:
+            if srt_json and srt_json != "[]":
+                print("📄 Preview: Using provided SRT JSON for optimization...")
                 try:
-                    c = json.loads(subtitle_config)
-                    if 'charsPerLine' in c: chars_limit = c['charsPerLine']
-                    yield json.dumps({"status": "progress", "message": "正在套用字幕設定與每行字數...", "percent": 75}) + "\n"
+                    loaded_sub = json.loads(srt_json)
+                    full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in loaded_sub]
                 except: pass
-            
-            segs = optimize_segments(res['segments'], max_chars=chars_limit)
-            
+            else:
+                yield json.dumps({"status": "progress", "message": f"正在生成字幕 ({whisper_language})...", "percent": 70}) + "\n"
+                model = ensure_whisper_model(whisper_model_size)
+                t_opts = get_transcribe_options(
+                    whisper_language, whisper_beam_size, 
+                    whisper_temperature, whisper_no_speech_threshold, 
+                    whisper_condition_on_previous_text,
+                    whisper_best_of, whisper_patience,
+                    whisper_compression_ratio_threshold, whisper_logprob_threshold,
+                    whisper_fp16
+                )
+                
+                if os.path.exists(final_audio_path) and os.path.getsize(final_audio_path) > 1000:
+                    res = model.transcribe(final_audio_path, **t_opts)
+                    full_segments_raw = res['segments']
+                else:
+                    full_segments_raw = []
+
+            # Apply Optimization (Balanced Split)
+            segs = optimize_segments(full_segments_raw, max_chars=whisper_chars_per_line, remove_punctuation=remove_punc)
             for i, s in enumerate(segs):
+                # Only include segments that fall within the preview range [0, end-start]
+                # But notice Whisper was run on the CROP already, so start is 0 relative to final_audio.
+                # However, segments in srt_json might be absolute. 
+                # Let's handle the time shift carefully.
+                is_srt_absolute = srt_json and srt_json != "[]"
+                shift = 0 if not is_srt_absolute else 0 # Actually srt_json passed is usually already what frontend has
+                
                 subtitles.append({
-                    "id": str(i),
-                    "start": s['start'] + start,
-                    "end": s['end'] + start,
+                    "id": f"p_{i}",
+                    "start": s['start'] + (start if not is_srt_absolute else 0),
+                    "end": s['end'] + (start if not is_srt_absolute else 0),
                     "text": s['text'].strip()
                 })
+
+            # Apply Translation/Conversion Logic (ALWAYS apply if checked and we have subtitles)
+            if str(translate_to_chinese).lower() == "true" and subtitles:
+                yield json.dumps({"status": "progress", "message": "正在優化繁體中文轉譯 (本地快速)...", "percent": 80}) + "\n"
+                subtitles = translate_subtitles(subtitles, api_key)
         
-        # 5. Face Tracking (Step 6)
         face_center = 0.5
-        if str(is_face_tracking).lower() == 'true':
+        if str(is_face_tracking).lower() == 'true' and face_detector:
              yield json.dumps({"status": "progress", "message": "正在偵測人臉位置...", "percent": 90}) + "\n"
-             if face_detector:
-                 mid_t = (end - start) / 2
-                 sc = VideoFileClip(temp_sub_path) # Reopen strict subclip
-                 frame = sc.get_frame(sc.duration / 2)
+             try:
+                 sc = VideoFileClip(temp_sub_path)
+                 frame = sc.get_frame(sc.duration / 2) # Get middle frame
+                 h, w, _ = frame.shape
                  
-                 import mediapipe as mp # Ensure imported
-                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-                 detect_res = face_detector.detect(image)
-                 if detect_res.detections:
-                     box = detect_res.detections[0].bounding_box
-                     face_center = (box.origin_x + box.width / 2) / frame.shape[1]
+                 # MediaPipe Tasks API
+                 if hasattr(face_detector, 'detect'):
+                     import mediapipe as mp
+                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                     det_res = face_detector.detect(mp_image)
+                     if det_res.detections:
+                         bbox = det_res.detections[0].bounding_box
+                         face_center = (bbox.origin_x + bbox.width / 2) / w
+                 
+                 # Legacy API
+                 elif hasattr(face_detector, 'process'):
+                      import cv2
+                      rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                      det_res = face_detector.process(rgb_frame)
+                      if det_res.detections:
+                          bbox = det_res.detections[0].location_data.relative_bounding_box
+                          face_center = bbox.xmin + (bbox.width / 2)
+                          
+                 # OpenCV Fallback
+                 elif face_detector == "opencv_fallback":
+                      import cv2
+                      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                      faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                      if len(faces) > 0:
+                          (fx, fy, fw, fh) = faces[0]
+                          face_center = (fx + fw / 2) / w
+
                  sc.close()
+             except Exception as fe:
+                 print(f"Face Tracking Preview Error: {fe}")
 
         # Cleanup
         sub.close()
@@ -1151,7 +1402,19 @@ def process_video(
     face_tracking: str = Form("true"),
     auto_caption: str = Form("false"),
     translate_to_chinese: str = Form("false"),
-    whisper_language: str = Form("zh"), # NEW: Default to Traditional Chinese (zh) which usually handles both, but we can hint it
+    whisper_language: str = Form("zh"), 
+    whisper_model_size: str = Form("turbo"),
+    whisper_beam_size: int = Form(5),
+    whisper_temperature: float = Form(0.0),
+    whisper_no_speech_threshold: float = Form(0.6),
+    whisper_condition_on_previous_text: str = Form("true"),
+    whisper_remove_punctuation: str = Form("true"),
+    whisper_best_of: int = Form(5),
+    whisper_patience: float = Form(1.0),
+    whisper_compression_ratio_threshold: float = Form(2.4),
+    whisper_logprob_threshold: float = Form(-1.0),
+    whisper_fp16: str = Form("true"),
+    whisper_chars_per_line: int = Form(14),
     api_key: str = Form(None),
     merge_clips: str = Form("false"),
     burn_captions: str = Form("false"),
@@ -1180,7 +1443,7 @@ def process_video(
     subtitle_text_align: str = Form("center"),
     subtitle_margin_v: int = Form(600),
     subtitle_font_name: str = Form("Arial"),
-    subtitle_chars_per_line: int = Form(7),
+    subtitle_chars_per_line: int = Form(9),
     subtitle_box_opacity: int = Form(50), 
     subtitle_box_padding_x: int = Form(10),
     subtitle_box_padding_y: int = Form(4),
@@ -1196,6 +1459,8 @@ def process_video(
     output_quality: str = Form("high"),
     srt_json: str = Form(None),
     subtitle_animation: str = Form("pop"),
+    subtitle_animation_duration: int = Form(15),
+    subtitle_animation_spring: float = Form(0.5),
     subtitle_outline_width: float = Form(0),
     subtitle_outline_color: str = Form("#000000"),
     subtitle_shadow_color: str = Form("#000000")
@@ -1237,15 +1502,17 @@ def process_video(
         full_subtitles = []
         full_segments_raw = [] # Keep raw segments for silence detection logic
 
-        # Extract Audio for Whisper
-        transcribe_options = {}
-        if whisper_language and whisper_language != "auto":
-            # Map zh-tw to zh for Whisper, but keep prompt
-            lang_arg = "zh" if whisper_language == "zh-tw" else whisper_language
-            transcribe_options["language"] = lang_arg
-            
-            if whisper_language == "zh" or whisper_language == "zh-tw":
-                 transcribe_options["initial_prompt"] = "以下是繁體中文的字幕，請使用台灣繁體中文。"
+        # 3. Whisper Transcribe (Step 2)
+        full_subtitles = []
+        full_segments_raw = []
+        
+        model = ensure_whisper_model(whisper_model_size)
+        transcribe_options = get_transcribe_options(
+            whisper_language, whisper_beam_size, 
+            whisper_temperature, whisper_no_speech_threshold, 
+            whisper_condition_on_previous_text
+        )
+        remove_punc = str(whisper_remove_punctuation).lower() == "true"
         
         # Determine if we need to force word timestamps? 
         # For better silence removal, word-level is ideal. 
@@ -1254,12 +1521,11 @@ def process_video(
         try:
              # ONLY transcribe if burn_captions is true or auto_caption is explicitly on
              is_subtitle_needed = str(burn_captions).lower() == "true" or str(auto_caption).lower() == "true"
-             
              if is_subtitle_needed:
                  if srt_json and srt_json != "[]":
-                     print("📄 Using provided SRT JSON...")
-                     full_subtitles = json.loads(srt_json)
-                     full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in full_subtitles]
+                     print("📄 Using provided SRT JSON for optimization path...")
+                     json_data = json.loads(srt_json)
+                     full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in json_data]
                  else:
                      print("🎙️ Extracting Audio & Transcribing by Cuts...")
                      video_clip = VideoFileClip(video_path)
@@ -1269,7 +1535,6 @@ def process_video(
                      full_segments_raw = []
                      
                      total_cuts_count = len(cuts)
-                     
                      for idx, cut in enumerate(cuts):
                          c_start = float(cut['start'])
                          c_end = float(cut['end'])
@@ -1304,23 +1569,22 @@ def process_video(
                              
                      video_clip.close()
 
-                     # Convert to Remotion Subtitle format
-                     raw_segments = optimize_segments(full_segments_raw, max_chars=subtitle_chars_per_line)
-                     for i, seg in enumerate(raw_segments):
-                         full_subtitles.append({
-                             "id": str(i),
-                             "start": seg['start'],
-                             "end": seg['end'],
-                             "text": seg['text'].strip()
-                         })
-                      
-                     # Apply Translation if requested
-                     if str(translate_to_chinese).lower() == "true":
-                         current_job_status = {"progress": 15, "message": "正在翻譯字幕...", "step": "translating"}
-                         full_subtitles = translate_subtitles(full_subtitles, api_key)
-
-                     if os.path.exists(temp_audio_path):
-                         os.remove(temp_audio_path)
+                 # Re-apply Split Limit to segments (loaded or fresh)
+                 raw_segments = optimize_segments(full_segments_raw, max_chars=whisper_chars_per_line, remove_punctuation=remove_punc)
+                 full_subtitles = []
+                 for i, seg in enumerate(raw_segments):
+                     full_subtitles.append({
+                         "id": str(i),
+                         "start": seg['start'],
+                         "end": seg['end'],
+                         "text": seg['text'].strip()
+                     })
+             
+             # Apply Translation/Conversion to ALL subtitles if requested
+             if str(translate_to_chinese).lower() == "true" and full_subtitles:
+                 current_job_status = {"progress": 25, "message": "正在優化繁體中文轉譯 (本地快速)...", "step": "translating"}
+                 full_subtitles = translate_subtitles(full_subtitles, api_key)
+             
              else:
                  print("⏭️ Subtitles disabled, skipping transcription")
                  full_subtitles = []
@@ -1365,6 +1629,8 @@ def process_video(
             "outlineWidth": subtitle_outline_width,
             "outlineColor": subtitle_outline_color,
             "animation": subtitle_animation,
+            "animationDuration": subtitle_animation_duration,
+            "animationSpring": subtitle_animation_spring,
 
             "shadowColor": subtitle_shadow_color,
             "shadowBlur": subtitle_shadow_blur,
@@ -1687,4 +1953,5 @@ def process_video(
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Video Processing Server Running on http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Enable auto-reload for development
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

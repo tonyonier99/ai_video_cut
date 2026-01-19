@@ -38,6 +38,18 @@ function App() {
   const [isAutoCaption, setIsAutoCaption] = useState(true);
   const [isTranslate, setIsTranslate] = useState(false); // Default false, Whisper directly outputs Chinese
   const [isBurnCaptions, setIsBurnCaptions] = useState(true);
+  const [whisperModelSize, setWhisperModelSize] = useState('turbo');
+  const [whisperBeamSize, setWhisperBeamSize] = useState(5);
+  const [whisperRemovePunctuation, setWhisperRemovePunctuation] = useState(true);
+  const [whisperTemperature, setWhisperTemperature] = useState(0);
+  const [whisperNoSpeechThreshold, setWhisperNoSpeechThreshold] = useState(0.6);
+  const [whisperConditionOnPreviousText, setWhisperConditionOnPreviousText] = useState(true);
+  const [whisperBestOf, setWhisperBestOf] = useState(5);
+  const [whisperPatience, setWhisperPatience] = useState(1.0);
+  const [whisperCompressionRatioThreshold, setWhisperCompressionRatioThreshold] = useState(2.4);
+  const [whisperLogprobThreshold, setWhisperLogprobThreshold] = useState(-1.0);
+  const [whisperFp16, setWhisperFp16] = useState(true);
+  const [showExpertWhisper, setShowExpertWhisper] = useState(false);
 
   // 進階參數
   const [trackZoom, setTrackZoom] = useState(1.5);
@@ -78,7 +90,8 @@ function App() {
   const [subtitleTextAlign, setSubtitleTextAlign] = useState('center');
 
   const [subtitleMarginV, setSubtitleMarginV] = useState(600);
-  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(7); // Restored missing param
+  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(9); // Visual Wrap
+  const [whisperCharsPerLine, setWhisperCharsPerLine] = useState(14); // Transcription Limit
 
   const [subtitleBgEnabled, setSubtitleBgEnabled] = useState(false);
   const [subtitleBgColor, setSubtitleBgColor] = useState('#000000');
@@ -88,6 +101,8 @@ function App() {
   const [subtitleBgRadius, setSubtitleBgRadius] = useState(4);
 
   const [subtitleAnimation, setSubtitleAnimation] = useState<'none' | 'pop' | 'fade' | 'slide-up'>('pop');
+  const [subtitleAnimationDuration, setSubtitleAnimationDuration] = useState(15);
+  const [subtitleAnimationSpring, setSubtitleAnimationSpring] = useState(0.5); // Mass / Intensity
 
   const [showSafeArea, setShowSafeArea] = useState(true);
   const [previewText, setPreviewText] = useState('預覽文字內容預覽文字內容');
@@ -297,6 +312,7 @@ function App() {
     formData.append('file', videoFile as any);
     formData.append('instruction', instruction);
     if (targetCount) formData.append('target_count', targetCount.toString());
+    if (targetDuration) formData.append('target_duration', targetDuration.toString());
     formData.append('api_key', apiKey);
     formData.append('model_name', selectedModel);
 
@@ -343,6 +359,10 @@ function App() {
 
     setPreviewMessage("AI 全流程處理中... (降噪 -> 去氣口 -> 字幕 -> 人臉)");
     setPreviewProgress(10);
+    setPreviewSubtitles([]);
+    setPreviewFaceCenter(0.5);
+    setPreviewAudioUrl(null);
+    setPreviewVisualSegments([]);
 
     try {
       const fd = new FormData();
@@ -358,11 +378,26 @@ function App() {
       // Auto Caption
       fd.append('is_auto_caption', (isAutoCaption || isBurnCaptions).toString());
       fd.append('whisper_language', whisperLanguage);
+      fd.append('whisper_model_size', whisperModelSize);
+      fd.append('whisper_beam_size', whisperBeamSize.toString());
+      fd.append('whisper_temperature', whisperTemperature.toString());
+      fd.append('whisper_no_speech_threshold', whisperNoSpeechThreshold.toString());
+      fd.append('whisper_condition_on_previous_text', whisperConditionOnPreviousText.toString());
+      fd.append('whisper_best_of', whisperBestOf.toString());
+      fd.append('whisper_patience', whisperPatience.toString());
+      fd.append('whisper_compression_ratio_threshold', whisperCompressionRatioThreshold.toString());
+      fd.append('whisper_logprob_threshold', whisperLogprobThreshold.toString());
+      fd.append('whisper_fp16', whisperFp16.toString());
+      fd.append('whisper_chars_per_line', whisperCharsPerLine.toString());
+      fd.append('whisper_remove_punctuation', whisperRemovePunctuation.toString());
       fd.append('translate_to_chinese', isTranslate.toString());
       fd.append('api_key', apiKey);
+      if (srtSubtitles.length > 0) {
+        fd.append('srt_json', JSON.stringify(srtSubtitles));
+      }
 
       // Pass Subtitle Config JSON to ensure Chars Per Line is respected in Transcription
-      const subConfigObj = { charsPerLine: subtitleCharsPerLine };
+      const subConfigObj = { charsPerLine: whisperCharsPerLine };
       fd.append('subtitle_config', JSON.stringify(subConfigObj));
 
       // Face Tracking
@@ -395,7 +430,7 @@ function App() {
             else if (msg.status === 'success') {
               const data = msg.data;
               if (data.subtitles) setPreviewSubtitles(data.subtitles);
-              if (data.faceCenterX) setPreviewFaceCenter(data.faceCenterX);
+              if (data.faceCenterX !== undefined) setPreviewFaceCenter(data.faceCenterX);
               if (data.audioUrl) setPreviewAudioUrl(data.audioUrl);
               if (data.visualSegments) setPreviewVisualSegments(data.visualSegments);
 
@@ -484,6 +519,8 @@ function App() {
     formData.append('subtitle_margin_v', subtitleMarginV.toString());
     formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
     formData.append('subtitle_animation', subtitleAnimation);
+    formData.append('subtitle_animation_duration', subtitleAnimationDuration.toString());
+    formData.append('subtitle_animation_spring', subtitleAnimationSpring.toString());
 
     formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
     formData.append('subtitle_box_color', subtitleBgColor);
@@ -495,6 +532,18 @@ function App() {
     formData.append('output_quality', outputQuality);
     formData.append('output_resolution', outputResolution);
     formData.append('whisper_language', whisperLanguage);
+    formData.append('whisper_model_size', whisperModelSize);
+    formData.append('whisper_beam_size', whisperBeamSize.toString());
+    formData.append('whisper_temperature', whisperTemperature.toString());
+    formData.append('whisper_no_speech_threshold', whisperNoSpeechThreshold.toString());
+    formData.append('whisper_condition_on_previous_text', whisperConditionOnPreviousText.toString());
+    formData.append('whisper_best_of', whisperBestOf.toString());
+    formData.append('whisper_patience', whisperPatience.toString());
+    formData.append('whisper_compression_ratio_threshold', whisperCompressionRatioThreshold.toString());
+    formData.append('whisper_logprob_threshold', whisperLogprobThreshold.toString());
+    formData.append('whisper_fp16', whisperFp16.toString());
+    formData.append('whisper_remove_punctuation', whisperRemovePunctuation.toString());
+    formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
 
     try {
       const res = await fetch('http://localhost:8000/process-video', { method: 'POST', body: formData });
@@ -680,16 +729,22 @@ function App() {
                       duration: previewCut.end - previewCut.start,
                       zoom: 1.0
                     }],
-                    subtitles: (
-                      (previewSubtitles.length > 0 ? previewSubtitles : srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start)).length > 0
-                        ? (previewSubtitles.length > 0 ? previewSubtitles : srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start))
-                        : [{
-                          id: 'preview',
-                          start: previewCut.start,
-                          end: previewCut.end,
-                          text: wrapText(previewText || '預覽文字內容 (可以手動輸入設定測試)', subtitleCharsPerLine)
-                        }]
-                    ),
+                    subtitles: (() => {
+                      // 1. If we have preview subtitles (from server), use them.
+                      if (previewSubtitles && previewSubtitles.length > 0) return previewSubtitles;
+
+                      // 2. If we have globally loaded SRT subtitles, filter and use them.
+                      const globalInCut = srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start);
+                      if (globalInCut.length > 0) return globalInCut;
+
+                      // 3. Last fallback: ONLY if no real subtitles exist, show the manual preview text.
+                      return [{
+                        id: 'preview_placeholder',
+                        start: previewCut.start,
+                        end: previewCut.end,
+                        text: wrapText(previewText || '預覽文字內容', subtitleCharsPerLine)
+                      }];
+                    })(),
                     isFaceTracking: isFaceTracking,
                     faceCenterX: previewFaceCenter, // Force usage of detected face center
                     subtitleConfig: {
@@ -900,7 +955,11 @@ function App() {
                       textShadow: isSubtitleShadow ? `${subtitleShadowOffsetX * scaleRatio}px ${subtitleShadowOffsetY * scaleRatio}px ${subtitleShadowBlur * scaleRatio}px ${subtitleShadowColor}${Math.round((subtitleShadowOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'none',
                       whiteSpace: 'pre-wrap'
                     }}>
-                      {wrapText(previewText, subtitleCharsPerLine)}
+                      {(() => {
+                        const currentSub = srtSubtitles.find(s => currentTime >= s.start && currentTime <= s.end);
+                        const displayText = currentSub ? currentSub.text : (previewText || '預覽文字內容 (點擊此處可輸入內容測試)');
+                        return wrapText(displayText, subtitleCharsPerLine);
+                      })()}
                     </span>
                   </div>
                 </div>
@@ -1010,7 +1069,7 @@ function App() {
                         </div>
                         <label className="checkbox-inline">
                           <input type="checkbox" checked={isJumpCutZoom} onChange={e => setIsJumpCutZoom(e.target.checked)} />
-                          <span>自動變焦 (Visual Pop)</span>
+                          <span>自動變焦</span>
                         </label>
                       </div>
                     )}
@@ -1018,7 +1077,7 @@ function App() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
                       <label className="checkbox-sm">
                         <input type="checkbox" checked={isAutoCaption} onChange={e => setIsAutoCaption(e.target.checked)} />
-                        <span>{srtSubtitles.length > 0 ? `已載入 SRT 字幕 (${srtSubtitles.length})` : 'AI 語音轉文字 (SRT)'}</span>
+                        <span>{srtSubtitles.length > 0 ? `已載入 SRT 字幕 (${srtSubtitles.length})` : 'AI 語音轉文字'}</span>
                       </label>
                     </div>
 
@@ -1029,14 +1088,101 @@ function App() {
                             <div className="style-row-inline" style={{ marginBottom: '8px' }}>
                               <span className="style-label" style={{ minWidth: '60px' }}>轉錄語言</span>
                               <select value={whisperLanguage} onChange={e => setWhisperLanguage(e.target.value)} className="select-xs" style={{ flex: 1 }}>
-                                <option value="zh">中文 (Auto)</option>
-                                <option value="zh-tw">繁體中文 (Taiwan)</option>
-                                <option value="en">英文 (English)</option>
-                                <option value="ja">日文 (Japanese)</option>
-                                <option value="auto">自動偵測 (Auto)</option>
+                                <option value="zh">中文</option>
+                                <option value="en">英文</option>
+                                <option value="ja">日文</option>
+                                <option value="auto">自動偵測</option>
                               </select>
                             </div>
-                            <label className="checkbox-inline"><input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} /><span>繁體中文翻譯 (Gemini)</span></label>
+
+                            {/* Advanced Whisper Settings */}
+                            <div className="whisper-adv-panel">
+                              <div className="section-subtitle" style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '12px', fontWeight: '800', textTransform: 'uppercase', letterSpacing: '1px' }}>AI 轉錄引擎調優</div>
+
+                              <div className="whisper-row">
+                                <span className="whisper-label">模型大小</span>
+                                <select value={whisperModelSize} onChange={e => setWhisperModelSize(e.target.value)} className="select-xs" style={{ flex: 1 }}>
+                                  <option value="turbo">Turbo</option>
+                                  <option value="large-v3">Large-v3</option>
+                                  <option value="medium">Medium</option>
+                                  <option value="small">Small</option>
+                                  <option value="base">Base</option>
+                                </select>
+                              </div>
+
+                              <div className="whisper-row">
+                                <span className="whisper-label">搜尋強度</span>
+                                <input type="range" min="1" max="10" value={whisperBeamSize} onChange={e => setWhisperBeamSize(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                <span className="val-display">{whisperBeamSize}</span>
+                              </div>
+
+                              <div className="whisper-row">
+                                <span className="whisper-label">轉錄切分字數</span>
+                                <input type="number" min="4" max="40" value={whisperCharsPerLine} onChange={e => setWhisperCharsPerLine(parseInt(e.target.value))} className="input-mini-xs" />
+                                <input type="range" min="4" max="40" value={whisperCharsPerLine} onChange={e => setWhisperCharsPerLine(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                              </div>
+
+                              <div className="whisper-row">
+                                <span className="whisper-label">隨機性</span>
+                                <input type="range" min="0" max="1" step="0.1" value={whisperTemperature} onChange={e => setWhisperTemperature(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                <span className="val-display">{whisperTemperature.toFixed(1)}</span>
+                              </div>
+
+                              <div className="whisper-row">
+                                <span className="whisper-label">靜音過濾</span>
+                                <input type="range" min="0" max="1" step="0.1" value={whisperNoSpeechThreshold} onChange={e => setWhisperNoSpeechThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                <span className="val-display">{whisperNoSpeechThreshold.toFixed(1)}</span>
+                              </div>
+
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '4px' }}>
+                                <label className="checkbox-inline">
+                                  <input type="checkbox" checked={whisperRemovePunctuation} onChange={e => setWhisperRemovePunctuation(e.target.checked)} />
+                                  <span className="label-xs">移除標點</span>
+                                </label>
+                                <label className="checkbox-inline">
+                                  <input type="checkbox" checked={whisperConditionOnPreviousText} onChange={e => setWhisperConditionOnPreviousText(e.target.checked)} />
+                                  <span className="label-xs">語意關聯</span>
+                                </label>
+                              </div>
+
+                              {/* Expert Toggle */}
+                              <button
+                                className={`expert-toggle-btn ${showExpertWhisper ? 'active' : ''}`}
+                                onClick={() => setShowExpertWhisper(!showExpertWhisper)}
+                              >
+                                <span>{showExpertWhisper ? '收起開發者設定' : '開啟專家級調優'}</span>
+                                <span className="chevron">▼</span>
+                              </button>
+
+                              {showExpertWhisper && (
+                                <div className="whisper-expert-container">
+                                  <div className="whisper-row">
+                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Best of</span>
+                                    <input type="number" value={whisperBestOf} onChange={e => setWhisperBestOf(parseInt(e.target.value))} className="input-mini-xs" />
+                                    <input type="range" min="1" max="10" value={whisperBestOf} onChange={e => setWhisperBestOf(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                  </div>
+                                  <div className="whisper-row">
+                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Patience</span>
+                                    <input type="number" step="0.1" value={whisperPatience} onChange={e => setWhisperPatience(parseFloat(e.target.value))} className="input-mini-xs" />
+                                    <input type="range" min="0" max="3" step="0.1" value={whisperPatience} onChange={e => setWhisperPatience(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                  </div>
+                                  <div className="whisper-row">
+                                    <span className="whisper-label" style={{ minWidth: '70px' }}>壓縮閾值</span>
+                                    <input type="number" step="0.1" value={whisperCompressionRatioThreshold} onChange={e => setWhisperCompressionRatioThreshold(parseFloat(e.target.value))} className="input-mini-xs" />
+                                    <input type="range" min="1" max="4" step="0.1" value={whisperCompressionRatioThreshold} onChange={e => setWhisperCompressionRatioThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                  </div>
+                                  <div className="whisper-row">
+                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Logprob</span>
+                                    <input type="number" step="0.1" value={whisperLogprobThreshold} onChange={e => setWhisperLogprobThreshold(parseFloat(e.target.value))} className="input-mini-xs" />
+                                    <input type="range" min="-3" max="0" step="0.1" value={whisperLogprobThreshold} onChange={e => setWhisperLogprobThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
+                                  </div>
+                                  <label className="checkbox-inline">
+                                    <input type="checkbox" checked={whisperFp16} onChange={e => setWhisperFp16(e.target.checked)} />
+                                    <span className="label-xs">FP16 硬體加速</span>
+                                  </label>
+                                </div>
+                              )}
+                            </div>
                           </>
                         )}
                         {srtSubtitles.length !== 0 && (
@@ -1045,10 +1191,16 @@ function App() {
                           </div>
                         )}
 
-                        <label className="checkbox-inline" style={{ marginTop: '10px' }}>
-                          <input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} />
-                          <span>燒錄至影片 (硬字幕)</span>
-                        </label>
+                        <div style={{ display: 'flex', gap: '20px', marginTop: '10px' }}>
+                          <label className="checkbox-inline">
+                            <input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} />
+                            <span>簡轉繁優化</span>
+                          </label>
+                          <label className="checkbox-inline">
+                            <input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} />
+                            <span>燒錄至影片</span>
+                          </label>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1133,7 +1285,7 @@ function App() {
                           <input type="number" step="0.5" value={subtitleLetterSpacing} onChange={e => setSubtitleLetterSpacing(parseFloat(e.target.value))} className="input-xs" />
                         </div>
                         <div className="mini-control">
-                          <label className="label-xs">限制字數</label>
+                          <label className="label-xs">視覺分行字數</label>
                           <input type="range" min="4" max="40" step="1" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="slider-xs" />
                           <input type="number" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="input-xs" />
                         </div>
@@ -1159,6 +1311,25 @@ function App() {
                           <option value="slide-up">向上滑入 (Slide Up)</option>
                         </select>
                       </div>
+
+                      {subtitleAnimation !== 'none' && (
+                        <div className="style-col-flex" style={{ marginTop: '8px', gap: '8px', paddingLeft: '8px', borderLeft: '2px solid rgba(255,255,255,0.1)' }}>
+                          <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
+                            <span className="label-xs">動畫時長</span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, marginLeft: '12px' }}>
+                              <input type="range" min="5" max="60" value={subtitleAnimationDuration} onChange={e => setSubtitleAnimationDuration(parseInt(e.target.value))} className="slider-xs" style={{ flex: 1 }} />
+                              <span className="val-display" style={{ minWidth: '24px' }}>{subtitleAnimationDuration}</span>
+                            </div>
+                          </div>
+                          <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
+                            <span className="label-xs">彈力強度</span>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, marginLeft: '12px' }}>
+                              <input type="range" min="0.1" max="2.0" step="0.1" value={subtitleAnimationSpring} onChange={e => setSubtitleAnimationSpring(parseFloat(e.target.value))} className="slider-xs" style={{ flex: 1 }} />
+                              <span className="val-display" style={{ minWidth: '24px' }}>{subtitleAnimationSpring.toFixed(1)}</span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                     <div className="style-item" style={{ marginTop: '10px' }}>
                       <div className="input-group-xs">

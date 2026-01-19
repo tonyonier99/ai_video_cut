@@ -33,6 +33,8 @@ export interface AdvancedSubtitleConfig {
     // Layout
     marginBottom: number;
     animation?: 'none' | 'pop' | 'fade' | 'slide-up';
+    animationDuration?: number;
+    animationSpring?: number; // Mass or Intensity
 
     // Background
     isUnknownBackground: boolean;
@@ -92,27 +94,29 @@ export const Subtitle: React.FC<SubtitleProps> = ({ text, config }) => {
 
     // 1. Animation Logic
     const animType = config.animation || 'pop';
+    const animDuration = config.animationDuration || 15;
+    const animSpringMass = config.animationSpring || 0.5;
 
     // Spring configs
     const popScale = spring({
         fps,
         frame,
-        config: { damping: 12, stiffness: 100, mass: 0.5 },
-        durationInFrames: 15,
+        config: { damping: 12, stiffness: 100, mass: animSpringMass },
+        durationInFrames: animDuration,
     });
 
     const fadeOpacity = spring({
         fps,
         frame,
         config: { damping: 20 },
-        durationInFrames: 15
+        durationInFrames: animDuration
     });
 
     const slideOffset = spring({
         fps,
         frame,
-        config: { damping: 15, stiffness: 90 },
-        durationInFrames: 20
+        config: { damping: 15, stiffness: 90, mass: animSpringMass },
+        durationInFrames: Math.round(animDuration * 1.3) // Slide usually looks better slightly slower
     });
 
     // Determine final styles

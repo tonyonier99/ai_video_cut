@@ -936,11 +936,95 @@ input[type="color"]::-webkit-color-swatch {
 }
 
 .val-display {
-  font-size: 12px;
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
   font-weight: 600;
-  color: #6366f1;
-  min-width: 35px;
+  color: #818cf8;
+  min-width: 32px;
   text-align: right;
+}
+
+/* Whisper Advanced Specific */
+.whisper-adv-panel {
+  background: rgba(0, 0, 0, 0.2);
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  margin-top: 10px;
+}
+
+.whisper-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.whisper-row:last-child {
+  margin-bottom: 0;
+}
+
+.whisper-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  min-width: 55px;
+  white-space: nowrap;
+}
+
+.expert-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 4px;
+  background: transparent;
+  border: none;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  margin-top: 12px;
+  color: #6366f1;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.expert-toggle-btn:hover {
+  color: #818cf8;
+  background: rgba(99, 102, 241, 0.05);
+}
+
+.expert-toggle-btn .chevron {
+  font-size: 8px;
+  transition: transform 0.3s ease;
+}
+
+.expert-toggle-btn.active .chevron {
+  transform: rotate(180deg);
+}
+
+.whisper-expert-container {
+  margin-top: 8px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 8px;
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.input-mini-xs {
+  width: 42px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 2px 4px;
+  color: #fff;
+  font-size: 11px;
+  text-align: center;
+  font-family: 'JetBrains Mono', monospace;
 }
 
 /* Buttons */
