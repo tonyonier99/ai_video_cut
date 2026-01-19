@@ -946,34 +946,68 @@ function App() {
                     flexDirection: 'column',
                     alignItems: (subtitleTextAlign === 'left' ? 'flex-start' : (subtitleTextAlign === 'right' ? 'flex-end' : 'center')),
                   }}>
-                    <span style={{
-                      fontFamily: subtitleFontName ? `"${subtitleFontName}", Arial, sans-serif` : 'Arial',
-                      fontSize: `${subtitleFontSize * scaleRatio}px`,
-                      fontWeight: subtitleFontWeight,
-                      fontStyle: subtitleFontStyle,
-                      color: isTextGradient ? 'transparent' : subtitleTextColor,
+                    {/* Dual Layer Rendering Strategy for perfect quality */}
+                    <div style={{
+                      display: 'inline-grid',
+                      position: 'relative',
                       textAlign: (subtitleTextAlign as any) || 'center',
-                      letterSpacing: `${subtitleLetterSpacing * scaleRatio}px`,
-                      lineHeight: subtitleLineHeight,
-                      textTransform: (subtitleTextTransform as any) || 'none',
-                      backgroundImage: isTextGradient ? `linear-gradient(${textGradientDirection}, ${textGradientColors.join(', ')})` : 'none',
-                      WebkitBackgroundClip: isTextGradient ? 'text' : undefined,
-                      WebkitTextFillColor: isTextGradient ? 'transparent' : undefined,
-                      // CSS Stroke simulation
-                      WebkitTextStroke: (isSubtitleOutline && subtitleOutlineWidth > 0) ? `${(subtitleOutlineWidth * scaleRatio) * 2}px ${subtitleOutlineColor}` : '0px',
-                      paintOrder: 'stroke fill',
-                      strokeLinejoin: 'round',
-                      strokeLinecap: 'round',
-                      // CSS Shadow simulation
-                      textShadow: isSubtitleShadow ? `${subtitleShadowOffsetX * scaleRatio}px ${subtitleShadowOffsetY * scaleRatio}px ${subtitleShadowBlur * scaleRatio}px ${subtitleShadowColor}${Math.round((subtitleShadowOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'none',
-                      whiteSpace: 'pre-wrap'
+                      isolation: 'isolate',
                     }}>
+                      {/* Common basic font styles */}
                       {(() => {
                         const currentSub = srtSubtitles.find(s => currentTime >= s.start && currentTime <= s.end);
-                        const displayText = currentSub ? currentSub.text : (previewText || '預覽文字內容 (點擊此處可輸入內容測試)');
-                        return wrapText(displayText, subtitleCharsPerLine);
+                        const displayText = currentSub ? currentSub.text : (previewText || '預覽文字內容');
+                        const finalText = wrapText(displayText, subtitleCharsPerLine);
+
+                        const baseTextStyle: React.CSSProperties = {
+                          fontFamily: subtitleFontName ? `"${subtitleFontName}", Arial, sans-serif` : 'Arial',
+                          fontSize: `${subtitleFontSize * scaleRatio}px`,
+                          fontWeight: subtitleFontWeight,
+                          fontStyle: subtitleFontStyle,
+                          textAlign: (subtitleTextAlign as any) || 'center',
+                          letterSpacing: `${subtitleLetterSpacing * scaleRatio}px`,
+                          lineHeight: subtitleLineHeight,
+                          textTransform: (subtitleTextTransform as any) || 'none',
+                          whiteSpace: 'pre-wrap',
+                          gridArea: '1 / 1',
+                          position: 'relative',
+                        };
+
+                        return (
+                          <>
+                            {/* Layer 1: The Outline & Shadow (Bottom) */}
+                            <span style={{
+                              ...baseTextStyle,
+                              WebkitTextStroke: (isSubtitleOutline && subtitleOutlineWidth > 0) ? `${(subtitleOutlineWidth * scaleRatio) * 2}px ${subtitleOutlineColor}` : '0px',
+                              textShadow: isSubtitleShadow ? `${subtitleShadowOffsetX * scaleRatio}px ${subtitleShadowOffsetY * scaleRatio}px ${subtitleShadowBlur * scaleRatio}px ${subtitleShadowColor}${Math.round((subtitleShadowOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'none',
+                              color: isTextGradient ? (isSubtitleOutline ? subtitleOutlineColor : 'transparent') : subtitleTextColor,
+                              zIndex: 0,
+                              paintOrder: 'stroke fill',
+                              strokeLinejoin: 'round',
+                              strokeLinecap: 'round',
+                            }}>
+                              {finalText}
+                            </span>
+
+                            {/* Layer 2: The Gradient Face (Top) */}
+                            {isTextGradient && (
+                              <span style={{
+                                ...baseTextStyle,
+                                zIndex: 10,
+                                backgroundImage: `linear-gradient(${textGradientDirection}, ${textGradientColors.join(', ')})`,
+                                WebkitBackgroundClip: 'text',
+                                WebkitTextFillColor: 'transparent',
+                                color: 'transparent',
+                                WebkitTextStroke: '0px transparent',
+                                textShadow: 'none',
+                              }}>
+                                {finalText}
+                              </span>
+                            )}
+                          </>
+                        );
                       })()}
-                    </span>
+                    </div>
                   </div>
                 </div>
               </div>
