@@ -607,6 +607,125 @@ def parse_time(value):
 # --- All legacy MoviePy/OpenCV reframing logic removed ---
 # Video processing is now handled via Remotion in 'process_video' endpoint.
 
+def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_tracking="false", track_zoom=1.5, track_weight=5.0, track_stickiness=2.0, min_shot_duration=2.0):
+    """
+    Simplified Reframing for Preview:
+    Detects face in the middle of the clip and static crops to it.
+    We don't do full frame-by-frame tracking in PREVIEW because it's too slow in Python.
+    Full tracking is handled by Remotion/Frontend logic or could be added back if needed.
+    """
+    # Only vertical mode needs reframing
+    if str(vertical_mode).lower() != "true":
+         # Just return original clip + center (0.5 placeholder calculated later if we don't track here)
+         # BUT we want to track if requested.
+         pass # Proceed to tracking logic below, but we will skip the CROP at the end if vertical_mode is false.
+
+
+    w, h = clip.size
+    target_ratio = 9/16
+    target_w = int(h * target_ratio)
+    target_h = h
+    
+    # Default Center Crop
+    center_x = w / 2
+    
+    # Face Detection (Single Frame Check for Speed)
+    # We check 3 frames: Start, Middle, End to get an average position
+    # Face Detection (Robust OpenCV Method with Temp File)
+    if str(face_tracking).lower() == "true" and face_detector:
+        detected_xs = []
+        import cv2
+        import numpy as np
+        import uuid
+        
+        # 1. Write temp file for OpenCV to read (Fastest possible write)
+        temp_track_filename = f"temp_track_{uuid.uuid4()}.mp4"
+        temp_track_path = os.path.join(UPLOAD_DIR, temp_track_filename)
+        
+        print(f"👁️ Preview Tracking: Writing temp clip for robust detection: {temp_track_filename}")
+        try:
+            # Write a small, fast version just for tracking? Or just the clip itself.
+            # Just write the audio-less video quickly
+            clip.write_videofile(temp_track_path, codec="libx264", preset="ultrafast", audio=False, logger=None)
+            
+            # 2. Open with OpenCV
+            cap = cv2.VideoCapture(temp_track_path)
+            
+            if not cap.isOpened():
+                print("⚠️ Could not open temp tracking file.")
+            else:
+                # Track every Nth frame to save time but keep accuracy
+                # e.g. every 0.5 seconds
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps <= 0: fps = 30
+                frame_step = int(fps * 0.5) # Check every 0.5s
+                if frame_step < 1: frame_step = 1 # Avoid step=0
+                
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                current_frame = 0
+                
+                print(f"👁️ Preview Tracking: Scanning {total_frames} frames (Step=0.5s)...")
+                
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    if current_frame % frame_step == 0:
+                        # OpenCV is BGR, Convert to RGB
+                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        
+                        fx = None
+                        if hasattr(face_detector, 'detect'):
+                             import mediapipe as mp
+                             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                             res = face_detector.detect(mp_image)
+                             if res.detections:
+                                 bbox = res.detections[0].bounding_box
+                                 fx = bbox.origin_x + bbox.width / 2
+                        elif hasattr(face_detector, 'process'):
+                             res = face_detector.process(rgb_frame)
+                             if res.detections:
+                                 bbox = res.detections[0].location_data.relative_bounding_box
+                                 fx = (bbox.xmin + bbox.width/2) * w
+                        elif face_detector == "opencv_fallback":
+                             gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+                             # face_cascade must be available globally or imported
+                             # Simplifying fallback here if needed
+                             pass
+
+                        if fx: detected_xs.append(fx)
+                    
+                    current_frame += 1
+                
+                cap.release()
+                
+        except Exception as e:
+            print(f"⚠️ Robust Tracking Failed: {e}")
+        finally:
+            if os.path.exists(temp_track_path):
+                os.remove(temp_track_path)
+
+        if detected_xs:
+             center_x = sum(detected_xs) / len(detected_xs)
+             print(f"👁️ Preview Smart Crop: Face detected at X={int(center_x)} (from {len(detected_xs)} samples)")
+        else:
+             print("👁️ Preview Smart Crop: No face, using center.")
+
+    # Calculate Crop Coords
+    x1 = max(0, int(center_x - target_w / 2))
+    # Ensure within bounds
+    if x1 + target_w > w:
+        x1 = w - target_w
+    
+    # Apply Crop (Only if vertical mode is TRUE)
+    if str(vertical_mode).lower() == "true":
+        from moviepy.video.fx.all import crop
+        cropped_clip = crop(clip, x1=x1, y1=0, width=target_w, height=target_h)
+        return (cropped_clip, float(center_x / w)) # Explicit Tuple
+    else:
+        # Return ORIGINAL clip + calculated center
+        return (clip, float(center_x / w)) # Explicit Tuple
+
 @app.post("/analyze-video")
 async def analyze_video(
     file: UploadFile = File(...),
@@ -928,6 +1047,22 @@ def preview_pipeline_generator(
         if end > clip.duration: end = clip.duration
         
         sub = clip.subclip(start, end)
+        
+        # 🚀 APPLY FACE TRACKING TO PREVIEW
+        # Note: We hardcode vertical_mode="true" (or we should detect aspect ratio?)
+        # Actually simplest is: if is_face_tracking is true, assume we want 9:16 crop for mobile preview
+        # or we should check aspect ratio param? But preview endpoint doesn't accept aspect ratio param currently.
+        # Let's assume preview is always vertical if tracking is on.
+        if str(is_face_tracking).lower() == "true":
+             yield json.dumps({"status": "progress", "message": "正在進行人臉裁切...", "percent": 15}) + "\n"
+             # CRITICAL FIX: apply_smart_reframing returns (clip, center_x). Must unpack!
+             sub, _ = apply_smart_reframing(
+                 sub, 
+                 aspect_ratio="9:16", 
+                 face_tracking="true", 
+                 vertical_mode="true"
+             )
+
         temp_sub_path = os.path.join(UPLOAD_DIR, f"sub_{ts}.mp4")
         sub.write_videofile(temp_sub_path, audio_codec='aac', logger=None)
         
@@ -1003,45 +1138,51 @@ def preview_pipeline_generator(
                 yield json.dumps({"status": "progress", "message": "正在優化繁體中文轉譯 (本地快速)...", "percent": 80}) + "\n"
                 subtitles = translate_subtitles(subtitles, api_key)
         
-        face_center = 0.5
+        # --- 5. Robust Face Tracking & Remotion "Proof of Work" (Matches Export) ---
+        face_center_x = 0.5
+        
+        # A. PHYSICAL CROP & DETECTION (Ensures Preview Visual is Correct)
+        # We use apply_smart_reframing which now uses the robust Temp File + OpenCV method internally.
         if str(is_face_tracking).lower() == 'true' and face_detector:
-             yield json.dumps({"status": "progress", "message": "正在偵測人臉位置...", "percent": 90}) + "\n"
-             try:
-                 sc = VideoFileClip(temp_sub_path)
-                 frame = sc.get_frame(sc.duration / 2) # Get middle frame
-                 h, w, _ = frame.shape
-                 
-                 # MediaPipe Tasks API
-                 if hasattr(face_detector, 'detect'):
-                     import mediapipe as mp
-                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                     mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                     det_res = face_detector.detect(mp_image)
-                     if det_res.detections:
-                         bbox = det_res.detections[0].bounding_box
-                         face_center = (bbox.origin_x + bbox.width / 2) / w
-                 
-                 # Legacy API
-                 elif hasattr(face_detector, 'process'):
-                      import cv2
-                      rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                      det_res = face_detector.process(rgb_frame)
-                      if det_res.detections:
-                          bbox = det_res.detections[0].location_data.relative_bounding_box
-                          face_center = bbox.xmin + (bbox.width / 2)
-                          
-                 # OpenCV Fallback
-                 elif face_detector == "opencv_fallback":
-                      import cv2
-                      gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                      faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-                      if len(faces) > 0:
-                          (fx, fy, fw, fh) = faces[0]
-                          face_center = (fx + fw / 2) / w
+             yield json.dumps({"status": "progress", "message": "正在分析人臉 (0.5s 取樣)...", "percent": 85}) + "\n"
+             
+             # Call the robust function we updated
+             # It acts as a defensive wrapper now
+             result = apply_smart_reframing(
+                 sub, 
+                 aspect_ratio="9:16",
+                 face_tracking="true",
+                 vertical_mode="false" # <--- IMPORTANT: Do NOT crop here
+             )
+             
+             print(f"DEBUG_RAW: result type: {type(result)}")
+             if isinstance(result, tuple) and len(result) >= 2:
+                 sub = result[0]
+                 face_center_x = result[1]
+             else:
+                 print("⚠️ WARNING: Unexpected return from apply_smart_reframing")
+                 # Fallback: assume it returned just the clip (old behavior?)
+                 if not isinstance(result, tuple):
+                     sub = result
+                 else:
+                     sub = result[0]
 
-                 sc.close()
-             except Exception as fe:
-                 print(f"Face Tracking Preview Error: {fe}")
+             
+             print(f"DEBUG: 'sub' type: {type(sub)}, 'face_center_x': {face_center_x}")
+             if isinstance(sub, tuple):
+                 sub = sub[0]
+                 
+             # Write the FULL (uncropped) SUB file
+             # Frontend will crop it using face_center_x
+             sub.write_videofile(temp_sub_path, audio_codec='aac', logger=None)
+             print(f"👤 Preview Face Center Applied: {face_center_x:.2f}")
+
+        # B. Remotion Rendering Removed for Speed
+        # We now rely on Client-Side Player to render the preview using `faceCenterX`
+        yield json.dumps({"status": "progress", "message": "正在準備客戶端預覽...", "percent": 95}) + "\n"
+        
+        # Cleanup Remotion Props/Artifacts if any
+        # (None to clean since we skipped render)
 
         # Cleanup
         sub.close()
@@ -1059,7 +1200,7 @@ def preview_pipeline_generator(
         result = {
             "status": "success",
             "subtitles": subtitles,
-            "faceCenterX": face_center,
+            "faceCenterX": face_center_x,
             "audioUrl": preview_audio_url,
             "visualSegments": visual_segments
         }
@@ -1701,82 +1842,66 @@ def process_video(
                     import cv2
                     import mediapipe as mp
                     
-                    # Analyze the middle frame of the clip for face position
-                    mid_point = start + (final_duration / 2)
+                    # Analyze MULTIPLE frames for better centering (Fine-grained)
+                    # Sample every 0.5s (MATCH PREVIEW LOGIC)
+                    dur = final_duration
+                    import numpy as np
+                    timestamps = np.arange(start, end, 0.5)
+                    if len(timestamps) == 0: timestamps = [start + dur/2]
                     
-                    # DIRECT OPENCV CAPTURE (Faster & Safer)
-                    rgb_frame = None
-                    try:
-                        cap = cv2.VideoCapture(abs_video_path)
-                        if cap.isOpened():
-                            cap.set(cv2.CAP_PROP_POS_MSEC, mid_point * 1000)
-                            ret, frame = cap.read()
-                            if ret:
-                                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                            cap.release()
-                    except Exception as ve:
-                         print(f"⚠️ OpenCV Frame Extract Failed: {ve}")
-
-                    # Fallback to FFmpeg ONLY if OpenCV failed
-                    if rgb_frame is None:
-                        print("⚠️ OpenCV failed to grab frame, falling back to FFmpeg CLI...")
-                        temp_frame_path = os.path.join(UPLOAD_DIR, f"temp_face_{i}_{int(time.time())}.jpg")
+                    print(f"👁️ Export Tracking: Scanning {len(timestamps)} frames (Step=0.5s)...")
+                    
+                    detected_centers = []
+                    
+                    for ts in timestamps:
                         try:
-                            cmd = [
-                                "ffmpeg", "-y", 
-                                "-ss", str(mid_point),
-                                "-i", abs_video_path,
-                                "-frames:v", "1",
-                                "-q:v", "2",
-                                "-update", "1", # Ensure single image update
-                                temp_frame_path
-                            ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-                            
-                            if os.path.exists(temp_frame_path):
-                                bgr_frame = cv2.imread(temp_frame_path)
-                                if bgr_frame is not None:
-                                    rgb_frame = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-                                os.remove(temp_frame_path)
-                        except Exception as fe:
-                             print(f"⚠️ FFmpeg Fallback also failed: {fe}")
+                            # DIRECT OPENCV CAPTURE (Faster & Safer)
+                            rgb_frame = None
+                            try:
+                                cap = cv2.VideoCapture(abs_video_path)
+                                if cap.isOpened():
+                                    cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000)
+                                    ret, frame = cap.read()
+                                    if ret:
+                                        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    cap.release()
+                            except: pass
 
-                    if rgb_frame is not None:
-                        h, w, _ = rgb_frame.shape
-                        
-                        # Use Tasks API or Legacy or OpenCV
-                        if hasattr(face_detector, 'detect'): # Tasks API
-                            # MoviePy returns RGB, perfect for MediaPipe
-                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                            detection_result = face_detector.detect(mp_image)
-                            if detection_result.detections:
-                                bbox = detection_result.detections[0].bounding_box
-                                center = bbox.origin_x + (bbox.width / 2)
-                                face_center_x = center / w
-                                print(f"👤 Face detected (Tasks API) at X={face_center_x:.2f}")
-                            else:
-                                print(f"👤 No face detected (Tasks API) in frame")
-                        
-                        elif hasattr(face_detector, 'process'): # Legacy API
-                            results = face_detector.process(rgb_frame)
-                            if results.detections:
-                                bboxC = results.detections[0].location_data.relative_bounding_box
-                                face_center_x = bboxC.xmin + (bboxC.width / 2)
-                                print(f"👤 Face detected at X={face_center_x:.2f}")
+                            # Analyze if frame grabbed
+                            if rgb_frame is not None:
+                                h, w, _ = rgb_frame.shape
                                 
-                        elif face_detector == "opencv_fallback": # OpenCV
-                            # Convert RGB back to BGR/GRAY for OpenCV
-                            gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
-                            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-                            if len(faces) > 0:
-                                (x, y, w_f, h_f) = faces[0]
-                                face_center_x = (x + w_f / 2) / w
-                                print(f"👤 Face detected (OpenCV) at X={face_center_x:.2f}")
-                            else:
-                                print(f"👤 No face detected (OpenCV) in frame")
-                    else:
-                        print(f"⚠️ Could not read frame at {mid_point}s")
+                                # Use Tasks API or Legacy or OpenCV
+                                if hasattr(face_detector, 'detect'): # Tasks API
+                                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                                    detection_result = face_detector.detect(mp_image)
+                                    if detection_result.detections:
+                                        bbox = detection_result.detections[0].bounding_box
+                                        center = bbox.origin_x + (bbox.width / 2)
+                                        detected_centers.append(center / w)
+                                
+                                elif hasattr(face_detector, 'process'): # Legacy API
+                                    results = face_detector.process(rgb_frame)
+                                    if results.detections:
+                                        bboxC = results.detections[0].location_data.relative_bounding_box
+                                        face_center_x_tmp = bboxC.xmin + (bboxC.width / 2)
+                                        detected_centers.append(face_center_x_tmp)
+                                        
+                                elif face_detector == "opencv_fallback": # OpenCV
+                                    gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
+                                    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+                                    if len(faces) > 0:
+                                        (x, y, w_f, h_f) = faces[0]
+                                        detected_centers.append((x + w_f / 2) / w)
+                        except Exception as e:
+                             print(f"⚠️ Tracking frame error at {ts}: {e}")
 
+                    # Calculate Average
+                    if detected_centers:
+                        face_center_x = sum(detected_centers) / len(detected_centers)
+                        print(f"👤 Final Face Center: {face_center_x:.2f} (sampled {len(detected_centers)} frames)")
+                    else:
+                        print("👤 No face detected in any sample frame, defaulting to center.")
                 except Exception as e:
                     print(f"⚠️ Face detection ERROR for clip {i}: {e}")
             else:

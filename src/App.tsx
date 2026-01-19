@@ -13,7 +13,16 @@ interface Cut {
   label: string;
 }
 
+
 function App() {
+  const formatTimestamp = (timeStr: string | number) => {
+    const time = typeof timeStr === 'string' ? parseFloat(timeStr) : timeStr;
+    const minutes = Math.floor(time / 60);
+    const seconds = Math.floor(time % 60);
+    const milliseconds = Math.floor((time % 1) * 10); // Show 1 decimal place
+    return `${minutes}:${seconds.toString().padStart(2, '0')}.${milliseconds}`;
+  };
+
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
@@ -36,7 +45,7 @@ function App() {
   const [isFaceTracking, setIsFaceTracking] = useState(true);
   const [isStudioSound, setIsStudioSound] = useState(false); // Default disabled
   const [isAutoCaption, setIsAutoCaption] = useState(true);
-  const [isTranslate, setIsTranslate] = useState(false); // Default false, Whisper directly outputs Chinese
+  const [isTranslate, setIsTranslate] = useState(true); // Default enabled for Traditional Chinese Optimization
   const [isBurnCaptions, setIsBurnCaptions] = useState(true);
   const [whisperModelSize, setWhisperModelSize] = useState('turbo');
   const [whisperBeamSize, setWhisperBeamSize] = useState(5);
@@ -100,7 +109,7 @@ function App() {
   const [subtitleBgPaddingY, setSubtitleBgPaddingY] = useState(4);
   const [subtitleBgRadius, setSubtitleBgRadius] = useState(4);
 
-  const [subtitleAnimation, setSubtitleAnimation] = useState<'none' | 'pop' | 'fade' | 'slide-up'>('pop');
+  const [subtitleAnimation, setSubtitleAnimation] = useState<'none' | 'pop' | 'fade' | 'slide-up'>('none');
   const [subtitleAnimationDuration, setSubtitleAnimationDuration] = useState(15);
   const [subtitleAnimationSpring, setSubtitleAnimationSpring] = useState(0.5); // Mass / Intensity
 
@@ -557,7 +566,7 @@ function App() {
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        alert('匯出成功！檔案已開始下載。');
+
       } else {
         const errorData = await res.json().catch(() => ({ detail: '匯出失敗' }));
         alert(`匯出失敗: ${errorData.detail || res.statusText}`);
@@ -1468,32 +1477,26 @@ function App() {
                           <div className="time-input-group">
                             <label>開始</label>
                             <input
-                              type="number"
-                              step="0.1"
-                              min="0"
-                              max={cut.end - 0.5}
-                              value={cut.start.toFixed(1)}
-                              onChange={(e) => updateCutTime(cut.id, 'start', parseFloat(e.target.value) || 0)}
-                              className="time-input"
+                              type="text"
+                              value={formatTimestamp(cut.start)}
+                              readOnly
+                              className="time-input-readonly"
+                              style={{ width: '70px', textAlign: 'center', background: 'transparent', border: 'none', color: '#4ade80', fontFamily: 'monospace' }}
                             />
-                            <span>s</span>
                           </div>
                           <div className="time-input-group">
                             <label>結束</label>
                             <input
-                              type="number"
-                              step="0.1"
-                              min={cut.start + 0.5}
-                              max={duration}
-                              value={cut.end.toFixed(1)}
-                              onChange={(e) => updateCutTime(cut.id, 'end', parseFloat(e.target.value) || 0)}
-                              className="time-input"
+                              type="text"
+                              value={formatTimestamp(cut.end)}
+                              readOnly
+                              className="time-input-readonly"
+                              style={{ width: '70px', textAlign: 'center', background: 'transparent', border: 'none', color: '#4ade80', fontFamily: 'monospace' }}
                             />
-                            <span>s</span>
                           </div>
                         </div>
                         {/* Time Range Sliders */}
-                        <div className="cut-slider-row">
+                        < div className="cut-slider-row" >
                           <label>開始</label>
                           <input
                             type="range"
@@ -1560,8 +1563,8 @@ function App() {
               </div>
             </aside>
           </div>
-        </div>
-      </main>
+        </div >
+      </main >
 
       {/* Bottom Progress Bar */}
       {
