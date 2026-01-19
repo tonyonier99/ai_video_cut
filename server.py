@@ -1113,10 +1113,10 @@ async def analyze_video(
 
         # Restore smart fallback logic to ensure success even if user selects non-existent model (like 3.0)
         candidate_models = [
-            real_model_name,              # 1. User selection (e.g. gemini-3.0-flash)
-            "gemini-2.0-flash-exp",       # 2. Smart Fallback: Newest Experimental
-            "gemini-1.5-pro",             # 3. Stable Pro
-            "gemini-1.5-flash",           # 4. Stable Flash
+            real_model_name,              # 1. User selection (e.g. gemini-3-flash-preview)
+            "gemini-3-flash-preview",     # 2. Smart Fallback: Gemini 3
+            "gemini-2.5-flash",           # 3. Next stable
+            "gemini-1.5-flash",           # 4. Old stable
         ]
         
         candidate_models = list(dict.fromkeys(candidate_models)) # Remove dupes

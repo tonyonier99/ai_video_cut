@@ -39,7 +39,7 @@ function App() {
   const [instruction, setInstruction] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [showApiSettings, setShowApiSettings] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-3.0-flash');
+  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
 
   // AI 核心功能
   const [isFaceTracking, setIsFaceTracking] = useState(true);
@@ -1009,8 +1009,11 @@ function App() {
                           <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="輸入 Gemini API Key..." className="api-input-inline" />
                         </div>
                         <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)} className="select-sm">
-                          <option value="gemini-3.0-flash">Gemini 3.0 Flash</option>
-                          <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                          <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                          <option value="gemini-3-pro-preview">Gemini 3 Pro</option>
+                          <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                          <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                          <option value="gemini-1.5-flash">Gemini 1.5 Flash (Legacy)</option>
                         </select>
                       </motion.div>
                     )}
