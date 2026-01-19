@@ -344,6 +344,7 @@ whisper_model = None
 # MediaPipe Initialization (New Tasks API for v0.10+)
 face_detector = None
 mp_face_detection = None
+face_mesh = None  # For lip movement detection
 
 try:
     # Try new MediaPipe Tasks API first (v0.10+)
@@ -385,6 +386,22 @@ except Exception as e:
             print("⚠️ Used OpenCV Haar Classifier as fallback")
         except:
             face_detector = None
+
+# Initialize Face Mesh for Lip Movement Detection
+try:
+    import mediapipe as mp
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=False,
+        max_num_faces=5,  # Track up to 5 faces
+        refine_landmarks=True,  # Get detailed lip landmarks
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    )
+    print("✅ MediaPipe Face Mesh Ready (Lip Movement Detection)")
+except Exception as e:
+    print(f"⚠️ Face Mesh Init Failed: {e}")
+    face_mesh = None
 
 # Studio Sound (DFN3)
 try:
@@ -607,6 +624,267 @@ def parse_time(value):
 # --- All legacy MoviePy/OpenCV reframing logic removed ---
 # Video processing is now handled via Remotion in 'process_video' endpoint.
 
+def detect_speaker_segments(clip, segment_duration=1.0):
+    """
+    Analyzes video clip and returns time-segmented speaker positions.
+    Returns: list of {start, end, faceCenterX} dictionaries
+    Each segment represents who is speaking at that time.
+    """
+    import cv2
+    import numpy as np
+    import uuid
+    import os
+    import mediapipe as mp
+    
+    w, h = clip.size
+    total_duration = clip.duration
+    segments = []
+    
+    # Explicitly access global variables
+    global face_mesh, face_detector
+    print(f"🔍 detect_speaker_segments: face_mesh={face_mesh is not None}, face_detector={face_detector is not None}")
+    
+    # Need at least one detection method
+    if face_mesh is None and (face_detector is None or not hasattr(face_detector, 'detect')):
+        print("⚠️ No face detection method available, returning fallback")
+        return [{"start": 0, "end": total_duration, "faceCenterX": 0.5}]
+    
+    local_face_mesh = face_mesh  # May be None, will use face_detector fallback
+    
+    temp_track_filename = f"temp_speaker_{uuid.uuid4()}.mp4"
+    temp_track_path = os.path.join(UPLOAD_DIR, temp_track_filename)
+    
+    print(f"🎤 Speaker Segments: Analyzing {total_duration:.1f}s video...")
+    
+    # Data: {frame_time: {bucket: lip_aperture}}
+    frame_data = []  # [(time, {bucket: (center_x, lip_aperture)}), ...]
+    
+    try:
+        clip.write_videofile(temp_track_path, codec="libx264", preset="ultrafast", audio=False, logger=None)
+        cap = cv2.VideoCapture(temp_track_path)
+        
+        if not cap.isOpened():
+            return [{"start": 0, "end": total_duration, "faceCenterX": 0.5}]
+        
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0: fps = 30
+        frame_step = max(1, int(fps * 0.05))  # Higher resolution sampling (every 0.05s)
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        current_frame = 0
+        frames_processed = 0
+        faces_found = 0
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            
+            current_time = current_frame / fps
+            
+            if current_frame % frame_step == 0:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame_h, frame_w = rgb_frame.shape[:2]
+                frame_faces = {}  # bucket -> (center_x, lip_aperture)
+                
+                # Try Face Mesh first for lip tracking
+                if local_face_mesh:
+                    mesh_results = local_face_mesh.process(rgb_frame)
+                    
+                    if mesh_results.multi_face_landmarks:
+                        for face_landmarks in mesh_results.multi_face_landmarks:
+                            try:
+                                upper_lip = face_landmarks.landmark[13]
+                                lower_lip = face_landmarks.landmark[14]
+                                nose = face_landmarks.landmark[1]
+                                
+                                lip_aperture = abs(lower_lip.y - upper_lip.y)
+                                face_center_x_px = nose.x * frame_w
+                                bucket = int(face_center_x_px / 100)  # Use larger bucket for better stability
+                                
+                                frame_faces[bucket] = (face_center_x_px, lip_aperture)
+                            except:
+                                pass
+                
+                # Fallback to face_detector if no Face Mesh
+                elif face_detector and hasattr(face_detector, 'detect'):
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                    res = face_detector.detect(mp_image)
+                    if res.detections:
+                        for det in res.detections:
+                            bbox = det.bounding_box
+                            fx = bbox.origin_x + bbox.width / 2
+                            bucket = int(fx / 100)  # Use larger bucket for better stability
+                            frame_faces[bucket] = (fx, 0)  # No lip data in fallback
+                
+                # Debug: Log detected faces periodically
+                if current_frame % 30 == 0 and frame_faces:
+                    print(f"   Frame {current_frame}: {len(frame_faces)} faces at buckets {list(frame_faces.keys())}")
+                
+                if frame_faces:
+                    frame_data.append((current_time, frame_faces))
+                    faces_found += 1
+                frames_processed += 1
+            
+            current_frame += 1
+        
+        cap.release()
+        print(f"🔍 Speaker Detection: Processed {frames_processed} frames, found faces in {faces_found} frames")
+    except Exception as e:
+        print(f"⚠️ Speaker Segment Analysis Failed: {e}")
+        return [{"start": 0, "end": total_duration, "faceCenterX": 0.5}]
+    finally:
+        if os.path.exists(temp_track_path):
+            os.remove(temp_track_path)
+    
+    if not frame_data:
+        return [{"start": 0, "end": total_duration, "faceCenterX": 0.5}]
+    
+    # Process frame_data to find speaker at each time window
+    # Window size = segment_duration (default 1s)
+    window_results = []  # [(window_start, window_end, speaker_bucket, speaker_x), ...]
+    
+    window_start = 0
+    while window_start < total_duration:
+        window_end = min(window_start + segment_duration, total_duration)
+        
+        # Get all frames in this window
+        window_frames = [(t, faces) for t, faces in frame_data if window_start <= t < window_end]
+        
+        if not window_frames:
+            window_start = window_end
+            continue
+        
+        # Aggregate data per bucket in this window
+        bucket_lip_data = {}  # bucket -> [lip_apertures]
+        bucket_x_data = {}    # bucket -> [x_positions]
+        bucket_count = {}     # bucket -> appearance count
+        
+        for _, faces in window_frames:
+            for bucket, (cx, lip) in faces.items():
+                if bucket not in bucket_lip_data:
+                    bucket_lip_data[bucket] = []
+                    bucket_x_data[bucket] = []
+                    bucket_count[bucket] = 0
+                bucket_lip_data[bucket].append(lip)
+                bucket_x_data[bucket].append(cx)
+                bucket_count[bucket] += 1
+        
+        # Determine dominant face in this window
+        best_bucket = None
+        max_var = -1
+        has_lip_data = any(sum(lips) > 0 for lips in bucket_lip_data.values())
+        
+        if has_lip_data:
+            # Use lip variance if available (Face Mesh mode)
+            for bucket, lips in bucket_lip_data.items():
+                if len(lips) >= 2:
+                    var = np.var(lips)
+                    if var > max_var:
+                        max_var = var
+                        best_bucket = bucket
+        else:
+            # Fallback: Use most frequently appearing face (Face Detector mode)
+            max_count = 0
+            for bucket, count in bucket_count.items():
+                if count > max_count:
+                    max_count = count
+                    best_bucket = bucket
+        
+        # Calculate speaker X position
+        if best_bucket is not None:
+            speaker_x = np.mean(bucket_x_data[best_bucket])
+        else:
+            all_x = [x for xs in bucket_x_data.values() for x in xs]
+            speaker_x = np.mean(all_x) if all_x else w / 2
+        
+        window_results.append((window_start, window_end, best_bucket, speaker_x))
+        window_start = window_end
+    
+    # --- MERGE WITH STICKINESS & SWITCH CONFIRMATION ---
+    merged_segments = []
+    STICKINESS_DIST = 0.10 
+    
+    # Switch confirmation: Need to see a new speaker for at least 2 windows
+    confirm_count = 0
+    confirmed_bucket = None
+    
+    for wr in window_results:
+        ws, we, bucket, sx = wr
+        norm_x = sx / w
+        
+        if not merged_segments:
+            merged_segments.append({"start": ws, "end": we, "faceCenterX": norm_x, "bucket": bucket})
+            confirmed_bucket = bucket
+            continue
+            
+        prev = merged_segments[-1]
+        dist = abs(norm_x - prev["faceCenterX"])
+        
+        # Check if we should switch
+        is_different = (bucket != prev["bucket"] and dist >= STICKINESS_DIST)
+        
+        if not is_different:
+            # Same speaker or very close position
+            prev["end"] = we
+            prev["faceCenterX"] = (prev["faceCenterX"] * 0.6) + (norm_x * 0.4)
+            confirm_count = 0 
+        else:
+            # Potential switch detected - needs confirmation to avoid jumping on "Yeah/Uh-huh"
+            confirm_count += 1
+            if confirm_count >= 2: # Must hold for at least 0.6s (2 windows of 0.3s)
+                # Confirmed switch
+                merged_segments.append({
+                    "start": ws,
+                    "end": we,
+                    "faceCenterX": norm_x,
+                    "bucket": bucket
+                })
+                confirm_count = 0
+            else:
+                # Not confirmed yet, keep extending previous segment but don't move camera
+                prev["end"] = we
+            
+    # --- SECOND PASS: Sandwich & Tiny Segment Filtering ---
+    # If A -> B -> A and B is short, it's an interjection.
+    final_merged = []
+    MIN_STABLE_DUR = 1.2 # Interjections are usually < 1.2s
+    
+    i = 0
+    while i < len(merged_segments):
+        seg = merged_segments[i]
+        dur = seg["end"] - seg["start"]
+        
+        if i > 0 and i < len(merged_segments) - 1:
+            prev_seg = final_merged[-1]
+            next_seg = merged_segments[i+1]
+            
+            # Key "Sandwich" Logic: A -> B -> A
+            # If B is short and surrounded by the same person (or similar position)
+            pos_dist = abs(prev_seg["faceCenterX"] - next_seg["faceCenterX"])
+            if dur < MIN_STABLE_DUR and pos_dist < 0.15:
+                # Merge B into A
+                prev_seg["end"] = next_seg["end"]
+                i += 2 # Skip B and next A
+                continue
+        
+        # General tiny segment removal
+        if final_merged and (dur < 0.8):
+            final_merged[-1]["end"] = seg["end"]
+        else:
+            final_merged.append(seg)
+        i += 1
+    
+    # Remove internal bucket key
+    segments = [{"start": s["start"], "end": s["end"], "faceCenterX": s["faceCenterX"]} for s in final_merged]
+    
+    print(f"🎤 Speaker Segments: Detected {len(segments)} segments")
+    for i, seg in enumerate(segments[:5]):  # Log first 5
+        print(f"   Segment {i+1}: {seg['start']:.1f}s - {seg['end']:.1f}s @ X={seg['faceCenterX']:.2f}")
+    if len(segments) > 5:
+        print(f"   ... and {len(segments) - 5} more segments")
+    
+    return segments if segments else [{"start": 0, "end": total_duration, "faceCenterX": 0.5}]
+
 def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_tracking="false", track_zoom=1.5, track_weight=5.0, track_stickiness=2.0, min_shot_duration=2.0):
     """
     Simplified Reframing for Preview:
@@ -630,10 +908,8 @@ def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_
     center_x = w / 2
     
     # Face Detection (Single Frame Check for Speed)
-    # We check 3 frames: Start, Middle, End to get an average position
-    # Face Detection (Robust OpenCV Method with Temp File)
+    # UPGRADED: Now uses Lip Movement Detection to find the SPEAKER in multi-person videos
     if str(face_tracking).lower() == "true" and face_detector:
-        detected_xs = []
         import cv2
         import numpy as np
         import uuid
@@ -642,74 +918,117 @@ def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_
         temp_track_filename = f"temp_track_{uuid.uuid4()}.mp4"
         temp_track_path = os.path.join(UPLOAD_DIR, temp_track_filename)
         
-        print(f"👁️ Preview Tracking: Writing temp clip for robust detection: {temp_track_filename}")
+        print(f"👁️ Speaker Tracking: Writing temp clip for detection: {temp_track_filename}")
+        
+        # Data structures for lip movement analysis
+        # Key: face_id (approximated by X position bucket), Value: list of lip apertures
+        face_lip_data = {}  # {face_bucket: [(center_x, lip_aperture), ...]}
+        
         try:
-            # Write a small, fast version just for tracking? Or just the clip itself.
-            # Just write the audio-less video quickly
             clip.write_videofile(temp_track_path, codec="libx264", preset="ultrafast", audio=False, logger=None)
-            
-            # 2. Open with OpenCV
             cap = cv2.VideoCapture(temp_track_path)
             
             if not cap.isOpened():
                 print("⚠️ Could not open temp tracking file.")
             else:
-                # Track every Nth frame to save time but keep accuracy
-                # e.g. every 0.5 seconds
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 if fps <= 0: fps = 30
-                frame_step = int(fps * 0.5) # Check every 0.5s
-                if frame_step < 1: frame_step = 1 # Avoid step=0
+                frame_step = int(fps * 0.2)  # Check every 0.2s for lip movement (more frequent for accuracy)
+                if frame_step < 1: frame_step = 1
                 
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 current_frame = 0
                 
-                print(f"👁️ Preview Tracking: Scanning {total_frames} frames (Step=0.5s)...")
+                print(f"👁️ Speaker Tracking: Scanning {total_frames} frames with Lip Analysis (Step=0.2s)...")
                 
                 while True:
                     ret, frame = cap.read()
                     if not ret: break
                     
                     if current_frame % frame_step == 0:
-                        # OpenCV is BGR, Convert to RGB
                         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_h, frame_w = rgb_frame.shape[:2]
                         
-                        fx = None
-                        if hasattr(face_detector, 'detect'):
-                             import mediapipe as mp
-                             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                             res = face_detector.detect(mp_image)
-                             if res.detections:
-                                 bbox = res.detections[0].bounding_box
-                                 fx = bbox.origin_x + bbox.width / 2
-                        elif hasattr(face_detector, 'process'):
-                             res = face_detector.process(rgb_frame)
-                             if res.detections:
-                                 bbox = res.detections[0].location_data.relative_bounding_box
-                                 fx = (bbox.xmin + bbox.width/2) * w
-                        elif face_detector == "opencv_fallback":
-                             gray = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2GRAY)
-                             # face_cascade must be available globally or imported
-                             # Simplifying fallback here if needed
-                             pass
-
-                        if fx: detected_xs.append(fx)
+                        # Use Face Mesh for lip landmark detection
+                        if face_mesh:
+                            mesh_results = face_mesh.process(rgb_frame)
+                            
+                            if mesh_results.multi_face_landmarks:
+                                for face_landmarks in mesh_results.multi_face_landmarks:
+                                    # Get key lip landmarks (MediaPipe indices)
+                                    # Upper lip center: 13, Lower lip center: 14
+                                    # Nose tip for face center: 1
+                                    try:
+                                        upper_lip = face_landmarks.landmark[13]
+                                        lower_lip = face_landmarks.landmark[14]
+                                        nose = face_landmarks.landmark[1]
+                                        
+                                        # Calculate lip aperture (normalized)
+                                        lip_aperture = abs(lower_lip.y - upper_lip.y)
+                                        
+                                        # Get face center X (use nose as reference)
+                                        face_center_x_px = nose.x * frame_w
+                                        
+                                        # Bucket faces by X position (allow some tolerance)
+                                        bucket = int(face_center_x_px / 100)  # 100px buckets
+                                        
+                                        if bucket not in face_lip_data:
+                                            face_lip_data[bucket] = []
+                                        face_lip_data[bucket].append((face_center_x_px, lip_aperture))
+                                    except:
+                                        pass
+                        
+                        # Fallback: Just use face detection if no Face Mesh
+                        elif hasattr(face_detector, 'detect'):
+                            import mediapipe as mp
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                            res = face_detector.detect(mp_image)
+                            if res.detections:
+                                for det in res.detections:
+                                    bbox = det.bounding_box
+                                    fx = bbox.origin_x + bbox.width / 2
+                                    bucket = int(fx / 100)
+                                    if bucket not in face_lip_data:
+                                        face_lip_data[bucket] = []
+                                    face_lip_data[bucket].append((fx, 0))  # No lip data in fallback
                     
                     current_frame += 1
                 
                 cap.release()
                 
         except Exception as e:
-            print(f"⚠️ Robust Tracking Failed: {e}")
+            print(f"⚠️ Speaker Tracking Failed: {e}")
         finally:
             if os.path.exists(temp_track_path):
                 os.remove(temp_track_path)
 
-        if detected_xs:
-             center_x = sum(detected_xs) / len(detected_xs)
-             print(f"👁️ Preview Smart Crop: Face detected at X={int(center_x)} (from {len(detected_xs)} samples)")
+        # Analyze which face is the speaker (highest lip movement variance)
+        if face_lip_data:
+            speaker_bucket = None
+            max_variance = -1
+            
+            for bucket, data in face_lip_data.items():
+                if len(data) >= 3:  # Need at least 3 samples for meaningful variance
+                    apertures = [d[1] for d in data]
+                    variance = np.var(apertures)
+                    
+                    if variance > max_variance:
+                        max_variance = variance
+                        speaker_bucket = bucket
+            
+            if speaker_bucket is not None and max_variance > 0.0001:  # Threshold to filter noise
+                # Calculate average X position of the speaker
+                speaker_x_positions = [d[0] for d in face_lip_data[speaker_bucket]]
+                center_x = sum(speaker_x_positions) / len(speaker_x_positions)
+                print(f"🎤 Speaker Detected: Face at X={int(center_x)} (Lip Variance={max_variance:.6f})")
+            else:
+                # No clear speaker, use average of all faces
+                all_x = [d[0] for data in face_lip_data.values() for d in data]
+                if all_x:
+                    center_x = sum(all_x) / len(all_x)
+                print(f"👁️ No clear speaker, using average face position: X={int(center_x)}")
         else:
-             print("👁️ Preview Smart Crop: No face, using center.")
+            print("👁️ No faces detected, using center.")
 
     # Calculate Crop Coords
     x1 = max(0, int(center_x - target_w / 2))
@@ -1048,20 +1367,51 @@ def preview_pipeline_generator(
         
         sub = clip.subclip(start, end)
         
-        # 🚀 APPLY FACE TRACKING TO PREVIEW
-        # Note: We hardcode vertical_mode="true" (or we should detect aspect ratio?)
-        # Actually simplest is: if is_face_tracking is true, assume we want 9:16 crop for mobile preview
-        # or we should check aspect ratio param? But preview endpoint doesn't accept aspect ratio param currently.
-        # Let's assume preview is always vertical if tracking is on.
+        # 🎤 SPEAKER DETECTION FIRST (on original 16:9 clip)
+        # This must happen BEFORE any cropping so we can see all faces
+        face_center_x = 0.5
+        speaker_segments = []
+        
         if str(is_face_tracking).lower() == "true":
+            yield json.dumps({"status": "progress", "message": "正在分析講者切換 (唇動偵測)...", "percent": 12}) + "\n"
+            try:
+                # Detect on ORIGINAL sub (before cropping!)
+                # segment_duration=0.3 for very responsive speaker detection windows
+                speaker_segments = detect_speaker_segments(sub, segment_duration=0.3)
+                
+                # CRITICAL: Offset segment times to match original video timeline
+                # detect_speaker_segments returns times relative to sub (0 to duration)
+                # Frontend expects times relative to original video (start to end)
+                for seg in speaker_segments:
+                    seg["start"] += start  # Add clip start offset
+                    seg["end"] += start
+                
+                print(f"🎤 Preview (Pre-Crop): {len(speaker_segments)} speaker segments detected (times: {start}s - {end}s)")
+                
+                if speaker_segments:
+                    face_center_x = speaker_segments[0]["faceCenterX"]
+            except Exception as e:
+                print(f"⚠️ detect_speaker_segments error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 🎬 NOW APPLY CROPPING (for preview rendering)
+        # 🎬 SKIP BACKEND CROPPING when we have dynamic speaker segments
+        # The frontend will handle dynamic positioning using speakerSegments
+        # Only do static crop if we DON'T have speakers detected (fallback)
+        if str(is_face_tracking).lower() == "true" and len(speaker_segments) <= 1:
              yield json.dumps({"status": "progress", "message": "正在進行人臉裁切...", "percent": 15}) + "\n"
-             # CRITICAL FIX: apply_smart_reframing returns (clip, center_x). Must unpack!
+             # Static crop only when no speaker switching detected
              sub, _ = apply_smart_reframing(
                  sub, 
                  aspect_ratio="9:16", 
                  face_tracking="true", 
                  vertical_mode="true"
              )
+        elif str(is_face_tracking).lower() == "true":
+             # Dynamic mode: Keep original video, let frontend handle positioning
+             yield json.dumps({"status": "progress", "message": f"偵測到 {len(speaker_segments)} 個講者切換...", "percent": 15}) + "\n"
+             print(f"🎬 Skipping backend crop: Using dynamic camera cuts ({len(speaker_segments)} segments)")
 
         temp_sub_path = os.path.join(UPLOAD_DIR, f"sub_{ts}.mp4")
         sub.write_videofile(temp_sub_path, audio_codec='aac', logger=None)
@@ -1138,47 +1488,12 @@ def preview_pipeline_generator(
                 yield json.dumps({"status": "progress", "message": "正在優化繁體中文轉譯 (本地快速)...", "percent": 80}) + "\n"
                 subtitles = translate_subtitles(subtitles, api_key)
         
-        # --- 5. Robust Face Tracking & Remotion "Proof of Work" (Matches Export) ---
-        face_center_x = 0.5
-        
-        # A. PHYSICAL CROP & DETECTION (Ensures Preview Visual is Correct)
-        # We use apply_smart_reframing which now uses the robust Temp File + OpenCV method internally.
-        if str(is_face_tracking).lower() == 'true' and face_detector:
-             yield json.dumps({"status": "progress", "message": "正在分析人臉 (0.5s 取樣)...", "percent": 85}) + "\n"
-             
-             # Call the robust function we updated
-             # It acts as a defensive wrapper now
-             result = apply_smart_reframing(
-                 sub, 
-                 aspect_ratio="9:16",
-                 face_tracking="true",
-                 vertical_mode="false" # <--- IMPORTANT: Do NOT crop here
-             )
-             
-             print(f"DEBUG_RAW: result type: {type(result)}")
-             if isinstance(result, tuple) and len(result) >= 2:
-                 sub = result[0]
-                 face_center_x = result[1]
-             else:
-                 print("⚠️ WARNING: Unexpected return from apply_smart_reframing")
-                 # Fallback: assume it returned just the clip (old behavior?)
-                 if not isinstance(result, tuple):
-                     sub = result
-                 else:
-                     sub = result[0]
-
-             
-             print(f"DEBUG: 'sub' type: {type(sub)}, 'face_center_x': {face_center_x}")
-             if isinstance(sub, tuple):
-                 sub = sub[0]
-                 
-             # Write the FULL (uncropped) SUB file
-             # Frontend will crop it using face_center_x
-             sub.write_videofile(temp_sub_path, audio_codec='aac', logger=None)
-             print(f"👤 Preview Face Center Applied: {face_center_x:.2f}")
+        # Speaker tracking already done at the beginning (before cropping)
+        # Just log the final state here
+        print(f"🎤 Final: Using {len(speaker_segments)} speaker segments, faceCenterX={face_center_x:.2f}")
 
         # B. Remotion Rendering Removed for Speed
-        # We now rely on Client-Side Player to render the preview using `faceCenterX`
+        # We now rely on Client-Side Player to render the preview using speaker segments
         yield json.dumps({"status": "progress", "message": "正在準備客戶端預覽...", "percent": 95}) + "\n"
         
         # Cleanup Remotion Props/Artifacts if any
@@ -1201,6 +1516,7 @@ def preview_pipeline_generator(
             "status": "success",
             "subtitles": subtitles,
             "faceCenterX": face_center_x,
+            "speakerSegments": speaker_segments,  # NEW: Dynamic camera cuts
             "audioUrl": preview_audio_url,
             "visualSegments": visual_segments
         }

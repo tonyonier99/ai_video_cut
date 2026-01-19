@@ -1,8 +1,52 @@
 import React from 'react';
-import { AbsoluteFill, Video, Sequence, staticFile } from 'remotion';
+import { AbsoluteFill, Video, Sequence, staticFile, useCurrentFrame } from 'remotion';
 import { Subtitle } from './Subtitle';
 import { z } from 'zod';
 import '../App.css'; // Import global styles and Google Fonts
+
+// Helper component for dynamic speaker tracking
+const DynamicVideo: React.FC<{
+    src: string;
+    startFromFrame: number;
+    isFaceTracking: boolean;
+    faceCenterX: number;
+    speakerSegments: { start: number, end: number, faceCenterX: number }[];
+    currentVideoTime: number; // Base time of this segment in original video
+}> = ({ src, startFromFrame, isFaceTracking, faceCenterX, speakerSegments, currentVideoTime }) => {
+    const FPS = 30;
+    const frame = useCurrentFrame();
+
+    // Calculate actual playback time in original video
+    const actualVideoTime = currentVideoTime + (frame / FPS);
+
+    // Determine current speaker center based on time
+    let activeCenterX = faceCenterX;
+
+    if (speakerSegments && speakerSegments.length > 0) {
+        const activeSegment = speakerSegments.find(seg =>
+            actualVideoTime >= seg.start && actualVideoTime < seg.end
+        );
+        if (activeSegment) {
+            activeCenterX = activeSegment.faceCenterX;
+        }
+    }
+
+    return (
+        <Video
+            src={src}
+            startFrom={startFromFrame}
+            muted={false}
+            style={{
+                height: '100%',
+                width: '100%',
+                objectFit: isFaceTracking ? 'cover' : 'contain',
+                objectPosition: isFaceTracking ? `${activeCenterX * 100}% center` : 'center',
+                // No transition - instant camera cut
+            }}
+        />
+    );
+};
+
 
 export const myCompSchema = z.object({
     videoUrl: z.string(),
@@ -59,6 +103,11 @@ export const myCompSchema = z.object({
     })).optional(),
     isFaceTracking: z.boolean().optional(),
     faceCenterX: z.number().optional(),
+    speakerSegments: z.array(z.object({
+        start: z.number(),
+        end: z.number(),
+        faceCenterX: z.number()
+    })).optional(),
     durationInFrames: z.number().optional()
 });
 
@@ -69,11 +118,12 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
     startFrom = 0,
     visualSegments,
     isFaceTracking = true,
-    faceCenterX = 0.5
+    faceCenterX = 0.5,
+    speakerSegments = []
 }) => {
     const FPS = 30;
     // DEBUG: Check props received by Remotion
-    console.log(`[MyComposition] FaceTracking=${isFaceTracking}, Center=${faceCenterX}`);
+    console.log(`[MyComposition] FaceTracking=${isFaceTracking}, Center=${faceCenterX}, SpeakerSegs=${speakerSegments?.length || 0}`);
     console.log(`[MyComposition] SubtitleConfig:`, JSON.stringify(subtitleConfig, null, 2));
 
     // Inject Custom Font Style if needed
@@ -129,7 +179,7 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
     return (
         <AbsoluteFill style={{ backgroundColor: '#000' }}>
             {customFontStyle}
-            {/* Render Video Segments (Jump Cuts) */}
+            {/* Render Video Segments (Jump Cuts) with Dynamic Speaker Tracking */}
             {layoutSegments.map((seg, index) => (
                 <Sequence
                     key={`seg-${index}`}
@@ -140,19 +190,14 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
                         <div style={{
                             width: '100%', height: '100%',
                             transform: `scale(${seg.zoom})`,
-                            transition: 'transform 0.1s linear' // Smooth? No, Jump Cut should be instant usually.
                         }}>
-                            <Video
+                            <DynamicVideo
                                 src={resolvedVideoUrl}
-                                startFrom={Math.floor(seg.startInVideo * FPS)}
-                                muted={false} // FORCE UNMUTE: User reported no sound. Using internal video audio is safer since we aren't modifying audio yet.
-                                // volume={audioUrl ? 0 : 1} 
-                                style={{
-                                    height: '100%',
-                                    width: '100%',
-                                    objectFit: isFaceTracking ? 'cover' : 'contain',
-                                    objectPosition: isFaceTracking ? `${faceCenterX * 100}% center` : 'center',
-                                }}
+                                startFromFrame={Math.floor(seg.startInVideo * FPS)}
+                                isFaceTracking={isFaceTracking}
+                                faceCenterX={faceCenterX}
+                                speakerSegments={speakerSegments}
+                                currentVideoTime={seg.startInVideo}
                             />
                         </div>
                     ) : null}

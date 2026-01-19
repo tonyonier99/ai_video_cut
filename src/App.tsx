@@ -72,7 +72,7 @@ function App() {
 
   // 字幕樣式
   // 字幕樣式 (Advanced)
-  const [subtitleFontSize, setSubtitleFontSize] = useState(90);
+  const [subtitleFontSize, setSubtitleFontSize] = useState(70);
   const [subtitleFontName, setSubtitleFontName] = useState('Arial');
   const [subtitleFontWeight, setSubtitleFontWeight] = useState<string | number>('normal');
   const [subtitleFontStyle, setSubtitleFontStyle] = useState('normal');
@@ -99,7 +99,7 @@ function App() {
   const [subtitleTextAlign, setSubtitleTextAlign] = useState('center');
 
   const [subtitleMarginV, setSubtitleMarginV] = useState(600);
-  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(9); // Visual Wrap
+  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(10); // Visual Wrap
   const [whisperCharsPerLine, setWhisperCharsPerLine] = useState(14); // Transcription Limit
 
   const [subtitleBgEnabled, setSubtitleBgEnabled] = useState(false);
@@ -127,6 +127,7 @@ function App() {
   const [previewSubtitles, setPreviewSubtitles] = useState<any[]>([]); // Temp subs for preview
   const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
   const [previewVisualSegments, setPreviewVisualSegments] = useState<any[]>([]);
+  const [previewSpeakerSegments, setPreviewSpeakerSegments] = useState<{ start: number, end: number, faceCenterX: number }[]>([]); // NEW: Dynamic camera cuts
   const [srtSubtitles, setSrtSubtitles] = useState<any[]>([]); // User uploaded SRT content
 
 
@@ -442,6 +443,7 @@ function App() {
               if (data.faceCenterX !== undefined) setPreviewFaceCenter(data.faceCenterX);
               if (data.audioUrl) setPreviewAudioUrl(data.audioUrl);
               if (data.visualSegments) setPreviewVisualSegments(data.visualSegments);
+              if (data.speakerSegments) setPreviewSpeakerSegments(data.speakerSegments); // NEW: Dynamic camera cuts
 
               setPreviewProgress(100);
               setTimeout(() => {
@@ -706,6 +708,7 @@ function App() {
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
               className="preview-modal-content"
+              onClick={e => e.stopPropagation()} // Prevent closing when clicking inside
               style={{
                 width: 'auto',
                 height: '85vh',
@@ -755,7 +758,8 @@ function App() {
                       }];
                     })(),
                     isFaceTracking: isFaceTracking,
-                    faceCenterX: previewFaceCenter, // Force usage of detected face center
+                    faceCenterX: previewFaceCenter, // Fallback for single speaker
+                    speakerSegments: previewSpeakerSegments, // NEW: Dynamic camera cuts
                     subtitleConfig: {
                       fontSize: subtitleFontSize,
                       fontFamily: subtitleFontName,
