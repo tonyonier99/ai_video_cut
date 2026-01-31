@@ -1,0 +1,54 @@
+              {/* 5. Output Settings & Export */}
+              <div className="controls-footer">
+                <div className="output-settings">
+                  <div className="output-row">
+                    <label>畫質</label>
+                    <select value={outputQuality} onChange={e => setOutputQuality(e.target.value)} className="select-xs">
+                      <option value="high">高畫質 (20Mbps)</option>
+                      <option value="medium">中畫質 (8Mbps)</option>
+                      <option value="low">低畫質 (4Mbps)</option>
+                    </select>
+                  </div>
+                  <div className="output-row">
+                    <label>解析度 (9:16)</label>
+                    <select value={outputResolution} onChange={e => setOutputResolution(e.target.value)} className="select-xs">
+                      <option value="1080x1920">1080×1920</option>
+                      <option value="720x1280">720×1280</option>
+                      <option value="original">原始比例</option>
+                    </select>
+                  </div>
+                </div>
+                <button onClick={() => handleExport()} disabled={cuts.length === 0 || isExporting} className="btn-export-main">
+                  {isExporting ? <Loader2 className="spin" size={18} /> : <><Download size={18} /> 匯出全部片段</>}
+                </button>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </main>
+
+      <footer style={{ padding: '20px', textAlign: 'center', opacity: 0.4, fontSize: '12px', letterSpacing: '1px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+        Copyright © 2026 《呀沙係・引力》
+      </footer>
+
+      {/* Bottom Progress Bar */}
+      {(isExporting || isPreviewLoading) && (
+        <div className="progress-bar-bottom">
+          <div className="progress-bar-fill" style={{ width: `${isPreviewLoading ? previewProgress : exportProgress}%` }} />
+          <div className="progress-bar-content">
+            <Loader2 className="spin" size={16} />
+            <span>{isPreviewLoading ? previewMessage : (systemStatus.message || '匯出處理中')}</span>
+            <span className="progress-percent">{Math.round(isPreviewLoading ? previewProgress : exportProgress)}%</span>
+          </div>
+          {!isPreviewLoading && (
+            <button className="btn-icon-xs" style={{ marginLeft: '10px', background: 'rgba(255,255,255,0.2)' }} onClick={() => window.location.reload()}>
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default App;
