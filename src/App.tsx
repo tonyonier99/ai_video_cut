@@ -1,9 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Download, Video, Scissors, Play, Pause, Loader2, Film, Key, Upload, Wand2, Zap, Languages, Trash, X } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
-import WaveSurfer from 'wavesurfer.js';
-import { Player } from '@remotion/player';
-import { MyComposition } from './remotion/MyComposition';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import type { DragEvent } from 'react';
+import { Play, Pause, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Settings, Download, ChevronRight, ChevronDown, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type } from 'lucide-react';
 import './App.css';
 
 interface Cut {
@@ -11,1624 +8,1364 @@ interface Cut {
   start: number;
   end: number;
   label: string;
+  trackId: number;
+  assetId?: string;
 }
 
+interface Asset {
+  id: string;
+  type: 'video' | 'image' | 'audio';
+  name: string;
+  url: string;
+  duration?: number;
+  file?: File;
+}
+
+interface TrackConfig {
+  id: number;
+  type: 'video' | 'audio' | 'text';
+  name: string;
+  visible: boolean;
+  locked: boolean;
+}
+
+const MAX_HISTORY = 20;
 
 function App() {
-  const formatTimestamp = (timeStr: string | number) => {
-    const time = typeof timeStr === 'string' ? parseFloat(timeStr) : timeStr;
-    const minutes = Math.floor(time / 60);
-    const seconds = Math.floor(time % 60);
-    const milliseconds = Math.floor((time % 1) * 10); // Show 1 decimal place
-    return `${minutes}:${seconds.toString().padStart(2, '0')}.${milliseconds}`;
-  };
-
+  // --- Global State ---
+  const [projectAssets, setProjectAssets] = useState<Asset[]>([]);
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [cuts, setCuts] = useState<Cut[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
+  const [originalVideoPath, setOriginalVideoPath] = useState<string | null>(null);
 
+  // --- Layout State ---
+  const [isVerticalMode, setIsVerticalMode] = useState(false);
+  const [leftPanelTab, setLeftPanelTab] = useState<'project' | 'controls' | 'effects' | 'ai'>('project');
+  const [activeTool, setActiveTool] = useState<'select' | 'blade' | 'text'>('select');
+  const [appView, setAppView] = useState<'welcome' | 'editor'>('welcome');
 
-  const [targetCount, setTargetCount] = useState(1);
-  const [targetDuration, setTargetDuration] = useState(15);
+  // --- Timeline State ---
+  const [cuts, setCuts] = useState<Cut[]>([]);
+  const [selectedCutId, setSelectedCutId] = useState<string | null>(null);
+  const [zoomLevel, setZoomLevel] = useState(10);
+
+  const [videoTracks, setVideoTracks] = useState<TrackConfig[]>([
+    { id: 0, type: 'video', name: 'V1', visible: true, locked: false },
+    { id: 1, type: 'text', name: 'T1', visible: true, locked: false }
+  ]);
+
+  const toggleTrackVisibility = (id: number) => {
+    setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, visible: !t.visible } : t));
+  };
+
+  const toggleTrackLock = (id: number) => {
+    setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, locked: !t.locked } : t));
+  };
+
+  // History
+  const [history, setHistory] = useState<Cut[][]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+
+  // Export Modal
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportFormat, setExportFormat] = useState('xml');
+  const [exportResolution, setExportResolution] = useState('1080p');
+
+  // Dragging State
+  const [dragState, setDragState] = useState<{
+    isDragging: boolean;
+    type: 'scrub' | 'move' | 'trim-start' | 'trim-end' | null;
+    targetId: string | null;
+    startX: number;
+    initialValue: number;
+  }>({ isDragging: false, type: null, targetId: null, startX: 0, initialValue: 0 });
+
+  // --- Export States ---
+  const [exportAutoCaption, setExportAutoCaption] = useState(false);
+  const [exportFaceTracking, setExportFaceTracking] = useState(false);
+  const [exportStudioSound, setExportStudioSound] = useState(false);
+  const [exportMergeClips, setExportMergeClips] = useState(true);
+  // --- AI / Tools State ---
+  const [apiKey, setApiKey] = useState(localStorage.getItem('antigravity_api_key') || '');
+  const [highlightCount, setHighlightCount] = useState(5);
+  const [targetDuration, setTargetDuration] = useState(60);
   const [instruction, setInstruction] = useState('');
-  const [apiKey, setApiKey] = useState('');
-  const [showApiSettings, setShowApiSettings] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
 
-  // AI 核心功能
-  const [isFaceTracking, setIsFaceTracking] = useState(true);
-  const [isStudioSound, setIsStudioSound] = useState(false); // Default disabled
-  const [isAutoCaption, setIsAutoCaption] = useState(true);
-  const [isTranslate, setIsTranslate] = useState(true); // Default enabled for Traditional Chinese Optimization
-  const [isBurnCaptions, setIsBurnCaptions] = useState(true);
-  const [whisperModelSize, setWhisperModelSize] = useState('turbo');
-  const [whisperBeamSize, setWhisperBeamSize] = useState(5);
-  const [whisperRemovePunctuation, setWhisperRemovePunctuation] = useState(true);
-  const [whisperTemperature, setWhisperTemperature] = useState(0);
-  const [whisperNoSpeechThreshold, setWhisperNoSpeechThreshold] = useState(0.6);
-  const [whisperConditionOnPreviousText, setWhisperConditionOnPreviousText] = useState(true);
-  const [whisperBestOf, setWhisperBestOf] = useState(5);
-  const [whisperPatience, setWhisperPatience] = useState(1.0);
-  const [whisperCompressionRatioThreshold, setWhisperCompressionRatioThreshold] = useState(2.4);
-  const [whisperLogprobThreshold, setWhisperLogprobThreshold] = useState(-1.0);
-  const [whisperFp16, setWhisperFp16] = useState(true);
-  const [showExpertWhisper, setShowExpertWhisper] = useState(false);
+  // Silence Removal Params
+  const [silenceThreshold, setSilenceThreshold] = useState(-30);
+  const [silenceMinDuration, setSilenceMinDuration] = useState(0.5);
 
-  // 進階參數
-  const [trackZoom, setTrackZoom] = useState(1.5);
-  const [mpMinDetectionCon, setMpMinDetectionCon] = useState(0.5);
-  const [dfn3Strength, setDfn3Strength] = useState(100);
+  // --- Inspector State ---
 
-  // Silence Removal & Jump Cut Parameters
-  const [isSilenceRemoval, setIsSilenceRemoval] = useState(false);
-  const [silenceThreshold, setSilenceThreshold] = useState(0.5); // Seconds
-  const [isJumpCutZoom, setIsJumpCutZoom] = useState(true);
-
-  // 字幕樣式
-  // 字幕樣式 (Advanced)
-  const [subtitleFontSize, setSubtitleFontSize] = useState(70);
-  const [subtitleFontName, setSubtitleFontName] = useState('Arial');
-  const [subtitleFontWeight, setSubtitleFontWeight] = useState<string | number>('normal');
-  const [subtitleFontStyle, setSubtitleFontStyle] = useState('normal');
-
-  const [subtitleTextColor, setSubtitleTextColor] = useState('#FFFFFF');
-  const [isTextGradient, setIsTextGradient] = useState(false);
-  const [textGradientColors, setTextGradientColors] = useState(['#FF0080', '#7928CA']); // Default nice gradient
-  const [textGradientDirection, setTextGradientDirection] = useState('to right');
-
-  const [subtitleOutlineWidth, setSubtitleOutlineWidth] = useState(4);
-  const [subtitleOutlineColor, setSubtitleOutlineColor] = useState('#000000');
-  const [isSubtitleOutline, setIsSubtitleOutline] = useState(true);
-
-  const [subtitleShadowColor, setSubtitleShadowColor] = useState('#000000');
-  const [subtitleShadowOpacity, setSubtitleShadowOpacity] = useState(80);
-  const [subtitleShadowBlur, setSubtitleShadowBlur] = useState(0);
-  const [subtitleShadowOffsetX, setSubtitleShadowOffsetX] = useState(3);
-  const [subtitleShadowOffsetY, setSubtitleShadowOffsetY] = useState(3);
-  const [isSubtitleShadow, setIsSubtitleShadow] = useState(true);
-
-  const [subtitleLetterSpacing, setSubtitleLetterSpacing] = useState(0);
-  const [subtitleLineHeight, setSubtitleLineHeight] = useState(1.2);
-  const [subtitleTextTransform, setSubtitleTextTransform] = useState('none');
-  const [subtitleTextAlign, setSubtitleTextAlign] = useState('center');
-
-  const [subtitleMarginV, setSubtitleMarginV] = useState(600);
-  const [subtitleCharsPerLine, setSubtitleCharsPerLine] = useState(10); // Visual Wrap
-  const [whisperCharsPerLine, setWhisperCharsPerLine] = useState(14); // Transcription Limit
-
-  const [subtitleBgEnabled, setSubtitleBgEnabled] = useState(false);
-  const [subtitleBgColor, setSubtitleBgColor] = useState('#000000');
-  const [subtitleBgOpacity, setSubtitleBgOpacity] = useState(50);
-  const [subtitleBgPaddingX, setSubtitleBgPaddingX] = useState(10);
-  const [subtitleBgPaddingY, setSubtitleBgPaddingY] = useState(4);
-  const [subtitleBgRadius, setSubtitleBgRadius] = useState(4);
-
-  const [subtitleAnimation, setSubtitleAnimation] = useState<'none' | 'pop' | 'fade' | 'slide-up'>('none');
-  const [subtitleAnimationDuration, setSubtitleAnimationDuration] = useState(15);
-  const [subtitleAnimationSpring, setSubtitleAnimationSpring] = useState(0.5); // Mass / Intensity
-
-  const [showSafeArea, setShowSafeArea] = useState(true);
-  const [previewText, setPreviewText] = useState('預覽文字內容預覽文字內容');
-  const [isDraggingSubtitle, setIsDraggingSubtitle] = useState(false);
-
-
-  const [previewCut, setPreviewCut] = useState<Cut | null>(null); // NEW: Remotion Preview State
-  const [showPreviewModal, setShowPreviewModal] = useState(false);
-  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
-  const [previewProgress, setPreviewProgress] = useState(0);
-  const [previewFaceCenter, setPreviewFaceCenter] = useState(0.5); // NEW for Face Tracking
-  const [previewMessage, setPreviewMessage] = useState(''); // NEW: Detailed status
-  const [previewSubtitles, setPreviewSubtitles] = useState<any[]>([]); // Temp subs for preview
-  const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
-  const [previewVisualSegments, setPreviewVisualSegments] = useState<any[]>([]);
-  const [previewSpeakerSegments, setPreviewSpeakerSegments] = useState<{ start: number, end: number, faceCenterX: number }[]>([]); // NEW: Dynamic camera cuts
-  const [srtSubtitles, setSrtSubtitles] = useState<any[]>([]); // User uploaded SRT content
-
-
-  const [draggingCut, setDraggingCut] = useState<{ id: string, edge: 'start' | 'end' | 'move', initialX: number, initialStart: number, initialEnd: number } | null>(null);
-  const [systemStatus, setSystemStatus] = useState({ progress: 100, status: 'ready', message: '就緒' });
-  const [fontList, setFontList] = useState(['Arial', 'Sans-serif']); // Remove client-local fonts that backend doesn't have
-  const [outputQuality, setOutputQuality] = useState('high');
-  const [outputResolution, setOutputResolution] = useState('1080x1920');
-  const [whisperLanguage, setWhisperLanguage] = useState('zh');
-
+  // --- Refs ---
   const videoRef = useRef<HTMLVideoElement>(null);
+  const timelineContainerRef = useRef<HTMLDivElement>(null);
   const timelineRef = useRef<HTMLDivElement>(null);
-  const waveformRef = useRef<HTMLDivElement>(null);
-  const wavesurferRef = useRef<WaveSurfer | null>(null);
 
-  // NEW: Precise Subtitle Scaling System
-  const [scaleRatio, setScaleRatio] = useState(0.4);
-  const previewCanvasRef = useRef<HTMLDivElement>(null);
-
+  // --- Persistence ---
   useEffect(() => {
-    if (!previewCanvasRef.current) return;
-    const updateScale = () => {
-      if (previewCanvasRef.current) {
-        // Standardize scaling: 
-        // User sets font size relative to 1080x1920 canvas.
-        // We scale the DOM preview linearly based on the canvas height vs 1920 (Height).
-        setScaleRatio(previewCanvasRef.current.offsetHeight / 1920);
+    localStorage.setItem('antigravity_api_key', apiKey);
+  }, [apiKey]);
+
+  // --- Shortcuts ---
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if typing in input/textarea
+      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handleSplit();
+      } else if (e.code === 'Backspace' || e.code === 'Delete') {
+        handleDelete();
       }
     };
-    const observer = new ResizeObserver(updateScale);
-    observer.observe(previewCanvasRef.current);
-    updateScale(); // Init relative to current size
-    return () => observer.disconnect();
-  }, []);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isPlaying, currentTime, cuts, selectedCutId]);
 
-  // Poll Job Status when Exporting to show detailed steps (like "Applying Subtitles")
+  // --- Persistence & Auto-Save ---
   useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    if (isExporting) {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch('http://localhost:8000/job-status');
-          if (res.ok) {
-            const status = await res.json();
-            if (status.step !== 'idle' && status.step !== 'done') {
-              setExportProgress(status.progress);
-              setSystemStatus(prev => ({ ...prev, message: status.message }));
-            }
-          }
-        } catch (e) { }
-      }, 500);
+    const projectData = {
+      cuts,
+      videoUrl,
+      originalVideoPath,
+      isVerticalMode,
+      projectAssets: projectAssets.map(a => ({ ...a, file: undefined })) // Can't serialize File objects
+    };
+    if (cuts.length > 0 || videoUrl) {
+      localStorage.setItem('antigravity_current_project', JSON.stringify(projectData));
     }
-    return () => clearInterval(interval);
-  }, [isExporting]);
+  }, [cuts, videoUrl, originalVideoPath, isVerticalMode, projectAssets]);
 
-  useEffect(() => {
-    let timer: ReturnType<typeof setInterval> | null = null;
-
-    const pollStatus = async () => {
-      try {
-        const res = await fetch('http://localhost:8000/model-status');
-        if (res.ok) {
-          const data = await res.json();
-          setSystemStatus(data);
-          // Stop polling once model is ready
-          if (data.status === 'ready' && timer) {
-            clearInterval(timer);
-            timer = null;
-          }
-        }
-      } catch (e) { }
-    };
-
-    timer = setInterval(pollStatus, 2000);
-    pollStatus();
-
-    return () => {
-      if (timer) clearInterval(timer);
-    };
-  }, []);
-
-  // Load available fonts from server
-  useEffect(() => {
-    const loadFonts = async () => {
-      try {
-        const res = await fetch('http://localhost:8000/list-fonts');
-        if (res.ok) {
-          const data = await res.json();
-          if (data.fonts && data.fonts.length > 0) {
-            setFontList(() => {
-              // Only show fonts that actually exist on backend + basic fallbacks
-              const combined = [...new Set([...data.fonts, 'Arial', 'Sans-serif'])];
-
-              // Dynamically load fonts for accurate preview
-              data.fonts.forEach(async (fontName: string) => {
-                const baseUrl = `http://localhost:8000/fonts/${encodeURIComponent(fontName)}`;
-                // Try multiple extensions
-                const extensions = ['.ttf', '.otf', '.TTF', '.OTF'];
-                let loaded = false;
-
-                for (const ext of extensions) {
-                  if (loaded) break;
-                  try {
-                    const font = new FontFace(fontName, `url(${baseUrl}${ext})`);
-                    await font.load();
-                    document.fonts.add(font);
-                    loaded = true;
-                    console.log(`✅ Loaded font: ${fontName} (${ext})`);
-                  } catch (e) {
-                    // Silently try next extension
-                  }
-                }
-                if (!loaded) {
-                  console.warn(`❌ Failed to load font: ${fontName} after trying various extensions.`);
-                }
-              });
-
-              return combined;
-            });
-          }
-        }
-      } catch (e) { /* Server not running */ }
-    };
-    loadFonts();
-  }, []);
-
-  // Initialize WaveSurfer
-  useEffect(() => {
-    if (videoUrl && waveformRef.current && !wavesurferRef.current) {
-      wavesurferRef.current = WaveSurfer.create({
-        container: waveformRef.current,
-        waveColor: '#6366f1',
-        progressColor: '#818cf8',
-        cursorColor: '#fff',
-        barWidth: 2,
-        barGap: 1,
-        barRadius: 2,
-        height: 50,
-        normalize: true,
-        backend: 'MediaElement',
-        media: videoRef.current || undefined,
-      });
-      wavesurferRef.current.load(videoUrl);
-    }
-    return () => {
-      if (wavesurferRef.current) {
-        wavesurferRef.current.destroy();
-        wavesurferRef.current = null;
-      }
-    };
-  }, [videoUrl]);
-
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setVideoFile(file);
-      setVideoUrl(URL.createObjectURL(file));
-      setCuts([]);
-      setSrtSubtitles([]); // Clear SRT when new video
+  const loadProject = (data: any) => {
+    try {
+      if (data.cuts) setCuts(data.cuts);
+      if (data.videoUrl) setVideoUrl(data.videoUrl);
+      if (data.originalVideoPath) setOriginalVideoPath(data.originalVideoPath);
+      if (data.isVerticalMode !== undefined) setIsVerticalMode(data.isVerticalMode);
+      if (data.projectAssets) setProjectAssets(data.projectAssets);
+      setAppView('editor');
+    } catch (e) {
+      console.error("Failed to load project", e);
+      alert("專案檔案格式錯誤");
     }
   };
 
-  const handleMakeVideo = async () => {
-    if (!videoFile) return;
-    setIsProcessing(true);
+  const handleExportProject = () => {
+    const projectData = {
+      version: '1.0',
+      timestamp: Date.now(),
+      cuts,
+      videoUrl,
+      originalVideoPath,
+      isVerticalMode,
+      projectAssets: projectAssets.map(a => ({ ...a, file: undefined }))
+    };
+    const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `project_${new Date().toISOString().split('T')[0]}.agpro`;
+    a.click();
+  };
 
-    // If no API key, generate random cuts based on settings
-    if (!apiKey.trim()) {
-      const videoDur = duration || 60;
-      const count = targetCount || 1;
-      const clipLen = targetDuration || 15;
-      const newCuts: Cut[] = [];
-
-      for (let i = 0; i < count; i++) {
-        const maxStart = Math.max(0, videoDur - clipLen);
-        const start = Math.random() * maxStart;
-        const end = Math.min(start + clipLen, videoDur);
-        newCuts.push({
-          id: i.toString(),
-          start: parseFloat(start.toFixed(2)),
-          end: parseFloat(end.toFixed(2)),
-          label: `片段 ${i + 1}`
-        });
+  const handleImportProject = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const data = JSON.parse(event.target?.result as string);
+        loadProject(data);
+      } catch (e) {
+        alert("匯入失敗：無效的專案檔案");
       }
-      setCuts(newCuts);
-      setIsProcessing(false);
-      return;
-    }
+    };
+    reader.readAsText(file);
+  };
 
-    // With API key, use AI analysis
+  // --- Player Logic ---
+  const togglePlay = () => {
+    if (videoRef.current) {
+      if (isPlaying) videoRef.current.pause();
+      else videoRef.current.play();
+      setIsPlaying(!isPlaying);
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    // Only update state from video if NOT scrubbing
+    if (videoRef.current && dragState.type !== 'scrub') {
+      setCurrentTime(videoRef.current.currentTime);
+    }
+  };
+
+  const handleMetadata = () => {
+    if (videoRef.current) {
+      setDuration(videoRef.current.duration);
+      if (cuts.length === 0) {
+        // Initial clip is full video
+        setCuts([{ id: 'full', start: 0, end: videoRef.current.duration, label: 'Full Video', trackId: 0 }]);
+      }
+    }
+  };
+
+  // --- File Upload ---
+  const processFile = async (file: File) => {
+    if (!file) return;
+    setVideoFile(file);
+    setIsUploading(true);
+
     const formData = new FormData();
-    formData.append('file', videoFile as any);
-    formData.append('instruction', instruction);
-    if (targetCount) formData.append('target_count', targetCount.toString());
-    if (targetDuration) formData.append('target_duration', targetDuration.toString());
-    formData.append('api_key', apiKey);
-    formData.append('model_name', selectedModel);
+    formData.append('file', file);
 
     try {
-      console.log("🚀 Starting AI Analysis...", { model: selectedModel, targetCount });
+      const res = await fetch('http://localhost:8000/upload-proxy', {
+        method: 'POST',
+        body: formData
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const encodedUrl = data.url; // Server already encodes if needed, but we'll ensure it's a valid URL object
+        setVideoUrl(encodedUrl);
+        setOriginalVideoPath(data.original_path);
+        setCuts([]);
+      } else {
+        alert("Upload failed");
+        // Fallback to client side
+        setVideoUrl(URL.createObjectURL(file));
+      }
+    } catch (err) {
+      console.error("Upload error", err);
+      // Fallback
+      setVideoUrl(URL.createObjectURL(file));
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) processFile(file);
+  };
+
+  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith('video/')) {
+      processFile(file);
+    }
+  };
+
+  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+
+  // --- Timeline Operations ---
+  const handleSplit = () => {
+    // Find which cut includes currentTime
+    const targetCut = cuts.find(c => currentTime > c.start + 0.1 && currentTime < c.end - 0.1);
+    if (!targetCut) return;
+
+    const newCutId = Math.random().toString(36).substr(2, 9);
+    const firstHalf: Cut = { ...targetCut, end: currentTime };
+    const secondHalf: Cut = {
+      id: newCutId,
+      start: currentTime,
+      end: targetCut.end,
+      label: targetCut.label,
+      trackId: targetCut.trackId || 0,
+      assetId: targetCut.assetId
+    };
+
+    const newCuts = cuts.map(c => c.id === targetCut.id ? firstHalf : c);
+    const index = newCuts.findIndex(c => c.id === targetCut.id);
+    newCuts.splice(index + 1, 0, secondHalf);
+
+    setCuts([...newCuts]);
+    setSelectedCutId(newCutId);
+  };
+
+  const handleDelete = () => {
+    if (!selectedCutId) return;
+    setCuts(cuts.filter(c => c.id !== selectedCutId));
+    setSelectedCutId(null);
+  };
+
+  // --- DRAG HANDLERS ---
+  const handleTimelineMouseDown = (e: React.MouseEvent) => {
+    // If clicking on ruler or empty space, start scrubbing
+    if (!timelineRef.current) return;
+    const rect = timelineRef.current.getBoundingClientRect();
+    const clickX = e.clientX - rect.left + timelineContainerRef.current!.scrollLeft;
+    const time = Math.max(0, clickX / zoomLevel);
+
+    // Update immediatley
+    setCurrentTime(time);
+    if (videoRef.current) videoRef.current.currentTime = time;
+
+    setDragState({
+      isDragging: true,
+      type: 'scrub',
+      startX: e.clientX,
+      targetId: null,
+      initialValue: 0
+    });
+  };
+
+  const handleClipMouseDown = (e: React.MouseEvent, cut: Cut, type: 'move' | 'trim-start' | 'trim-end') => {
+    e.stopPropagation();
+    setSelectedCutId(cut.id);
+
+    setDragState({
+      isDragging: true,
+      type,
+      targetId: cut.id,
+      startX: e.clientX,
+      initialValue: type === 'move' ? cut.start : (type === 'trim-start' ? cut.start : cut.end)
+    });
+  };
+
+  // Global Mouse Move / Up Listeners
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!dragState.isDragging) return;
+
+      const deltaX = e.clientX - dragState.startX;
+      const deltaTime = deltaX / zoomLevel;
+
+      if (dragState.type === 'scrub') {
+        if (videoRef.current) {
+          const newTime = Math.max(0, Math.min(duration, videoRef.current.currentTime + deltaTime));
+          // For scrubbing, we simply read the timeline position relative to container is better?
+          // Let's use simplified approach: re-calculate from mouse position relative to container
+          if (timelineRef.current && timelineContainerRef.current) {
+            const rect = timelineRef.current.getBoundingClientRect();
+            // We need to account for scroll
+            const offsetX = e.clientX - rect.left + timelineContainerRef.current.scrollLeft;
+            const absTime = Math.max(0, offsetX / zoomLevel);
+            setCurrentTime(absTime);
+            videoRef.current.currentTime = absTime;
+          }
+        }
+      }
+      else if (dragState.type === 'move' && dragState.targetId) {
+        const newStart = Math.max(0, dragState.initialValue + deltaTime);
+        const duration = cuts.find(c => c.id === dragState.targetId)!.end - cuts.find(c => c.id === dragState.targetId)!.start;
+        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, start: newStart, end: newStart + duration } : c));
+      }
+      else if (dragState.type === 'trim-start' && dragState.targetId) {
+        const newStart = Math.min(dragState.initialValue + deltaTime, cuts.find(c => c.id === dragState.targetId)!.end - 0.1);
+        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, start: Math.max(0, newStart) } : c));
+      }
+      else if (dragState.type === 'trim-end' && dragState.targetId) {
+        const newEnd = Math.max(dragState.initialValue + deltaTime, cuts.find(c => c.id === dragState.targetId)!.start + 0.1);
+        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, end: newEnd } : c));
+      }
+    };
+
+    const handleMouseUp = () => {
+      if (dragState.isDragging) {
+        setDragState({ ...dragState, isDragging: false, type: null });
+      }
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [dragState, cuts, zoomLevel, duration]);
+
+
+  // --- AI Functions ---
+  const handleGeminiHighlights = async () => {
+    if (!videoFile || !apiKey) return;
+    setIsProcessing(true);
+
+    const formData = new FormData();
+    formData.append('file', videoFile);
+    formData.append('instruction', instruction || "Find the best highlights");
+    formData.append('target_count', highlightCount.toString());
+    formData.append('target_duration', targetDuration.toString());
+    formData.append('api_key', apiKey);
+    formData.append('model_name', 'gemini-2.0-flash-exp');
+
+    try {
       const res = await fetch('http://localhost:8000/analyze-video', { method: 'POST', body: formData });
       if (res.ok) {
         const data = await res.json();
-        console.log("✅ Analysis Result:", data);
-        setCuts(data.map((c: any, i: number) => ({ ...c, id: i.toString() })));
+        const aiCuts = data.map((c: any, i: number) => ({
+          id: `ai-${i}`,
+          start: c.start,
+          end: c.end,
+          label: c.label || `Highlight ${i + 1}`,
+          trackId: 0
+        }));
+
+        if (confirm(`AI Found ${aiCuts.length} clips. Replace timeline?`)) {
+          setCuts(aiCuts);
+        }
       } else {
-        const errData = await res.json();
-        alert(`分析失敗: ${errData.detail || res.statusText}`);
+        alert("AI Analysis Failed");
       }
     } catch (e) {
-      console.error("❌ AI Analysis Error:", e);
-      alert('分析失敗，請檢查網路連線或後端服務是否運行於 localhost:8000');
+      console.error(e);
+      alert("Error connecting to backend");
     }
     setIsProcessing(false);
   };
 
+  const handleSilenceRemoval = async () => {
+    if (!videoFile) return;
+    if (!confirm("這將會移除影片中的靜音部分並取代目前的時間軸。確定嗎？")) return;
 
-  // NEW: Instant Remotion Preview
-  const handlePreview = async (cut: Cut) => {
-    if (!videoUrl) return;
-
-    setPreviewCut({ ...cut });
-    setShowPreviewModal(false); // Hide Player Modal initially
-    setIsPreviewLoading(true); // Show Loading Overlay
-    setPreviewProgress(0);
-    setPreviewMessage("正在初始化...");
-
-    setPreviewSubtitles([]);
-    setPreviewAudioUrl(null);
-    setPreviewVisualSegments([]);
-    setPreviewFaceCenter(0.5);
-
-    // Strict Pipeline Execution
-    if (!videoFile) {
-      alert("⚠️ 請重新上傳原始影片以執行完整 AI 預覽流程。");
-      setTimeout(() => setShowPreviewModal(false), 500);
-      return;
-    }
-
-    setPreviewMessage("AI 全流程處理中... (降噪 -> 去氣口 -> 字幕 -> 人臉)");
-    setPreviewProgress(10);
-    setPreviewSubtitles([]);
-    setPreviewFaceCenter(0.5);
-    setPreviewAudioUrl(null);
-    setPreviewVisualSegments([]);
-
-    try {
-      const fd = new FormData();
-      fd.append('file', videoFile);
-      fd.append('start', cut.start.toString());
-      fd.append('end', cut.end.toString());
-
-      // Pass all configs for Strict Execution
-      fd.append('is_denoise', isStudioSound.toString());
-      fd.append('is_silence_removal', isSilenceRemoval.toString());
-      fd.append('silence_threshold', silenceThreshold.toString());
-
-      // Auto Caption
-      fd.append('is_auto_caption', (isAutoCaption || isBurnCaptions).toString());
-      fd.append('whisper_language', whisperLanguage);
-      fd.append('whisper_model_size', whisperModelSize);
-      fd.append('whisper_beam_size', whisperBeamSize.toString());
-      fd.append('whisper_temperature', whisperTemperature.toString());
-      fd.append('whisper_no_speech_threshold', whisperNoSpeechThreshold.toString());
-      fd.append('whisper_condition_on_previous_text', whisperConditionOnPreviousText.toString());
-      fd.append('whisper_best_of', whisperBestOf.toString());
-      fd.append('whisper_patience', whisperPatience.toString());
-      fd.append('whisper_compression_ratio_threshold', whisperCompressionRatioThreshold.toString());
-      fd.append('whisper_logprob_threshold', whisperLogprobThreshold.toString());
-      fd.append('whisper_fp16', whisperFp16.toString());
-      fd.append('whisper_chars_per_line', whisperCharsPerLine.toString());
-      fd.append('whisper_remove_punctuation', whisperRemovePunctuation.toString());
-      fd.append('translate_to_chinese', isTranslate.toString());
-      fd.append('api_key', apiKey);
-      if (srtSubtitles.length > 0) {
-        fd.append('srt_json', JSON.stringify(srtSubtitles));
-      }
-
-      // Pass Subtitle Config JSON to ensure Chars Per Line is respected in Transcription
-      const subConfigObj = { charsPerLine: whisperCharsPerLine };
-      fd.append('subtitle_config', JSON.stringify(subConfigObj));
-
-      // Face Tracking
-      fd.append('is_face_tracking', isFaceTracking.toString());
-
-      // Endpoint Call with Streaming Support
-      const res = await fetch('http://localhost:8000/process-preview-pipeline', { method: 'POST', body: fd });
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("Failed to get reader");
-
-      const decoder = new TextDecoder();
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n").filter(l => l.trim() !== "");
-
-        for (const line of lines) {
-          try {
-            const msg = JSON.parse(line);
-            console.log("[Preview Pipeline Stream]", msg);
-
-            if (msg.status === 'progress') {
-              setPreviewMessage(msg.message);
-              setPreviewProgress(msg.percent);
-            }
-            else if (msg.status === 'success') {
-              const data = msg.data;
-              if (data.subtitles) setPreviewSubtitles(data.subtitles);
-              if (data.faceCenterX !== undefined) setPreviewFaceCenter(data.faceCenterX);
-              if (data.audioUrl) setPreviewAudioUrl(data.audioUrl);
-              if (data.visualSegments) setPreviewVisualSegments(data.visualSegments);
-              if (data.speakerSegments) setPreviewSpeakerSegments(data.speakerSegments); // NEW: Dynamic camera cuts
-
-              setPreviewProgress(100);
-              setTimeout(() => {
-                setIsPreviewLoading(false);
-                setShowPreviewModal(true);
-              }, 500);
-            }
-            else if (msg.status === 'error') {
-              setPreviewMessage("發生錯誤: " + msg.message);
-              console.error("Pipeline Back-end Error", msg.message);
-              return;
-            }
-          } catch (e) {
-            console.warn("Stream parse error", e, line);
-          }
-        }
-      }
-
-    } catch (e) {
-      console.error("Pipeline Error", e);
-      setPreviewMessage("連線錯誤");
-    }
-
-  };
-
-  /* LEGACY BACKEND PREVIEW (Disabled for Remotion)
-  const handlePreview = async (cut: Cut) => {
-     // ... old logic ...
-  };
-  */
-
-  const handleExport = async (singleCut?: Cut) => {
-    const activeCuts = singleCut ? [singleCut] : cuts;
-    if (activeCuts.length === 0) {
-      alert("請先分析影片或手動新增片段");
-      return;
-    }
-
-    setIsExporting(true);
-    setExportProgress(0);
-
-    // Start Export
-    setIsExporting(true);
-    setExportProgress(0);
+    setIsProcessing(true);
 
     const formData = new FormData();
-    formData.append('file', videoFile!);
-    formData.append('cuts_json', JSON.stringify(activeCuts));
-    formData.append('face_tracking', isFaceTracking.toString());
-    formData.append('studio_sound', isStudioSound.toString());
-    formData.append('dfn3_strength', dfn3Strength.toString());
-    formData.append('is_silence_removal', isSilenceRemoval.toString());
-    formData.append('silence_threshold', silenceThreshold.toString());
-    formData.append('is_jump_cut_zoom', isJumpCutZoom.toString());
-
-    formData.append('auto_caption', isAutoCaption.toString());
-    formData.append('translate_to_chinese', isTranslate.toString());
-    formData.append('burn_captions', isBurnCaptions.toString());
-    formData.append('srt_json', JSON.stringify(srtSubtitles)); // Send user's SRT
-    formData.append('subtitle_font_name', subtitleFontName);
-    formData.append('subtitle_font_size', subtitleFontSize.toString());
-    formData.append('subtitle_font_weight', subtitleFontWeight.toString());
-    formData.append('subtitle_font_style', subtitleFontStyle);
-
-    formData.append('subtitle_text_color', subtitleTextColor);
-    formData.append('is_text_gradient', isTextGradient.toString());
-    formData.append('text_gradient_colors', JSON.stringify(textGradientColors));
-    formData.append('text_gradient_direction', textGradientDirection);
-
-    formData.append('subtitle_outline_width', (isSubtitleOutline ? subtitleOutlineWidth : 0).toString());
-    formData.append('subtitle_outline_color', subtitleOutlineColor);
-
-    formData.append('subtitle_shadow_color', subtitleShadowColor);
-    formData.append('subtitle_shadow_opacity', (isSubtitleShadow ? subtitleShadowOpacity : 0).toString()); // Int 0-100
-    formData.append('subtitle_shadow_blur', subtitleShadowBlur.toString());
-    formData.append('subtitle_shadow_offset_x', subtitleShadowOffsetX.toString());
-    formData.append('subtitle_shadow_offset_y', subtitleShadowOffsetY.toString());
-
-    formData.append('subtitle_letter_spacing', subtitleLetterSpacing.toString());
-    formData.append('subtitle_line_height', subtitleLineHeight.toString());
-    formData.append('subtitle_text_transform', subtitleTextTransform);
-    formData.append('subtitle_text_align', subtitleTextAlign);
-
-    formData.append('subtitle_margin_v', subtitleMarginV.toString());
-    formData.append('subtitle_chars_per_line', subtitleCharsPerLine.toString());
-    formData.append('subtitle_animation', subtitleAnimation);
-    formData.append('subtitle_animation_duration', subtitleAnimationDuration.toString());
-    formData.append('subtitle_animation_spring', subtitleAnimationSpring.toString());
-
-    formData.append('subtitle_box_enabled', subtitleBgEnabled.toString());
-    formData.append('subtitle_box_color', subtitleBgColor);
-    formData.append('subtitle_box_opacity', subtitleBgOpacity.toString()); // Int 0-100
-    formData.append('subtitle_box_padding_x', subtitleBgPaddingX.toString());
-    formData.append('subtitle_box_padding_y', subtitleBgPaddingY.toString());
-    formData.append('subtitle_box_radius', subtitleBgRadius.toString());
-
-    formData.append('output_quality', outputQuality);
-    formData.append('output_resolution', outputResolution);
-    formData.append('whisper_language', whisperLanguage);
-    formData.append('whisper_model_size', whisperModelSize);
-    formData.append('whisper_beam_size', whisperBeamSize.toString());
-    formData.append('whisper_temperature', whisperTemperature.toString());
-    formData.append('whisper_no_speech_threshold', whisperNoSpeechThreshold.toString());
-    formData.append('whisper_condition_on_previous_text', whisperConditionOnPreviousText.toString());
-    formData.append('whisper_best_of', whisperBestOf.toString());
-    formData.append('whisper_patience', whisperPatience.toString());
-    formData.append('whisper_compression_ratio_threshold', whisperCompressionRatioThreshold.toString());
-    formData.append('whisper_logprob_threshold', whisperLogprobThreshold.toString());
-    formData.append('whisper_fp16', whisperFp16.toString());
-    formData.append('whisper_remove_punctuation', whisperRemovePunctuation.toString());
-    formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
+    formData.append('file', videoFile);
+    formData.append('threshold_db', silenceThreshold.toString());
+    formData.append('min_duration', silenceMinDuration.toString());
 
     try {
-      const res = await fetch('http://localhost:8000/process-video', { method: 'POST', body: formData });
-      if (res.ok) {
-        const data = await res.json();
-        // Trigger download via direct URL
-        const downloadUrl = `http://localhost:8000${data.download_url}`;
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = data.filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+      const res = await fetch('http://localhost:8000/detect-silence', {
+        method: 'POST',
+        body: formData
+      });
 
+      if (res.ok) {
+        const segments = await res.json();
+        const newCuts: Cut[] = segments.map((seg: any, i: number) => ({
+          id: `silence-${i}`,
+          start: seg.start,
+          end: seg.end,
+          label: 'Speech',
+          trackId: 0
+        }));
+
+        if (newCuts.length === 0) {
+          alert("未偵測到任何語音片段 (No speech found)");
+        } else {
+          setCuts(newCuts);
+        }
       } else {
-        const errorData = await res.json().catch(() => ({ detail: '匯出失敗' }));
-        alert(`匯出失敗: ${errorData.detail || res.statusText}`);
+        console.error(await res.text());
+        alert("偵測失敗");
       }
     } catch (e) {
-      alert('無法連接後端服務，或處理時間過長導致超時');
-    }
-
-    setExportProgress(100);
-    setTimeout(() => setExportProgress(0), 500);
-    setIsExporting(false);
-  };
-
-  const updateCutLabel = (id: string, label: string) => setCuts(cuts.map(c => c.id === id ? { ...c, label } : c));
-  const updateCutTime = (id: string, field: 'start' | 'end', value: number) => {
-    setCuts(cuts.map(c => c.id === id ? { ...c, [field]: Math.max(0, Math.min(duration, value)) } : c));
-  };
-  const seekTo = (time: number) => { if (videoRef.current) videoRef.current.currentTime = time; };
-
-  const handleTimelineClick = (e: React.MouseEvent) => {
-    if (draggingCut) return; // Don't seek when dragging
-    if (timelineRef.current) {
-      const rect = timelineRef.current.getBoundingClientRect();
-      const pos = (e.clientX - rect.left) / rect.width;
-      const targetTime = pos * duration;
-      seekTo(targetTime);
+      console.error(e);
+      alert("連線後端失敗");
+    } finally {
+      setIsProcessing(false);
     }
   };
 
-  const handleCutDragStart = (e: React.MouseEvent, cutId: string, edge: 'start' | 'end' | 'move') => {
-    e.stopPropagation();
-    const cut = cuts.find(c => c.id === cutId);
-    if (cut) {
-      setDraggingCut({ id: cutId, edge, initialX: e.clientX, initialStart: cut.start, initialEnd: cut.end });
+  const handleExportVideo = async () => {
+    if (cuts.length === 0 || !videoFile) {
+      if (!videoFile) alert("請先上傳影片檔案以進行匯出");
+      return;
     }
-  };
 
-  const handleCutDrag = (e: React.MouseEvent) => {
-    if (!draggingCut || !timelineRef.current) return;
-    const rect = timelineRef.current.getBoundingClientRect();
-    const deltaX = e.clientX - draggingCut.initialX;
-    const deltaTime = (deltaX / rect.width) * duration;
+    setIsProcessing(true);
+    setShowExportModal(false);
 
-    if (draggingCut.edge === 'start') {
-      const newStart = Math.max(0, Math.min(draggingCut.initialEnd - 0.5, draggingCut.initialStart + deltaTime));
-      updateCutTime(draggingCut.id, 'start', newStart);
-    } else if (draggingCut.edge === 'end') {
-      const newEnd = Math.max(draggingCut.initialStart + 0.5, Math.min(duration, draggingCut.initialEnd + deltaTime));
-      updateCutTime(draggingCut.id, 'end', newEnd);
-    } else { // move
-      const clipDuration = draggingCut.initialEnd - draggingCut.initialStart;
-      let newStart = draggingCut.initialStart + deltaTime;
-      newStart = Math.max(0, Math.min(duration - clipDuration, newStart));
-      setCuts(cuts.map(c => c.id === draggingCut.id ? { ...c, start: newStart, end: newStart + clipDuration } : c));
-    }
-  };
+    const formData = new FormData();
+    formData.append('file', videoFile);
+    formData.append('cuts_json', JSON.stringify(cuts));
+    formData.append('output_resolution', exportResolution);
+    formData.append('output_mode', 'video'); // Force video render
+    formData.append('whisper_language', 'zh');
+    formData.append('vertical_mode', isVerticalMode ? 'true' : 'false');
 
-  const handleCutDragEnd = () => {
-    setDraggingCut(null);
-  };
+    // Linked AI options
+    formData.append('burn_captions', exportAutoCaption ? 'true' : 'false');
+    formData.append('auto_caption', exportAutoCaption ? 'true' : 'false');
+    formData.append('face_tracking', exportFaceTracking ? 'true' : 'false');
+    formData.append('studio_sound', exportStudioSound ? 'true' : 'false');
+    formData.append('merge_clips', exportMergeClips ? 'true' : 'false');
 
-  // Wrap text based on chars per line (each character = 1)
-  const wrapText = (text: string, charsPerLine: number): string => {
-    if (!text || charsPerLine <= 0) return text;
+    try {
+      const response = await fetch('http://localhost:8000/process-video', {
+        method: 'POST',
+        body: formData
+      });
 
-    // Support existing newlines first
-    const paragraphs = text.split('\n');
-    const wrappedParagraphs = paragraphs.map(p => {
-      if (p.length <= charsPerLine) return p;
-
-      const lines = [];
-      let current = p;
-
-      while (current.length > 0) {
-        if (current.length <= charsPerLine) {
-          lines.push(current);
-          break;
+      if (response.ok) {
+        const data = await response.json();
+        if (data.status === 'success' && data.download_url) {
+          const downloadUrl = `http://localhost:8000${data.download_url}`;
+          const a = document.createElement('a');
+          a.href = downloadUrl;
+          a.download = data.filename || `export_${Date.now()}.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        } else {
+          alert("匯出成功但未獲取下載連結: " + JSON.stringify(data));
         }
-
-        // Find best break point for English (space) within the limit
-        let breakAt = charsPerLine;
-        const sub = current.substring(0, charsPerLine + 1);
-        const lastSpace = sub.lastIndexOf(' ');
-
-        // Only use space break if it's not too far back (e.g. at least 60% of limit)
-        if (lastSpace > charsPerLine * 0.6) {
-          breakAt = lastSpace;
-        }
-
-        lines.push(current.substring(0, breakAt).trim());
-        current = current.substring(breakAt).trim();
+      } else {
+        const errorText = await response.text();
+        console.error("Export failed:", errorText);
+        alert("匯出失敗，請檢查後端日誌");
       }
-      return lines.join('\n');
+    } catch (e) {
+      console.error("Export error:", e);
+      alert("連線後端失敗");
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleExportXML = () => {
+    if (cuts.length === 0) return;
+    const fps = 30;
+    const fileName = videoFile?.name || "video.mp4";
+
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.8">
+    <resources>
+        <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080"/>
+        <asset id="a1" name="${fileName}" src="file://${originalVideoPath || `localhost/path/to/${fileName}`}" duration="${Math.round(duration * fps)}/30s" hasVideo="1" hasAudio="1"/>
+    </resources>
+    <library>
+        <event name="Antigravity Cut Event">
+            <project name="Antigravity Project">
+                <sequence format="r1" duration="${Math.round(cuts.reduce((a, b) => a + (b.end - b.start), 0) * fps)}/30s" tcStart="0s" tcFormat="NDF">
+                    <spine>`;
+
+    let offset = 0;
+    cuts.forEach((cut, i) => {
+      const dur = cut.end - cut.start;
+      const durFrames = Math.round(dur * fps);
+      const startFrames = Math.round(cut.start * fps);
+      const offsetFrames = Math.round(offset * fps);
+
+      xml += `
+                        <video name="${cut.label || 'Clip ' + (i + 1)}" offset="${offsetFrames}/30s" ref="a1" duration="${durFrames}/30s" start="${startFrames}/30s"/>`;
+      offset += dur;
     });
 
-    return wrappedParagraphs.join('\n');
-  };
+    xml += `
+                    </spine>
+                </sequence>
+            </project>
+        </event>
+    </library>
+</fcpxml>`;
 
-  // Calculate shadow offset from angle
-
-
-  const handleGradientColorChange = (index: number, color: string) => {
-    const newColors = [...textGradientColors];
-    newColors[index] = color;
-    setTextGradientColors(newColors);
+    const blob = new Blob([xml], { type: 'application/xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `project_export.xml`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   return (
-    <div className="app-container">
-      {/* System Status Banner */}
-      {systemStatus.status !== 'ready' && (
-        <div className="system-status-banner glass">
-          <div className="status-info">
-            <div className="pulse-dot" />
-            <span className="status-message">{systemStatus.message}</span>
-            <span className="status-percent">{systemStatus.progress}%</span>
-          </div>
-          <div className="status-progress-bar">
-            <div className="status-progress-fill" style={{ width: `${systemStatus.progress}%` }} />
-          </div>
+    <div className="app-container" onDrop={handleDrop} onDragOver={handleDragOver}>
+      {/* 1. Compact Header */}
+      <header className="header">
+        <div className="logo" style={{ fontSize: '14px', paddingLeft: 80 }}>
+          <Scissors size={14} className="text-secondary" />
+          <span style={{ color: '#ddd' }}>Antigravity Cut</span>
         </div>
-      )}
-
-      {/* Preview Modal (Updated for Remotion) */}
-
-      {/* Preview Modal (Updated for Remotion) */}
-      <AnimatePresence>
-        {showPreviewModal && previewCut && videoUrl && (
-          <motion.div
-            className="modal-overlay"
-            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-            onClick={() => { setPreviewCut(null); setShowPreviewModal(false); }}
-            style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.9)', zIndex: 9999, display: 'flex', justifyContent: 'center', alignItems: 'center' }}
-          >
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="preview-modal-content"
-              onClick={e => e.stopPropagation()} // Prevent closing when clicking inside
-              style={{
-                width: 'auto',
-                height: '85vh',
-                aspectRatio: '9/16',
-                background: '#000',
-                borderRadius: '24px',
-                position: 'relative',
-                overflow: 'hidden',
-                boxShadow: '0 8px 32px rgba(0,0,0,0.5)'
-              }}
-            >
-              <div style={{ width: '100%', height: '100%', position: 'relative' }}>
-                <Player
-                  key={`res-preview-${previewCut.id}-${previewCut.start}-${previewCut.end}-${previewFaceCenter}-${previewAudioUrl}-${subtitleFontSize}-${subtitleFontName}-${subtitleFontWeight}-${subtitleFontStyle}-${subtitleTextColor}-${subtitleBgEnabled}-${subtitleOutlineWidth}-${subtitleShadowOpacity}-${subtitleLetterSpacing}-${subtitleLineHeight}-${subtitleTextAlign}-${subtitleTextTransform}-${isTextGradient}-${subtitleBgColor}-${subtitleBgOpacity}-${subtitleBgPaddingX}-${subtitleBgPaddingY}-${subtitleBgRadius}-${subtitleCharsPerLine}-${isBurnCaptions}`}
-                  component={MyComposition}
-                  durationInFrames={Math.max(1, Math.floor((previewCut.end - previewCut.start) * 30))}
-                  compositionWidth={1080}
-                  compositionHeight={1920}
-                  fps={30}
-                  style={{ width: '100%', height: '100%' }}
-                  controls
-                  autoPlay
-                  loop
-                  inputProps={{
-                    videoUrl: videoUrl,
-                    audioUrl: previewAudioUrl || undefined,
-                    startFrom: previewCut.start,
-                    visualSegments: previewVisualSegments.length > 0 ? previewVisualSegments : [{
-                      startInVideo: previewCut.start,
-                      duration: previewCut.end - previewCut.start,
-                      zoom: 1.0
-                    }],
-                    subtitles: (() => {
-                      // 1. If we have preview subtitles (from server), use them.
-                      if (previewSubtitles && previewSubtitles.length > 0) return previewSubtitles;
-
-                      // 2. If we have globally loaded SRT subtitles, filter and use them.
-                      const globalInCut = srtSubtitles.filter(s => s.start <= previewCut.end && s.end >= previewCut.start);
-                      if (globalInCut.length > 0) return globalInCut;
-
-                      // 3. Last fallback: ONLY if no real subtitles exist, show the manual preview text.
-                      return [{
-                        id: 'preview_placeholder',
-                        start: previewCut.start,
-                        end: previewCut.end,
-                        text: wrapText(previewText || '預覽文字內容', subtitleCharsPerLine)
-                      }];
-                    })(),
-                    isFaceTracking: isFaceTracking,
-                    faceCenterX: previewFaceCenter, // Fallback for single speaker
-                    speakerSegments: previewSpeakerSegments, // NEW: Dynamic camera cuts
-                    subtitleConfig: {
-                      fontSize: subtitleFontSize,
-                      fontFamily: subtitleFontName,
-                      fontWeight: subtitleFontWeight,
-                      fontStyle: subtitleFontStyle,
-
-                      textColor: subtitleTextColor,
-                      isTextGradient: isTextGradient,
-                      textGradientColors: textGradientColors,
-                      textGradientDirection: textGradientDirection,
-
-                      outlineWidth: isSubtitleOutline ? subtitleOutlineWidth : 0,
-                      outlineColor: subtitleOutlineColor,
-
-                      shadowColor: subtitleShadowColor,
-                      shadowBlur: subtitleShadowBlur,
-                      shadowOffsetX: subtitleShadowOffsetX,
-                      shadowOffsetY: subtitleShadowOffsetY,
-                      shadowOpacity: isSubtitleShadow ? subtitleShadowOpacity / 100 : 0,
-
-                      letterSpacing: subtitleLetterSpacing,
-                      lineHeight: subtitleLineHeight,
-                      textTransform: subtitleTextTransform as any,
-                      textAlign: subtitleTextAlign as any,
-
-                      marginBottom: subtitleMarginV,
-                      charsPerLine: subtitleCharsPerLine,
-                      animation: subtitleAnimation,
-
-                      isUnknownBackground: subtitleBgEnabled,
-                      backgroundColor: subtitleBgColor,
-                      backgroundOpacity: subtitleBgOpacity / 100,
-                      backgroundPaddingX: subtitleBgPaddingX,
-                      backgroundPaddingY: subtitleBgPaddingY,
-                      backgroundBorderRadius: subtitleBgRadius,
-                    } as any // Force cast to avoid strict union type errors temporarily
-                  }}
-                />
-              </div>
-              {/* Overlay instruction removed to avoid overlap with subtitles */}
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <header className="header glass">
-        <div className="logo">
-          <Scissors className="icon-primary" size={24} />
-          <span>Antigravity Cut <small>v3.0</small></span>
-        </div>
-        <div className="api-status">
-          {/* Empty space - API Key moved to sidebar */}
+        <div className="header-drag-region" />
+        <div style={{ display: 'flex', gap: '8px', WebkitAppRegion: 'no-drag', alignItems: 'center' } as any}>
+          <button className="btn-ghost-sm" onClick={() => setAppView('welcome')} title="主選單">
+            <RotateCcw size={14} />
+          </button>
+          <div style={{ width: 1, height: 16, background: '#333', margin: '0 4px' }} />
+          <button className="btn-ghost-sm" onClick={handleExportProject} title="儲存專案 (Save Project)">
+            <Save size={14} /> 儲存專案
+          </button>
+          <button className="btn-ghost-sm" onClick={handleExportXML} style={{ height: 28, fontSize: 11 }}>
+            XML
+          </button>
+          <button className="btn-primary-sm" onClick={() => setShowExportModal(true)} style={{ height: 28, fontSize: 11, padding: '0 12px', background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)', border: 'none', fontWeight: 600 }}>
+            <Download size={14} /> 匯出影片
+          </button>
         </div>
       </header>
 
-      <main className="main-content-new">
-        <div className="top-row">
-          {/* Section 1: Main Video Player (Left) */}
-          <div className="panel-column">
-            <div className="panel-header-title">
-              <Video size={14} style={{ marginRight: '8px' }} /> 16:9 素材影片
+      {/* Welcome Screen */}
+      {appView === 'welcome' ? (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#111', color: 'white' }}>
+          <div style={{ marginBottom: 40, textAlign: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 16, marginBottom: 24 }}>
+              <Scissors size={64} className="text-secondary" />
+              <h1 style={{ fontSize: 48, margin: 0, fontWeight: 800, background: 'linear-gradient(135deg, #fff 0%, #a1a1aa 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>Antigravity Cut</h1>
             </div>
-            <div className="video-panel">
-              <div className="video-container-16-9">
-                {videoUrl ? (
-                  <video
-                    ref={videoRef}
-                    src={videoUrl}
-                    className="video-player"
-                    onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-                    onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-                  />
-                ) : (
-                  <div className="upload-placeholder">
-                    <input type="file" accept="video/*" onChange={handleFileUpload} style={{ display: 'none' }} id="video-upload-main" />
-                    <label htmlFor="video-upload-main" className="upload-label">
-                      <Upload size={48} color="#6366f1" />
-                      <div>點擊此處上傳原始影片</div>
-                    </label>
+            <p style={{ color: '#666', fontSize: 16 }}>專業級 AI 智能影音剪輯工具</p>
+          </div>
+
+          <div style={{ display: 'flex', gap: 24 }}>
+            <div
+              onClick={() => {
+                const hasSaved = localStorage.getItem('antigravity_current_project');
+                if (!hasSaved || confirm('這將會清空目前所有進度，確定嗎？')) {
+                  localStorage.removeItem('antigravity_current_project');
+                  setCuts([]);
+                  setVideoUrl(null);
+                  setOriginalVideoPath(null);
+                  setProjectAssets([]);
+                  setAppView('editor');
+                }
+              }}
+              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s' }}
+              className="welcome-card"
+            >
+              <Plus size={40} color="#3ea6ff" style={{ marginBottom: 16 }} />
+              <span style={{ fontWeight: 600, fontSize: 16 }}>建立新專案</span>
+              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Start New Project</span>
+            </div>
+
+            <div
+              onClick={() => {
+                const saved = localStorage.getItem('antigravity_current_project');
+                if (saved) {
+                  loadProject(JSON.parse(saved));
+                }
+              }}
+              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s', opacity: localStorage.getItem('antigravity_current_project') ? 1 : 0.5, pointerEvents: localStorage.getItem('antigravity_current_project') ? 'auto' : 'none' }}
+              className="welcome-card"
+            >
+              <RotateCcw size={40} color="#10b981" style={{ marginBottom: 16 }} />
+              <span style={{ fontWeight: 600, fontSize: 16 }}>恢復上次專案</span>
+              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Resume Project</span>
+            </div>
+
+            <label
+              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s' }}
+              className="welcome-card"
+            >
+              <Save size={40} color="#eb64ff" style={{ marginBottom: 16 }} />
+              <span style={{ fontWeight: 600, fontSize: 16 }}>從檔案匯入 project</span>
+              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Import .agpro File</span>
+              <input type="file" hidden accept=".agpro,.json" onChange={handleImportProject} />
+            </label>
+          </div>
+
+          <div style={{ marginTop: 64, color: '#444', fontSize: 12 }}>
+            v1.0.0 Alpha
+          </div>
+        </div>
+      ) : (
+        <div className="premiere-layout">
+          {/* 2. Main Premiere Layout */}
+
+          {/* Top Section: Panels */}
+          <div className="top-panels">
+
+            {/* Left: Project / Inspector Panel */}
+            <div className="panel-container" style={{ width: 340, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+              {/* Panel Tabs Header */}
+              <div className="panel-header" style={{ gap: 2, padding: '0 4px' }}>
+                <div className={`panel-tab ${leftPanelTab === 'project' ? 'active' : ''}`} onClick={() => setLeftPanelTab('project')} style={{ flex: 1, justifyContent: 'center' }}>專案</div>
+                <div className={`panel-tab ${leftPanelTab === 'controls' ? 'active' : ''}`} onClick={() => setLeftPanelTab('controls')} style={{ flex: 1, justifyContent: 'center' }}>控制</div>
+                <div className={`panel-tab ${leftPanelTab === 'ai' ? 'active' : ''}`} onClick={() => setLeftPanelTab('ai')} style={{ flex: 1, justifyContent: 'center' }}>AI</div>
+                <div className={`panel-tab ${leftPanelTab === 'effects' ? 'active' : ''}`} onClick={() => setLeftPanelTab('effects')} style={{ flex: 1, justifyContent: 'center' }}>特效</div>
+              </div>
+
+              <div className="panel-content" style={{ padding: 0, overflowY: 'auto' }}>
+
+                {/* 1. PROJECT TAB */}
+                {leftPanelTab === 'project' && (
+                  <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+                    {/* Toolbar */}
+                    <div style={{ padding: 8, borderBottom: '1px solid #333', display: 'flex', gap: 8 }}>
+                      <label className="btn-primary-sm" style={{ flex: 1, cursor: 'pointer' }}>
+                        <Plus size={12} /> 匯入素材
+                        <input type="file" multiple hidden accept="video/*,image/*,audio/*" onChange={(e) => {
+                          if (e.target.files) {
+                            const newAssets = Array.from(e.target.files).map(f => ({
+                              id: Math.random().toString(36).substr(2, 9),
+                              type: f.type.startsWith('video') ? 'video' : f.type.startsWith('audio') ? 'audio' : 'image',
+                              name: f.name,
+                              url: URL.createObjectURL(f),
+                              file: f
+                            } as Asset));
+                            setProjectAssets(prev => [...prev, ...newAssets]);
+                            // Auto-load first video if timeline is empty
+                            if (cuts.length === 0 && newAssets[0].type === 'video') {
+                              setVideoUrl(newAssets[0].url);
+                              setVideoFile(newAssets[0].file || null);
+                              setOriginalVideoPath(null); // Local file
+                              // Need to wait for metadata... handled by onLoadedMetadata
+                            }
+                          }
+                        }} />
+                      </label>
+                      <button className="btn-icon-sm" onClick={() => { if (confirm('清空素材庫？')) setProjectAssets([]) }} title="清空素材庫"><Trash size={14} /></button>
+                    </div>
+
+                    {/* Assets Grid */}
+                    <div style={{ flex: 1, overflowY: 'auto', padding: 8, display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, alignContent: 'start' }}>
+                      {projectAssets.length > 0 ? projectAssets.map(asset => (
+                        <div key={asset.id}
+                          onClick={() => {
+                            if (asset.type === 'video') {
+                              if (confirm(`要將 "${asset.name}" 載入到預覽視窗嗎?`)) {
+                                setVideoUrl(asset.url);
+                                setVideoFile(asset.file || null);
+                                // Clean restart
+                                setCuts([]);
+                              }
+                            }
+                          }}
+                          className="asset-item"
+                          title={asset.name}
+                          style={{ aspectRatio: '1/1', background: '#222', borderRadius: 4, overflow: 'hidden', position: 'relative', border: '1px solid #444', cursor: 'pointer' }}
+                        >
+                          {asset.type === 'video' || asset.type === 'image' ? (
+                            <video src={asset.url} style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }} />
+                          ) : (
+                            <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                              <Loader2 size={24} color="#666" />
+                            </div>
+                          )}
+                          <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.8)', fontSize: 10, padding: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {asset.name}
+                          </div>
+                        </div>
+                      )) : (
+                        <div style={{ gridColumn: '1/-1', textAlign: 'center', marginTop: 32, color: '#666', fontSize: 11 }}>
+                          無素材<br />點擊上方按鈕匯入
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* 2. CONTROLS TAB */}
+                {leftPanelTab === 'controls' && (
+                  <div style={{ padding: 12 }}>
+                    {selectedCutId ? (
+                      <div style={{ color: '#ddd', fontSize: 11 }}>
+                        <div style={{ marginBottom: 16, fontWeight: 'bold', color: 'var(--primary-color)', borderBottom: '1px solid #333', paddingBottom: 8 }}>
+                          {cuts.find(c => c.id === selectedCutId)?.label}
+                        </div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 16 }}>
+                          <div>
+                            <label style={{ display: 'block', marginBottom: 4, color: '#888' }}>開始時間 (Start)</label>
+                            <input className="input-dark" readOnly value={cuts.find(c => c.id === selectedCutId)?.start.toFixed(2)} style={{ width: '100%', fontFamily: 'monospace' }} />
+                          </div>
+                          <div>
+                            <label style={{ display: 'block', marginBottom: 4, color: '#888' }}>結束時間 (End)</label>
+                            <input className="input-dark" readOnly value={cuts.find(c => c.id === selectedCutId)?.end.toFixed(2)} style={{ width: '100%', fontFamily: 'monospace' }} />
+                          </div>
+                        </div>
+
+                        {cuts.find(c => c.id === selectedCutId)?.trackId === 1 && (
+                          <div style={{ marginBottom: 16, borderTop: '1px solid #333', paddingTop: 16 }}>
+                            <div style={{ fontWeight: 'bold', marginBottom: 8 }}>文字設定</div>
+                            {/* Placeholder for future text styling */}
+                            <input className="input-dark" value={cuts.find(c => c.id === selectedCutId)?.label}
+                              onChange={(e) => {
+                                setCuts(prev => prev.map(c => c.id === selectedCutId ? { ...c, label: e.target.value } : c));
+                              }}
+                              style={{ width: '100%' }}
+                            />
+                          </div>
+                        )}
+
+                        <button className="btn-ghost-sm" style={{ width: '100%', color: '#ef4444', border: '1px solid #ef4444' }} onClick={handleDelete}>
+                          <Trash size={12} style={{ marginRight: 4 }} /> 刪除片段
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ textAlign: 'center', marginTop: 40, color: '#666', fontSize: 11 }}>
+                        未選取任何片段<br />(請點擊時間軸上的片段)
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 3. AI TOOLS TAB (Restored & Moved) */}
+                {leftPanelTab === 'ai' && (
+                  <div style={{ padding: 12 }}>
+
+                    {/* Silence Removal */}
+                    <div className="style-group" style={{ marginTop: 0 }}>
+                      <div style={{ marginBottom: 8, borderBottom: '1px solid #333', paddingBottom: 8 }}>
+                        <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#10b981', display: 'flex', alignItems: 'center' }}>
+                          <Zap size={14} style={{ marginRight: 6 }} /> 智能去氣口
+                        </div>
+                        <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>自動偵測並刪除影片中的靜音片段。</div>
+
+                        <div className="style-grid-2" style={{ marginBottom: 8 }}>
+                          <div>
+                            <label className="label-sm">噪音閥值 (dB)</label>
+                            <input type="number" className="input-xs" value={silenceThreshold} onChange={e => setSilenceThreshold(Number(e.target.value))} placeholder="-30" />
+                          </div>
+                          <div>
+                            <label className="label-sm">最短保留 (秒)</label>
+                            <input type="number" className="input-xs" value={silenceMinDuration} onChange={e => setSilenceMinDuration(Number(e.target.value))} placeholder="0.5" />
+                          </div>
+                        </div>
+                        <button className="btn-primary-sm" style={{ width: '100%' }} onClick={handleSilenceRemoval}>
+                          執行去氣口
+                        </button>
+                      </div>
+
+                      {/* AI Highlights */}
+                      <div style={{ marginTop: 16 }}>
+                        <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#818cf8', display: 'flex', alignItems: 'center' }}>
+                          <Film size={14} style={{ marginRight: 6 }} /> AI 精華生成
+                        </div>
+                        <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>使用 Gemini AI 分析並剪輯精華片段。</div>
+
+                        <div className="style-grid-2" style={{ marginBottom: 8 }}>
+                          <div>
+                            <label className="label-sm">片段數量</label>
+                            <input type="number" className="input-xs" value={highlightCount} onChange={e => setHighlightCount(Number(e.target.value))} />
+                          </div>
+                          <div>
+                            <label className="label-sm">單片時長 (秒)</label>
+                            <input type="number" className="input-xs" value={targetDuration} onChange={e => setTargetDuration(Number(e.target.value))} />
+                          </div>
+                        </div>
+                        <div style={{ marginBottom: 8 }}>
+                          <label className="label-sm">AI 提示詞</label>
+                          <textarea className="input-dark" rows={2} style={{ width: '100%', fontSize: 11 }}
+                            value={instruction}
+                            onChange={e => setInstruction(e.target.value)}
+                            placeholder="例如：找出最有趣的對話..."
+                          />
+                        </div>
+                        <div style={{ marginBottom: 8 }}>
+                          <label className="label-sm">API Key</label>
+                          <input type="password" className="input-dark" style={{ width: '100%' }}
+                            value={apiKey}
+                            onChange={e => setApiKey(e.target.value)}
+                            placeholder="Gemini API Key"
+                          />
+                        </div>
+
+                        <button className="btn-primary-sm" style={{ width: '100%' }} onClick={handleGeminiHighlights}>
+                          生成精華短片
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* 4. EFFECTS TAB */}
+                {leftPanelTab === 'effects' && (
+                  <div style={{ padding: 12, color: '#888', fontSize: 11 }}>
+                    <div style={{ marginBottom: 16, borderBottom: '1px solid #333', paddingBottom: 8 }}>
+                      <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#fff' }}>標題特效 (Titles)</div>
+                      <div className="effect-item" style={{ background: '#222', padding: 12, marginBottom: 8, cursor: 'pointer', borderRadius: 8, border: '1px solid #333', display: 'flex', alignItems: 'center', gap: 10 }} onClick={() => {
+                        const newCut: Cut = { id: Math.random().toString(36).substr(2, 9), start: currentTime, end: currentTime + 3, label: '新的文字標題', trackId: 1 };
+                        setCuts(prev => [...prev, newCut]);
+                      }}>
+                        <div style={{ width: 24, height: 24, background: 'var(--primary-color)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 'bold' }}>T</div>
+                        <div>
+                          <div style={{ color: '#eee', fontWeight: 600 }}>基礎文字標題</div>
+                          <div style={{ fontSize: 10, color: '#666' }}>點擊在當前時間增加文字圖層</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ opacity: 0.5 }}>
+                      <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#fff' }}>更多轉場即將推出...</div>
+                      <div style={{ background: '#1a1a1a', padding: 20, borderRadius: 8, textAlign: 'center', border: '1px dashed #333' }}>
+                        AI 智能轉場開發中
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
-              <div className="timeline-inline">
-                <div className="timeline-info">
-                  <span className="time-display">{new Date(currentTime * 1000).toISOString().substr(14, 5)} / {new Date(duration * 1000).toISOString().substr(14, 5)}</span>
-                  <div className="timeline-controls">
-                    <button className="btn-icon-sm" onClick={() => { if (videoRef.current) { if (isPlaying) videoRef.current.pause(); else videoRef.current.play(); setIsPlaying(!isPlaying); } }}>
-                      {isPlaying ? <Pause size={20} /> : <Play size={20} />}
-                    </button>
+            </div>
+
+            {/* Center: Program Monitor */}
+            <div className="panel-container" style={{ flex: 1 }}>
+              <div className="panel-header" style={{ justifyContent: 'space-between' }}>
+                <div className="panel-tab active">節目檢視: 序列 01</div>
+                {/* Layout Toggle */}
+                <div style={{ display: 'flex', gap: 4, marginRight: 8 }}>
+                  <button className={`btn-icon-sm ${!isVerticalMode ? 'active' : ''}`} onClick={() => setIsVerticalMode(false)} style={{ padding: 4, opacity: !isVerticalMode ? 1 : 0.5 }}>
+                    <Monitor size={14} />
+                  </button>
+                  <button className={`btn-icon-sm ${isVerticalMode ? 'active' : ''}`} onClick={() => setIsVerticalMode(true)} style={{ padding: 4, opacity: isVerticalMode ? 1 : 0.5 }}>
+                    <Smartphone size={14} />
+                  </button>
+                </div>
+              </div>
+              <div
+                className={`preview-area ${isVerticalMode ? 'vertical-mode' : 'horizontal-mode'}`}
+                style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', overflow: 'hidden', position: 'relative' }}
+              >
+                {(videoUrl || cuts.length > 0) && !(cuts.length > 0 && !videoUrl && cuts.some(c => c.trackId === 0)) ? (
+                  <div className="video-container" style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%' }}>
+                    {videoUrl ? (
+                      <video
+                        ref={videoRef}
+                        src={videoUrl}
+                        crossOrigin="anonymous"
+                        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                        onTimeUpdate={handleTimeUpdate}
+                        onLoadedMetadata={handleMetadata}
+                        onClick={togglePlay}
+                        onError={(e) => {
+                          console.error("Video element error:", e);
+                          if (videoUrl && videoUrl.startsWith('http') && videoFile) {
+                            console.log("♻️ Server video failed, falling back to local Blob URL...");
+                            setVideoUrl(URL.createObjectURL(videoFile));
+                          } else if (videoUrl) {
+                            alert("影片載入失敗！這可能是由於格式不支援 (例如 HEVC) 或檔案毀損。請嘗試將其轉換為標準 H.264 MP4 後再試。");
+                          }
+                        }}
+                      />
+                    ) : (
+                      // Text Only / Blank Mode
+                      <div style={{ width: '100%', height: '100%', background: '#000', display: 'flex', alignItems: 'center', justifyItems: 'center' }}>
+                        {/* Placeholder for size if needed, or just relying on container */}
+                      </div>
+                    )}
+
+                    {/* Text Overlays Layer */}
+                    <div className="text-overlay-renderer" style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'none', overflow: 'hidden' }}>
+                      {cuts.filter(c => {
+                        const track = videoTracks.find(t => t.id === c.trackId);
+                        return track && track.type === 'text' && currentTime >= c.start && currentTime < c.end;
+                      }).map(cut => (
+                        <div key={cut.id} className="text-element" style={{
+                          position: 'absolute',
+                          top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                          fontSize: 48, color: 'white', fontWeight: 'bold',
+                          textShadow: '0 2px 4px rgba(0,0,0,0.8)',
+                        }}>
+                          {cut.label}
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Overlay Controls */}
+                    {!isPlaying && !isProcessing && (
+                      <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', pointerEvents: 'none' }}>
+                        <div style={{ width: 64, height: 64, borderRadius: '50%', background: 'rgba(0,0,0,0.3)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', border: '1px solid rgba(255,255,255,0.1)' }}>
+                          <Play size={28} fill="white" stroke="none" />
+                        </div>
+                      </div>
+                    )}
+                    {isProcessing && (
+                      <div style={{ position: 'absolute', bottom: 20, right: 20, background: 'rgba(0,0,0,0.7)', padding: '8px 12px', borderRadius: 4, display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <Loader2 className="spin" size={14} color="#3ea6ff" />
+                        <span style={{ fontSize: 11, color: '#fff' }}>處理中...</span>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#666', padding: 20 }}>
+                    {isUploading ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
+                        <Loader2 className="spin" size={48} color="var(--primary-color)" />
+                        <div style={{ marginTop: 16, fontSize: 13 }}>檔案處理中...</div>
+                      </div>
+                    ) : (
+                      <div style={{ textAlign: 'center' }}>
+                        {cuts.length > 0 && cuts.some(c => c.trackId === 0) ? (
+                          <div style={{ background: 'rgba(255,50,50,0.1)', padding: 24, borderRadius: 12, border: '1px solid rgba(255,0,0,0.2)' }}>
+                            <div style={{ color: '#ff4444', fontWeight: 'bold', marginBottom: 12, fontSize: 20 }}>⚠️ 媒體連結中斷</div>
+                            <p style={{ color: '#aaa', fontSize: 13, marginBottom: 20 }}>目前專案中有剪輯進度，但預覽影片未載入。<br />請重新選取影片檔案以繼續編輯。</p>
+                            <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
+                              <label className="btn-primary-sm" style={{ cursor: 'pointer', background: '#d32f2f', border: 'none' }}>
+                                🚀 重新連結影片
+                                <input type="file" hidden onChange={handleFileUpload} accept="video/*" />
+                              </label>
+                              <button className="btn-ghost-sm" onClick={() => { if (confirm('要清空目前進度嗎？')) { setCuts([]); localStorage.removeItem('antigravity_cuts'); window.location.reload(); } }}>
+                                捨棄進度
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <>
+                            <div style={{ marginBottom: 20, opacity: 0.5 }}>
+                              <Upload size={64} strokeWidth={1} />
+                            </div>
+                            <label className="btn-primary-sm" style={{ padding: '10px 24px', fontSize: 14 }}>
+                              點擊匯入或拖曳影片至此
+                              <input type="file" hidden onChange={handleFileUpload} accept="video/*" />
+                            </label>
+                            <p style={{ marginTop: 12, fontSize: 11, color: '#555' }}>支援 MP4, MOV, WEBM 等常見格式</p>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+          </div>
+
+          {/* Bottom Section: Timeline */}
+          <div className="timeline-section" style={{ display: 'flex', flexDirection: 'column' }}>
+            <div className="timeline-toolbar">
+              <div className="timeline-tools-container">
+                {/* Edit Tools Group */}
+                <div className="tool-group">
+                  <div
+                    className={`tool-btn ${activeTool === 'select' ? 'active' : ''}`}
+                    title="選取工具 (V)"
+                    onClick={() => setActiveTool('select')}
+                  >
+                    <MousePointer2 size={18} />
+                  </div>
+                  <div
+                    className={`tool-btn ${activeTool === 'blade' ? 'active' : ''}`}
+                    title="切割工具 (K)"
+                    onClick={() => setActiveTool('blade')}
+                  >
+                    <Scissors size={18} />
+                  </div>
+                  {/* Hand Tool (Visual only for now) */}
+                  <div
+                    className={`tool-btn ${dragState.type === 'move' ? '' : ''}`} // Just visual toggle for now
+                    title="手形工具 (H) - 暫未開放"
+                    style={{ opacity: 0.5, cursor: 'not-allowed' }}
+                  >
+                    <Hand size={18} />
                   </div>
                 </div>
-                {videoUrl && <div ref={waveformRef} className="waveform-track" />}
-                <div
-                  ref={timelineRef}
-                  className="markers-track"
-                  onClick={handleTimelineClick}
-                  onMouseMove={handleCutDrag}
-                  onMouseUp={handleCutDragEnd}
-                  onMouseLeave={handleCutDragEnd}
+
+                {/* Actions Group */}
+                <div className="tool-group">
+                  <div
+                    className="tool-btn"
+                    title="分割目前片段 (Cmd+K)"
+                    onClick={handleSplit}
+                  >
+                    <SplitSquareHorizontal size={18} />
+                  </div>
+                  <div
+                    className="tool-btn danger"
+                    title="刪除選取片段 (Delete)"
+                    onClick={handleDelete}
+                  >
+                    <Trash size={18} />
+                  </div>
+                </div>
+
+                {/* Insert Group */}
+                <div className="tool-group">
+                  <div
+                    className={`tool-btn ${activeTool === 'text' ? 'active' : ''}`}
+                    title="新增文字 (T)"
+                    onClick={() => {
+                      setActiveTool('text');
+                      const newCut: Cut = {
+                        id: Math.random().toString(36).substr(2, 9),
+                        start: currentTime,
+                        end: currentTime + 3,
+                        label: '文字圖層',
+                        trackId: 1
+                      };
+                      setCuts(prev => [...prev, newCut]);
+                      setActiveTool('select');
+                    }}
+                  >
+                    <Type size={18} />
+                  </div>
+                  <div className="tool-btn" title="磁吸對齊 (S) - 開發中" style={{ opacity: 0.5 }}>
+                    <Magnet size={18} />
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Side: Time & Zoom */}
+              <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 16 }}>
+                <div className="time-counter">
+                  {new Date(currentTime * 1000).toISOString().substr(11, 8)}
+                  <span style={{ fontSize: 10, opacity: 0.5, marginLeft: 4 }}>
+                    {(Math.floor((currentTime % 1) * 30)).toString().padStart(2, '0')}
+                  </span>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <button className="btn-icon-sm" onClick={() => setZoomLevel(z => Math.max(z / 1.2, 1))}><ZoomOut size={14} /></button>
+                  <input type="range" min="1" max="100" value={zoomLevel} onChange={e => setZoomLevel(Number(e.target.value))} style={{ width: 80, accentColor: '#3ea6ff' }} />
+                  <button className="btn-icon-sm" onClick={() => setZoomLevel(z => Math.min(z * 1.2, 100))}><ZoomIn size={14} /></button>
+                </div>
+              </div>
+            </div>
+
+            {/* Timeline Main */}
+            <div className="timeline-main">
+              {/* Timeline Header toolbar */}
+              {/* Timeline Header toolbar (Removed Duplicate) */}
+
+              <div className="timeline-headers-container">
+                {/* Track Headers V1/A1 */}
+                <div className="track-headers">
+                  {/* V1 Header */}
+                  <div className={`track-header-item ${videoTracks[0].locked ? 'locked' : ''}`} style={{ opacity: videoTracks[0].visible ? 1 : 0.5 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ color: '#999', fontWeight: 'bold' }}>V1</span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <div
+                          onClick={() => toggleTrackVisibility(0)}
+                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[0].visible ? '#3ea6ff' : '#666', cursor: 'pointer' }}
+                        >
+                          {videoTracks[0].visible ? '👁️' : '🚫'}
+                        </div>
+                        <div
+                          onClick={() => toggleTrackLock(0)}
+                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[0].locked ? '#ef4444' : '#666', cursor: 'pointer' }}
+                        >
+                          {videoTracks[0].locked ? '🔒' : '🔓'}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 2 }}>
+                      <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3ea6ff', opacity: 0.5 }}></div>
+                    </div>
+                  </div>
+                  {/* A1 Header (Subtitles/Text Track) */}
+                  <div className={`track-header-item ${videoTracks[1].locked ? 'locked' : ''}`} style={{ opacity: videoTracks[1].visible ? 1 : 0.5 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ color: '#999', fontWeight: 'bold' }}>T1</span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        <div
+                          onClick={() => toggleTrackVisibility(1)}
+                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[1].visible ? '#10b981' : '#666', cursor: 'pointer' }}
+                        >
+                          {videoTracks[1].visible ? '👁️' : '🚫'}
+                        </div>
+                      </div>
+                    </div>
+                    {/* Fake Audio Meter visualization */}
+                    <div style={{ height: 4, width: '100%', background: '#333', marginTop: 8, borderRadius: 2, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: isPlaying ? '70%' : '10%', background: 'linear-gradient(90deg, #10b981, #f59e0b, #ef4444)', transition: 'width 0.1s' }}></div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Tracks Area */}
+                <div className="timeline-tracks-area"
+                  ref={timelineContainerRef}
                 >
-                  <div className="playhead" style={{ left: `${(currentTime / (duration || 1)) * 100}%` }} />
-                  {cuts.map(cut => (
+                  {/* Ruler */}
+                  <div className="timeline-ruler-container"
+                    style={{ width: Math.max(100, duration * zoomLevel) + 'px' }}
+                    onMouseDown={handleTimelineMouseDown}
+                  >
+                    {/* Scrubbing Playhead Head (The Triangle) inside ruler */}
+                    <div style={{
+                      position: 'absolute',
+                      left: currentTime * zoomLevel - 6,
+                      top: 12,
+                      width: 0, height: 0, borderLeft: '6px solid transparent', borderRight: '6px solid transparent', borderTop: '10px solid #3ea6ff',
+                      pointerEvents: 'none'
+                    }}></div>
+
+                    {/* Ruler Ticks */}
+                    {Array.from({ length: Math.ceil(duration) }).map((_, i) => (
+                      <React.Fragment key={i}>
+                        <div className="time-mark" style={{ left: i * zoomLevel }}></div>
+                        {i % 5 === 0 && <div className="time-text" style={{ left: i * zoomLevel + 4 }}>{i}s</div>}
+                      </React.Fragment>
+                    ))}
+                  </div>
+
+                  {/* Tracks Content */}
+                  <div className="tracks-content"
+                    style={{ width: Math.max(100, duration * zoomLevel) + 'px', cursor: dragState.type === 'scrub' ? 'ew-resize' : 'default' }}
+                    onMouseDown={handleTimelineMouseDown}
+                    ref={timelineRef}
+                  >
+                    {/* Playhead Line */}
+                    <div className="playhead-marker" style={{ left: currentTime * zoomLevel }}></div>
+
+                    {/* V1 Track */}
+                    <div className="track-lane">
+                      {cuts.map(cut => (
+                        <div
+                          key={cut.id}
+                          className={`clip-block ${selectedCutId === cut.id ? 'selected' : ''}`}
+                          style={{
+                            left: cut.start * zoomLevel,
+                            width: Math.max(10, (cut.end - cut.start) * zoomLevel) + 'px'
+                          }}
+                          onMouseDown={(e) => handleClipMouseDown(e, cut, 'move')}
+                        >
+                          {/* Drag Handles */}
+                          <div
+                            className="clip-handle-area"
+                            style={{ position: 'absolute', left: 0, width: 6, height: '100%', cursor: 'ew-resize', zIndex: 20, background: 'rgba(255,255,255,0.1)' }}
+                            onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-start')}
+                          />
+                          <div
+                            className="clip-handle-area"
+                            style={{ position: 'absolute', right: 0, width: 6, height: '100%', cursor: 'ew-resize', zIndex: 20, background: 'rgba(255,255,255,0.1)' }}
+                            onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-end')}
+                          />
+
+                          <span className="clip-label">{cut.label}</span>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* A1 Track (Mirror V1 for now) */}
+                    <div className="track-lane" style={{ background: '#1a1a1a' }}>
+                      {cuts.map(cut => (
+                        <div
+                          key={'audio-' + cut.id}
+                          className="clip-block"
+                          style={{
+                            left: cut.start * zoomLevel,
+                            width: Math.max(10, (cut.end - cut.start) * zoomLevel) + 'px',
+                            background: '#10b981', // Audio Green
+                            border: '1px solid #059669',
+                            opacity: 0.8
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      )}
+
+      {/* Export Modal */}
+      {showExportModal && (
+        <div className="modal-overlay" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+          <div className="export-modal-content" style={{ width: 420, background: '#121212', borderRadius: 20, border: '1px solid #333', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}>
+            <div style={{ padding: '20px 24px', borderBottom: '1px solid #222', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#1a1a1a' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ padding: 8, background: 'rgba(62,166,255,0.1)', borderRadius: 10 }}>
+                  <Download size={20} color="#3ea6ff" />
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#fff' }}>匯出影片</h3>
+                  <div style={{ fontSize: 11, color: '#666' }}>設定您的匯出偏好</div>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowExportModal(false)}
+                className="btn-icon-sm"
+                style={{ background: '#222', borderRadius: '50%', border: '1px solid #333' }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ padding: 24 }}>
+              {/* Resolution Toggle */}
+              <div style={{ marginBottom: 24 }}>
+                <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出解析度</label>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  {[{ id: '1080p', label: '1080p', desc: 'Full HD' }, { id: '720p', label: '720p', desc: 'HD Ready' }].map(res => (
                     <div
-                      key={cut.id}
-                      className={`cut-marker ${draggingCut?.id === cut.id ? 'dragging' : ''}`}
-                      style={{ left: `${(cut.start / (duration || 1)) * 100}%`, width: `${((cut.end - cut.start) / (duration || 1)) * 100}%` }}
+                      key={res.id}
+                      onClick={() => setExportResolution(res.id)}
+                      style={{
+                        flex: 1, padding: '12px 16px', borderRadius: 12, cursor: 'pointer', transition: 'all 0.2s',
+                        border: `1px solid ${exportResolution === res.id ? '#3ea6ff' : '#222'}`,
+                        background: exportResolution === res.id ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
+                        textAlign: 'center'
+                      }}
                     >
-                      <div
-                        className="cut-edge cut-edge-start"
-                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'start')}
-                      />
-                      <div
-                        className="cut-center"
-                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'move')}
-                      />
-                      <div
-                        className="cut-edge cut-edge-end"
-                        onMouseDown={(e) => handleCutDragStart(e, cut.id, 'end')}
-                      />
+                      <div style={{ fontSize: 14, fontWeight: 700, color: exportResolution === res.id ? '#3ea6ff' : '#eee' }}>{res.label}</div>
+                      <div style={{ fontSize: 10, color: exportResolution === res.id ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{res.desc}</div>
                     </div>
                   ))}
                 </div>
               </div>
-            </div>
-          </div>
 
-          {/* Section 2: Subtitle Preview (Middle) */}
-          <div className="panel-column">
-            <div className="preview-916-header">9:16 字幕位置預覽</div>
-            <div className="preview-916-panel">
-              <div
-                className="preview-916-canvas"
-                ref={previewCanvasRef} // Attach Observer
-                style={{ background: '#00ff00' }}
-                onMouseMove={(e) => {
-                  if (isDraggingSubtitle && e.buttons === 1) {
-                    const rect = e.currentTarget.getBoundingClientRect();
-                    // Calculate distance from bottom in visual pixels
-                    const visualBottom = rect.height - (e.clientY - rect.top);
-                    // Convert to 1080p reference pixels
-                    const truePixels = visualBottom / scaleRatio;
-                    // Clamp to reasonable range (0 to full height)
-                    setSubtitleMarginV(Math.max(0, Math.round(truePixels)));
-                  }
-                }}
-                onMouseUp={() => setIsDraggingSubtitle(false)}
-                onMouseLeave={() => setIsDraggingSubtitle(false)}
-              >
-                {showSafeArea && <div className="safe-area-guide" />}
-
-                {/* Subtitle Display Wrapper matches Remotion Layout */}
-                <div
-                  className="subtitle-draggable-wrapper"
-                  style={{
-                    position: 'absolute',
-                    top: 0,
-                    left: 0,
-                    width: '100%',
-                    height: '100%',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    justifyContent: 'flex-end', // Aligns items to bottom
-                    alignItems: (subtitleTextAlign === 'left' ? 'flex-start' : (subtitleTextAlign === 'right' ? 'flex-end' : 'center')),
-                    paddingBottom: `${subtitleMarginV * scaleRatio}px`, // Scaled pixel margin
-                    paddingLeft: '5%',
-                    paddingRight: '5%',
-                    boxSizing: 'border-box',
-                    cursor: 'ns-resize',
-                    pointerEvents: 'auto' // Allow dragging on empty space? Maybe better on text only
-                  }}
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    setIsDraggingSubtitle(true);
-                  }}
-                >
-                  <div style={{
-                    // Inner content box
-                    backgroundColor: subtitleBgEnabled ? `${subtitleBgColor}${Math.round((subtitleBgOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'transparent',
-                    padding: `${subtitleBgPaddingY * scaleRatio}px ${subtitleBgPaddingX * scaleRatio}px`,
-                    borderRadius: `${subtitleBgRadius * scaleRatio}px`,
-                    maxWidth: '100%',
-                    boxSizing: 'border-box',
-                    display: 'flex',
-                    flexDirection: 'column',
-                    alignItems: (subtitleTextAlign === 'left' ? 'flex-start' : (subtitleTextAlign === 'right' ? 'flex-end' : 'center')),
-                  }}>
-                    {/* Dual Layer Rendering Strategy for perfect quality */}
-                    <div style={{
-                      display: 'inline-grid',
-                      position: 'relative',
-                      textAlign: (subtitleTextAlign as any) || 'center',
-                      isolation: 'isolate',
-                    }}>
-                      {/* Common basic font styles */}
-                      {(() => {
-                        const currentSub = srtSubtitles.find(s => currentTime >= s.start && currentTime <= s.end);
-                        const displayText = currentSub ? currentSub.text : (previewText || '預覽文字內容');
-                        const finalText = wrapText(displayText, subtitleCharsPerLine);
-
-                        const baseTextStyle: React.CSSProperties = {
-                          fontFamily: subtitleFontName ? `"${subtitleFontName}", Arial, sans-serif` : 'Arial',
-                          fontSize: `${subtitleFontSize * scaleRatio}px`,
-                          fontWeight: subtitleFontWeight,
-                          fontStyle: subtitleFontStyle,
-                          textAlign: (subtitleTextAlign as any) || 'center',
-                          letterSpacing: `${subtitleLetterSpacing * scaleRatio}px`,
-                          lineHeight: subtitleLineHeight,
-                          textTransform: (subtitleTextTransform as any) || 'none',
-                          whiteSpace: 'pre-wrap',
-                          gridArea: '1 / 1',
-                          position: 'relative',
-                        };
-
-                        return (
-                          <>
-                            {/* Layer 1: The Outline & Shadow (Bottom) */}
-                            <span style={{
-                              ...baseTextStyle,
-                              WebkitTextStroke: (isSubtitleOutline && subtitleOutlineWidth > 0) ? `${(subtitleOutlineWidth * scaleRatio) * 2}px ${subtitleOutlineColor}` : '0px',
-                              textShadow: isSubtitleShadow ? `${subtitleShadowOffsetX * scaleRatio}px ${subtitleShadowOffsetY * scaleRatio}px ${subtitleShadowBlur * scaleRatio}px ${subtitleShadowColor}${Math.round((subtitleShadowOpacity / 100) * 255).toString(16).padStart(2, '0')}` : 'none',
-                              color: isTextGradient ? (isSubtitleOutline ? subtitleOutlineColor : 'transparent') : subtitleTextColor,
-                              zIndex: 0,
-                              paintOrder: 'stroke fill',
-                              strokeLinejoin: 'round',
-                              strokeLinecap: 'round',
-                            }}>
-                              {finalText}
-                            </span>
-
-                            {/* Layer 2: The Gradient Face (Top) */}
-                            {isTextGradient && (
-                              <span style={{
-                                ...baseTextStyle,
-                                zIndex: 10,
-                                backgroundImage: `linear-gradient(${textGradientDirection}, ${textGradientColors.join(', ')})`,
-                                WebkitBackgroundClip: 'text',
-                                WebkitTextFillColor: 'transparent',
-                                color: 'transparent',
-                                WebkitTextStroke: '0px transparent',
-                                textShadow: 'none',
-                              }}>
-                                {finalText}
-                              </span>
-                            )}
-                          </>
-                        );
-                      })()}
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div className="preview-controls">
-                <label className="checkbox-inline">
-                  <input type="checkbox" checked={showSafeArea} onChange={e => setShowSafeArea(e.target.checked)} />
-                  <span>顯示安全邊界</span>
-                </label>
-              </div>
-            </div>
-          </div>
-
-          {/* Section 3: Controls (Right) */}
-          <div className="panel-column">
-            <div className="panel-header-title" style={{ opacity: 0 }}>佔位符</div>
-            <aside className="controls-panel">
-              <div className="controls-scroll">
-                {/* 1. Project Section */}
-                <div className="controls-section">
-                  <div className="section-header">
-                    <Film size={16} className="icon-primary" />
-                    <span>專案與模型配置</span>
-                    <button onClick={() => setShowApiSettings(!showApiSettings)} className={`toggle-btn-sm ${apiKey ? 'active' : ''}`}>
-                      <Key size={14} />
-                    </button>
-                  </div>
-
-                  <AnimatePresence>
-                    {showApiSettings && (
-                      <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="settings-drawer">
-                        <div className="api-key-row">
-                          <Key size={14} className="icon-dim" />
-                          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="輸入 Gemini API Key..." className="api-input-inline" />
-                        </div>
-                        <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)} className="select-sm">
-                          <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
-                          <option value="gemini-3-pro-preview">Gemini 3 Pro</option>
-                          <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
-                          <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-                          <option value="gemini-1.5-flash">Gemini 1.5 Flash (Legacy)</option>
-                        </select>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-
-                  <div className="settings-row">
-                    <div className="setting-mini"><label>片段數量</label><input type="number" value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))} /></div>
-                    <div className="setting-mini"><label>長度(秒)</label><input type="number" value={targetDuration} onChange={(e) => setTargetDuration(Number(e.target.value))} /></div>
-                  </div>
-                  <textarea className="instruction-input-sm" placeholder="AI 剪輯指令 (例如：找出所有精彩笑點...)" value={instruction} onChange={(e) => setInstruction(e.target.value)} />
-                  <button
-                    onClick={handleMakeVideo}
-                    disabled={!videoFile || isProcessing}
-                    className={!videoFile ? "btn-disabled" : "btn-premium-ai"}
-                    style={{ width: '100%', marginTop: '16px' }}
+              {/* Advanced Options Grid */}
+              <div style={{ marginBottom: 24 }}>
+                <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>AI 加強與處理</label>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div
+                    onClick={() => setExportAutoCaption(!exportAutoCaption)}
+                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportAutoCaption ? 'rgba(16,185,129,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
                   >
-                    {isProcessing ? <><Loader2 className="spin" size={20} /> AI 分析中 (約 30s)...</> :
-                      !videoFile ? <><Video size={20} /> 請先上傳素材影片</> :
-                        <><Zap size={20} /> 開始 AI 自動分析片段</>}
-                  </button>
-                </div>
-
-                {/* 2. AI Enhancement Section */}
-                <div className="controls-section">
-                  <div className="section-header">
-                    <Languages size={16} className="icon-primary" />
-                    <span>AI 影像與音訊增強</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Zap size={16} color={exportAutoCaption ? '#10b981' : '#555'} />
+                      <div style={{ fontSize: 13, color: exportAutoCaption ? '#fff' : '#888' }}>自動生成 AI 字幕</div>
+                    </div>
+                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportAutoCaption ? '#10b981' : '#333', border: '1px solid #444' }} />
                   </div>
-                  <div className="ai-switches">
-                    <label className="checkbox-sm">
-                      <input type="checkbox" checked={isFaceTracking} onChange={e => setIsFaceTracking(e.target.checked)} />
-                      <span>人臉自動追蹤裁切 (9:16)</span>
-                    </label>
-                    {isFaceTracking && (
-                      <div className="mini-settings-panel">
-                        <div className="style-row-inline">
-                          <span className="style-label">縮放</span>
-                          <input type="number" step="0.1" value={trackZoom} onChange={e => setTrackZoom(parseFloat(e.target.value))} className="input-mini-sm" />
-                          <span className="style-label">信心</span>
-                          <input type="range" min="0.1" max="0.9" step="0.1" value={mpMinDetectionCon} onChange={e => setMpMinDetectionCon(parseFloat(e.target.value))} className="slider-sm" />
-                        </div>
-                      </div>
-                    )}
 
-                    <label className="checkbox-sm">
-                      <input type="checkbox" checked={isStudioSound} onChange={e => setIsStudioSound(e.target.checked)} />
-                      <span>DFN3 深度智慧降噪 (Beta)</span>
-                    </label>
-                    {isStudioSound && (
-                      <div className="mini-settings-panel">
-                        <div className="style-row-inline">
-                          <span className="style-label">強度</span>
-                          <input type="range" min="0" max="100" value={dfn3Strength} onChange={e => setDfn3Strength(parseInt(e.target.value))} className="slider-sm" />
-                          <span className="val-display">{dfn3Strength}%</span>
-                        </div>
-                      </div>
-                    )}
-
-                    <label className="checkbox-sm">
-                      <input type="checkbox" checked={isSilenceRemoval} onChange={e => setIsSilenceRemoval(e.target.checked)} />
-                      <span>智慧去氣口 & Jump Cuts (Beta)</span>
-                    </label>
-                    {isSilenceRemoval && (
-                      <div className="mini-settings-panel">
-                        <div className="style-row-inline" style={{ marginBottom: '8px' }}>
-                          <span className="style-label">靜音閾值(秒)</span>
-                          <input type="range" min="0.1" max="2.0" step="0.1" value={silenceThreshold} onChange={e => setSilenceThreshold(parseFloat(e.target.value))} className="slider-sm" />
-                          <span className="val-display">{silenceThreshold}s</span>
-                        </div>
-                        <label className="checkbox-inline">
-                          <input type="checkbox" checked={isJumpCutZoom} onChange={e => setIsJumpCutZoom(e.target.checked)} />
-                          <span>自動變焦</span>
-                        </label>
-                      </div>
-                    )}
-
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                      <label className="checkbox-sm">
-                        <input type="checkbox" checked={isAutoCaption} onChange={e => setIsAutoCaption(e.target.checked)} />
-                        <span>{srtSubtitles.length > 0 ? `已載入 SRT 字幕 (${srtSubtitles.length})` : 'AI 語音轉文字'}</span>
-                      </label>
+                  <div
+                    onClick={() => setExportFaceTracking(!exportFaceTracking)}
+                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportFaceTracking ? 'rgba(62,166,255,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Monitor size={16} color={exportFaceTracking ? '#3ea6ff' : '#555'} />
+                      <div style={{ fontSize: 13, color: exportFaceTracking ? '#fff' : '#888' }}>AI 人臉追蹤與自動取景</div>
                     </div>
-
-                    {isAutoCaption && (
-                      <div className="caption-sub-settings">
-                        {srtSubtitles.length === 0 && (
-                          <>
-                            <div className="style-row-inline" style={{ marginBottom: '8px' }}>
-                              <span className="style-label" style={{ minWidth: '60px' }}>轉錄語言</span>
-                              <select value={whisperLanguage} onChange={e => setWhisperLanguage(e.target.value)} className="select-xs" style={{ flex: 1 }}>
-                                <option value="zh">中文</option>
-                                <option value="en">英文</option>
-                                <option value="ja">日文</option>
-                                <option value="auto">自動偵測</option>
-                              </select>
-                            </div>
-
-                            {/* Advanced Whisper Settings */}
-                            <div className="whisper-adv-panel">
-                              <div className="section-subtitle" style={{ fontSize: '11px', color: 'rgba(255,255,255,0.4)', marginBottom: '12px', fontWeight: '800', textTransform: 'uppercase', letterSpacing: '1px' }}>AI 轉錄引擎調優</div>
-
-                              <div className="whisper-row">
-                                <span className="whisper-label">模型大小</span>
-                                <select value={whisperModelSize} onChange={e => setWhisperModelSize(e.target.value)} className="select-xs" style={{ flex: 1 }}>
-                                  <option value="turbo">Turbo</option>
-                                  <option value="large-v3">Large-v3</option>
-                                  <option value="medium">Medium</option>
-                                  <option value="small">Small</option>
-                                  <option value="base">Base</option>
-                                </select>
-                              </div>
-
-                              <div className="whisper-row">
-                                <span className="whisper-label">搜尋強度</span>
-                                <input type="range" min="1" max="10" value={whisperBeamSize} onChange={e => setWhisperBeamSize(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                <span className="val-display">{whisperBeamSize}</span>
-                              </div>
-
-                              <div className="whisper-row">
-                                <span className="whisper-label">轉錄切分字數</span>
-                                <input type="number" min="4" max="40" value={whisperCharsPerLine} onChange={e => setWhisperCharsPerLine(parseInt(e.target.value))} className="input-mini-xs" />
-                                <input type="range" min="4" max="40" value={whisperCharsPerLine} onChange={e => setWhisperCharsPerLine(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                              </div>
-
-                              <div className="whisper-row">
-                                <span className="whisper-label">隨機性</span>
-                                <input type="range" min="0" max="1" step="0.1" value={whisperTemperature} onChange={e => setWhisperTemperature(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                <span className="val-display">{whisperTemperature.toFixed(1)}</span>
-                              </div>
-
-                              <div className="whisper-row">
-                                <span className="whisper-label">靜音過濾</span>
-                                <input type="range" min="0" max="1" step="0.1" value={whisperNoSpeechThreshold} onChange={e => setWhisperNoSpeechThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                <span className="val-display">{whisperNoSpeechThreshold.toFixed(1)}</span>
-                              </div>
-
-                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginTop: '4px' }}>
-                                <label className="checkbox-inline">
-                                  <input type="checkbox" checked={whisperRemovePunctuation} onChange={e => setWhisperRemovePunctuation(e.target.checked)} />
-                                  <span className="label-xs">移除標點</span>
-                                </label>
-                                <label className="checkbox-inline">
-                                  <input type="checkbox" checked={whisperConditionOnPreviousText} onChange={e => setWhisperConditionOnPreviousText(e.target.checked)} />
-                                  <span className="label-xs">語意關聯</span>
-                                </label>
-                              </div>
-
-                              {/* Expert Toggle */}
-                              <button
-                                className={`expert-toggle-btn ${showExpertWhisper ? 'active' : ''}`}
-                                onClick={() => setShowExpertWhisper(!showExpertWhisper)}
-                              >
-                                <span>{showExpertWhisper ? '收起開發者設定' : '開啟專家級調優'}</span>
-                                <span className="chevron">▼</span>
-                              </button>
-
-                              {showExpertWhisper && (
-                                <div className="whisper-expert-container">
-                                  <div className="whisper-row">
-                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Best of</span>
-                                    <input type="number" value={whisperBestOf} onChange={e => setWhisperBestOf(parseInt(e.target.value))} className="input-mini-xs" />
-                                    <input type="range" min="1" max="10" value={whisperBestOf} onChange={e => setWhisperBestOf(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                  </div>
-                                  <div className="whisper-row">
-                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Patience</span>
-                                    <input type="number" step="0.1" value={whisperPatience} onChange={e => setWhisperPatience(parseFloat(e.target.value))} className="input-mini-xs" />
-                                    <input type="range" min="0" max="3" step="0.1" value={whisperPatience} onChange={e => setWhisperPatience(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                  </div>
-                                  <div className="whisper-row">
-                                    <span className="whisper-label" style={{ minWidth: '70px' }}>壓縮閾值</span>
-                                    <input type="number" step="0.1" value={whisperCompressionRatioThreshold} onChange={e => setWhisperCompressionRatioThreshold(parseFloat(e.target.value))} className="input-mini-xs" />
-                                    <input type="range" min="1" max="4" step="0.1" value={whisperCompressionRatioThreshold} onChange={e => setWhisperCompressionRatioThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                  </div>
-                                  <div className="whisper-row">
-                                    <span className="whisper-label" style={{ minWidth: '70px' }}>Logprob</span>
-                                    <input type="number" step="0.1" value={whisperLogprobThreshold} onChange={e => setWhisperLogprobThreshold(parseFloat(e.target.value))} className="input-mini-xs" />
-                                    <input type="range" min="-3" max="0" step="0.1" value={whisperLogprobThreshold} onChange={e => setWhisperLogprobThreshold(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                                  </div>
-                                  <label className="checkbox-inline">
-                                    <input type="checkbox" checked={whisperFp16} onChange={e => setWhisperFp16(e.target.checked)} />
-                                    <span className="label-xs">FP16 硬體加速</span>
-                                  </label>
-                                </div>
-                              )}
-                            </div>
-                          </>
-                        )}
-                        {srtSubtitles.length !== 0 && (
-                          <div style={{ marginBottom: '8px' }}>
-                            <button onClick={() => setSrtSubtitles([])} className="btn-ghost-xs" style={{ color: '#ef4444' }}>移除已載入的 SRT</button>
-                          </div>
-                        )}
-
-                        <div style={{ display: 'flex', gap: '20px', marginTop: '10px' }}>
-                          <label className="checkbox-inline">
-                            <input type="checkbox" checked={isTranslate} onChange={e => setIsTranslate(e.target.checked)} />
-                            <span>簡轉繁優化</span>
-                          </label>
-                          <label className="checkbox-inline">
-                            <input type="checkbox" checked={isBurnCaptions} onChange={e => setIsBurnCaptions(e.target.checked)} />
-                            <span>燒錄至影片</span>
-                          </label>
-                        </div>
-                      </div>
-                    )}
+                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportFaceTracking ? '#3ea6ff' : '#333', border: '1px solid #444' }} />
                   </div>
-                </div>
 
-                {/* 3. Subtitle Styles (Advanced) - Redesigned for Pro Layout */}
-                {(isBurnCaptions || isAutoCaption) && (
-                  <div className="controls-section">
-                    <div className="section-header"><Wand2 size={16} className="icon-primary" /><span>字幕視覺設計</span></div>
-
-                    <div className="style-group">
-                      <label className="group-label">文字樣式</label>
-
-                      <div className="style-item" style={{ marginBottom: '10px' }}>
-                        <select
-                          value={subtitleFontName}
-                          onChange={e => setSubtitleFontName(e.target.value)}
-                          className="select-sm"
-                          style={{ width: '100%' }}
-                        >
-                          {fontList.map(f => <option key={f} value={f}>{f}</option>)}
-                        </select>
-                      </div>
-
-                      <div className="style-item">
-                        <div className="style-row-inline">
-                          <span className="style-label" style={{ minWidth: '30px' }}>大小</span>
-                          <input type="range" min="12" max="150" value={subtitleFontSize} onChange={e => setSubtitleFontSize(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                          <span className="val-display" style={{ minWidth: '40px' }}>{subtitleFontSize}px</span>
-                        </div>
-                      </div>
-
-                      <div className="style-grid-2" style={{ marginTop: '10px' }}>
-                        <div className="mini-control">
-                          <label className="label-xs">粗細</label>
-                          <select value={subtitleFontWeight} onChange={e => setSubtitleFontWeight(e.target.value)} className="select-xs">
-                            <option value="normal">Normal</option>
-                            <option value="bold">Bold</option>
-                            <option value="500">Medium</option>
-                            <option value="900">Black</option>
-                          </select>
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">斜體</label>
-                          <select value={subtitleFontStyle} onChange={e => setSubtitleFontStyle(e.target.value)} className="select-xs">
-                            <option value="normal">正體</option>
-                            <option value="italic">斜體</option>
-                          </select>
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">轉換</label>
-                          <select value={subtitleTextTransform} onChange={e => setSubtitleTextTransform(e.target.value)} className="select-xs">
-                            <option value="none">正常</option>
-                            <option value="uppercase">大寫</option>
-                            <option value="lowercase">小寫</option>
-                            <option value="capitalize">首字大寫</option>
-                          </select>
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">對齊</label>
-                          <select value={subtitleTextAlign} onChange={e => setSubtitleTextAlign(e.target.value)} className="select-xs">
-                            <option value="center">置中</option>
-                            <option value="left">靠左</option>
-                            <option value="right">靠右</option>
-                          </select>
-                        </div>
-                      </div>
+                  <div
+                    onClick={() => setExportStudioSound(!exportStudioSound)}
+                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportStudioSound ? 'rgba(235,100,255,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Smartphone size={16} color={exportStudioSound ? '#eb64ff' : '#555'} />
+                      <div style={{ fontSize: 13, color: exportStudioSound ? '#fff' : '#888' }}>AI 降噪與錄音室音質</div>
                     </div>
-
-                    <div className="style-group">
-                      <label className="group-label">間隔與佈局</label>
-
-                      <div className="style-grid-3">
-                        <div className="mini-control">
-                          <label className="label-xs">行高</label>
-                          <input type="range" min="0.8" max="2.5" step="0.1" value={subtitleLineHeight} onChange={e => setSubtitleLineHeight(parseFloat(e.target.value))} className="slider-xs" />
-                          <input type="number" step="0.1" value={subtitleLineHeight} onChange={e => setSubtitleLineHeight(parseFloat(e.target.value))} className="input-xs" />
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">字距</label>
-                          <input type="range" min="-5" max="20" step="0.5" value={subtitleLetterSpacing} onChange={e => setSubtitleLetterSpacing(parseFloat(e.target.value))} className="slider-xs" />
-                          <input type="number" step="0.5" value={subtitleLetterSpacing} onChange={e => setSubtitleLetterSpacing(parseFloat(e.target.value))} className="input-xs" />
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">視覺分行字數</label>
-                          <input type="range" min="4" max="40" step="1" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="slider-xs" />
-                          <input type="number" value={subtitleCharsPerLine} onChange={e => setSubtitleCharsPerLine(parseInt(e.target.value))} className="input-xs" />
-                        </div>
-                      </div>
-
-                      <div className="style-row-inline" style={{ marginTop: '12px' }}>
-                        <span className="label-xs" style={{ minWidth: '50px' }}>垂直邊距</span>
-                        <input type="range" min="0" max="600" value={subtitleMarginV} onChange={e => setSubtitleMarginV(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                        <span className="val-display" style={{ minWidth: '30px' }}>{subtitleMarginV}</span>
-                      </div>
-
-                      <div className="style-row-inline" style={{ marginTop: '12px' }}>
-                        <span className="label-xs" style={{ minWidth: '50px' }}>出現動畫</span>
-                        <select
-                          value={subtitleAnimation}
-                          onChange={e => setSubtitleAnimation(e.target.value as any)}
-                          className="select-xs"
-                          style={{ flex: 1 }}
-                        >
-                          <option value="none">無 (Static)</option>
-                          <option value="pop">放大彈出 (Pop)</option>
-                          <option value="fade">淡入 (Fade)</option>
-                          <option value="slide-up">向上滑入 (Slide Up)</option>
-                        </select>
-                      </div>
-
-                      {subtitleAnimation !== 'none' && (
-                        <div className="style-col-flex" style={{ marginTop: '8px', gap: '8px', paddingLeft: '8px', borderLeft: '2px solid rgba(255,255,255,0.1)' }}>
-                          <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
-                            <span className="label-xs">動畫時長</span>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, marginLeft: '12px' }}>
-                              <input type="range" min="5" max="60" value={subtitleAnimationDuration} onChange={e => setSubtitleAnimationDuration(parseInt(e.target.value))} className="slider-xs" style={{ flex: 1 }} />
-                              <span className="val-display" style={{ minWidth: '24px' }}>{subtitleAnimationDuration}</span>
-                            </div>
-                          </div>
-                          <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
-                            <span className="label-xs">彈力強度</span>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, marginLeft: '12px' }}>
-                              <input type="range" min="0.1" max="2.0" step="0.1" value={subtitleAnimationSpring} onChange={e => setSubtitleAnimationSpring(parseFloat(e.target.value))} className="slider-xs" style={{ flex: 1 }} />
-                              <span className="val-display" style={{ minWidth: '24px' }}>{subtitleAnimationSpring.toFixed(1)}</span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                    <div className="style-item" style={{ marginTop: '10px' }}>
-                      <div className="input-group-xs">
-                        <span className="label-xs">預覽文字</span>
-                        <input type="text" value={previewText} onChange={e => setPreviewText(e.target.value)} className="input-xs" style={{ flex: 1, textAlign: 'left' }} placeholder="輸入預覽字樣..." />
-                      </div>
-                    </div>
-
-                    <div className="style-group">
-                      <label className="group-label">外觀與特效</label>
-
-                      <div className="tab-switch" style={{ marginBottom: '10px' }}>
-                        <button className={!isTextGradient ? 'active' : ''} onClick={() => setIsTextGradient(false)}>單色</button>
-                        <button className={isTextGradient ? 'active' : ''} onClick={() => setIsTextGradient(true)}>漸層</button>
-                      </div>
-
-                      {!isTextGradient ? (
-                        <div className="style-row-inline">
-                          <input type="color" value={subtitleTextColor} onChange={e => setSubtitleTextColor(e.target.value)} className="color-full" style={{ height: '32px' }} />
-                        </div>
-                      ) : (
-                        <div className="style-col-flex">
-                          <div className="style-grid-2">
-                            <input type="color" value={textGradientColors[0]} onChange={e => handleGradientColorChange(0, e.target.value)} className="color-full" />
-                            <input type="color" value={textGradientColors[1]} onChange={e => handleGradientColorChange(1, e.target.value)} className="color-full" />
-                          </div>
-                          <select value={textGradientDirection} onChange={e => setTextGradientDirection(e.target.value)} className="select-xs" style={{ width: '100%', marginTop: '4px' }}>
-                            <option value="to bottom">垂直漸層 (↓)</option>
-                            <option value="to right">水平漸層 (→)</option>
-                            <option value="to bottom right">對角漸層 (↘)</option>
-                            <option value="to top">反向垂直 (↑)</option>
-                          </select>
-                        </div>
-                      )}
-
-                      <div className="style-grid-3" style={{ marginTop: '10px' }}>
-                        <div className="mini-control" style={{ gridColumn: 'span 2' }}>
-                          <label className="checkbox-inline">
-                            <input type="checkbox" checked={isSubtitleOutline} onChange={e => setIsSubtitleOutline(e.target.checked)} />
-                            <span className="label-xs">描邊效果</span>
-                          </label>
-                          <input type="range" min="0" max="30" step="0.5" value={subtitleOutlineWidth} onChange={e => setSubtitleOutlineWidth(parseFloat(e.target.value))} className="slider-sm" disabled={!isSubtitleOutline} />
-                        </div>
-                        <div className="mini-control">
-                          <label className="label-xs">顏色</label>
-                          <input type="color" value={subtitleOutlineColor} onChange={e => setSubtitleOutlineColor(e.target.value)} className="color-sm" style={{ width: '100%' }} disabled={!isSubtitleOutline} />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="style-group">
-                      <label className="checkbox-inline" style={{ marginBottom: '14px', display: 'flex' }}>
-                        <input type="checkbox" checked={isSubtitleShadow} onChange={e => setIsSubtitleShadow(e.target.checked)} />
-                        <span className="label-xs" style={{ fontWeight: 600, color: '#fafafa' }}>陰影 Shadow</span>
-                      </label>
-                      {isSubtitleShadow && (
-                        <div style={{ paddingLeft: '4px' }}>
-                          <div className="style-row-inline" style={{ marginBottom: '16px' }}>
-                            <input type="color" value={subtitleShadowColor} onChange={e => setSubtitleShadowColor(e.target.value)} className="color-sm" style={{ width: '36px', height: '36px' }} />
-                            <div className="style-col-flex" style={{ flex: 1, marginLeft: '12px' }}>
-                              <div className="style-row-inline" style={{ justifyContent: 'space-between', marginBottom: '4px' }}>
-                                <span className="label-xs">模糊</span>
-                                <input type="range" min="0" max="30" value={subtitleShadowBlur} onChange={e => setSubtitleShadowBlur(parseFloat(e.target.value))} className="slider-sm" style={{ width: '80px' }} />
-                              </div>
-                              <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
-                                <span className="label-xs">不透</span>
-                                <input type="range" min="0" max="100" value={subtitleShadowOpacity} onChange={e => setSubtitleShadowOpacity(parseInt(e.target.value))} className="slider-sm" style={{ width: '80px' }} />
-                              </div>
-                            </div>
-                          </div>
-                          <div className="style-col-flex" style={{ marginTop: '14px', gap: '8px' }}>
-                            <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
-                              <span className="label-xs">Shadow X</span>
-                              <input type="range" min="-50" max="50" value={subtitleShadowOffsetX} onChange={e => setSubtitleShadowOffsetX(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1, margin: '0 8px' }} />
-                              <input type="number" value={subtitleShadowOffsetX} onChange={e => setSubtitleShadowOffsetX(parseFloat(e.target.value))} className="input-xs" style={{ width: '36px' }} />
-                            </div>
-                            <div className="style-row-inline" style={{ justifyContent: 'space-between' }}>
-                              <span className="label-xs">Shadow Y</span>
-                              <input type="range" min="-50" max="50" value={subtitleShadowOffsetY} onChange={e => setSubtitleShadowOffsetY(parseFloat(e.target.value))} className="slider-sm" style={{ flex: 1, margin: '0 8px' }} />
-                              <input type="number" value={subtitleShadowOffsetY} onChange={e => setSubtitleShadowOffsetY(parseFloat(e.target.value))} className="input-xs" style={{ width: '36px' }} />
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="style-group">
-                      <label className="checkbox-sm">
-                        <input type="checkbox" checked={subtitleBgEnabled} onChange={e => setSubtitleBgEnabled(e.target.checked)} />
-                        <span>字幕背景框</span>
-                      </label>
-                      {subtitleBgEnabled && (
-                        <div className="nested-panel" style={{ marginTop: '10px' }}>
-                          <div className="style-row-inline" style={{ marginBottom: '8px', gap: '8px' }}>
-                            <input type="color" value={subtitleBgColor} onChange={e => setSubtitleBgColor(e.target.value)} className="color-sm" style={{ width: '32px' }} />
-                            <span className="label-xs">不透</span>
-                            <input type="range" min="0" max="100" value={subtitleBgOpacity} onChange={e => setSubtitleBgOpacity(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                          </div>
-                          <div className="style-col-flex" style={{ gap: '10px' }}>
-                            <div className="slider-row">
-                              <label className="label-xs" style={{ minWidth: '40px' }}>Pad X</label>
-                              <input type="range" min="0" max="100" value={subtitleBgPaddingX} onChange={e => setSubtitleBgPaddingX(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                              <input type="number" value={subtitleBgPaddingX} onChange={e => setSubtitleBgPaddingX(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
-                            </div>
-                            <div className="slider-row">
-                              <label className="label-xs" style={{ minWidth: '40px' }}>Pad Y</label>
-                              <input type="range" min="0" max="100" value={subtitleBgPaddingY} onChange={e => setSubtitleBgPaddingY(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                              <input type="number" value={subtitleBgPaddingY} onChange={e => setSubtitleBgPaddingY(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
-                            </div>
-                            <div className="slider-row">
-                              <label className="label-xs" style={{ minWidth: '40px' }}>圓角</label>
-                              <input type="range" min="0" max="50" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value))} className="slider-sm" style={{ flex: 1 }} />
-                              <input type="number" value={subtitleBgRadius} onChange={e => setSubtitleBgRadius(parseInt(e.target.value))} className="input-xs" style={{ width: '40px' }} />
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportStudioSound ? '#eb64ff' : '#333', border: '1px solid #444' }} />
                   </div>
-                )}
 
-                {/* 4. Cuts List */}
-                <div className="controls-section no-border">
-                  <div className="section-header"><Scissors size={16} className="icon-primary" /><span>自動裁切片段清單</span></div>
-                  <div className="cuts-list">
-                    {cuts.length === 0 ? <div className="empty-state">尚未分析片段</div> : cuts.map(cut => (
-                      <div key={cut.id} className="cut-card">
-                        <div className="cut-header">
-                          <input className="cut-label-input" value={cut.label} onChange={(e) => updateCutLabel(cut.id, e.target.value)} />
-                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                            <span className="cut-duration-badge">{(cut.end - cut.start).toFixed(1)}s</span>
-                            <button onClick={() => setCuts(cuts.filter(c => c.id !== cut.id))} className="btn-delete"><Trash size={14} /></button>
-                          </div>
-                        </div>
-                        <div className="cut-time-inputs">
-                          <div className="time-input-group">
-                            <label>開始</label>
-                            <input
-                              type="text"
-                              value={formatTimestamp(cut.start)}
-                              readOnly
-                              className="time-input-readonly"
-                              style={{ width: '70px', textAlign: 'center', background: 'transparent', border: 'none', color: '#4ade80', fontFamily: 'monospace' }}
-                            />
-                          </div>
-                          <div className="time-input-group">
-                            <label>結束</label>
-                            <input
-                              type="text"
-                              value={formatTimestamp(cut.end)}
-                              readOnly
-                              className="time-input-readonly"
-                              style={{ width: '70px', textAlign: 'center', background: 'transparent', border: 'none', color: '#4ade80', fontFamily: 'monospace' }}
-                            />
-                          </div>
-                        </div>
-                        {/* Time Range Sliders */}
-                        < div className="cut-slider-row" >
-                          <label>開始</label>
-                          <input
-                            type="range"
-                            min="0"
-                            max={duration}
-                            step="0.1"
-                            value={cut.start}
-                            onChange={(e) => updateCutTime(cut.id, 'start', parseFloat(e.target.value))}
-                            className="cut-slider"
-                          />
-                        </div>
-                        <div className="cut-slider-row">
-                          <label>結束</label>
-                          <input
-                            type="range"
-                            min="0"
-                            max={duration}
-                            step="0.1"
-                            value={cut.end}
-                            onChange={(e) => updateCutTime(cut.id, 'end', parseFloat(e.target.value))}
-                            className="cut-slider"
-                          />
-                        </div>
-                        <div className="cut-actions">
-                          <button className="btn-seek" onClick={() => seekTo(cut.start)}>
-                            <Play size={12} /> 跳轉開始
-                          </button>
-                          <button className="btn-preview-xs" onClick={() => handlePreview(cut)}>
-                            <Play size={12} /> 預覽
-                          </button>
-                          <button className="btn-preview-xs" style={{ background: 'rgba(16, 185, 129, 0.1)', borderColor: 'rgba(16, 185, 129, 0.3)' }} onClick={() => handleExport(cut)}>
-                            <Download size={12} /> 匯出此段
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                  <div
+                    onClick={() => setExportMergeClips(!exportMergeClips)}
+                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportMergeClips ? 'rgba(255,165,0,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <Film size={16} color={exportMergeClips ? '#ffa500' : '#555'} />
+                      <div style={{ fontSize: 13, color: exportMergeClips ? '#fff' : '#888' }}>合併為單一影片</div>
+                    </div>
+                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportMergeClips ? '#ffa500' : '#333', border: '1px solid #444' }} />
                   </div>
                 </div>
               </div>
 
-              {/* 5. Output Settings & Export */}
-              <div className="controls-footer">
-                <div className="output-settings">
-                  <div className="output-row">
-                    <label>畫質</label>
-                    <select value={outputQuality} onChange={e => setOutputQuality(e.target.value)} className="select-xs">
-                      <option value="high">高畫質 (20Mbps)</option>
-                      <option value="medium">中畫質 (8Mbps)</option>
-                      <option value="low">低畫質 (4Mbps)</option>
-                    </select>
-                  </div>
-                  <div className="output-row">
-                    <label>解析度 (9:16)</label>
-                    <select value={outputResolution} onChange={e => setOutputResolution(e.target.value)} className="select-xs">
-                      <option value="1080x1920">1080×1920</option>
-                      <option value="720x1280">720×1280</option>
-                      <option value="original">原始比例</option>
-                    </select>
-                  </div>
-                </div>
-                <button onClick={() => handleExport()} disabled={cuts.length === 0 || isExporting} className="btn-export-main">
-                  {isExporting ? <Loader2 className="spin" size={18} /> : <><Download size={18} /> 匯出全部片段</>}
-                </button>
-              </div>
-            </aside>
-          </div>
-        </div >
-      </main >
-
-      {/* Bottom Progress Bar */}
-      {
-        (isExporting || isPreviewLoading) && (
-          <div className="progress-bar-bottom">
-            <div className="progress-bar-fill" style={{ width: `${isPreviewLoading ? previewProgress : exportProgress}%` }} />
-            <div className="progress-bar-content">
-              <Loader2 className="spin" size={16} />
-              <span>{isPreviewLoading ? previewMessage : (systemStatus.message || '匯出處理中')}</span>
-              <span className="progress-percent">{Math.round(isPreviewLoading ? previewProgress : exportProgress)}%</span>
-            </div>
-            {/* Cancel Button (Only for export for now) */}
-            {!isPreviewLoading && (
-              <button className="btn-icon-xs" style={{ marginLeft: '10px', background: 'rgba(255,255,255,0.2)' }} onClick={() => window.location.reload()}>
-                <X size={14} />
+              <button
+                className="btn-primary"
+                onClick={handleExportVideo}
+                disabled={isProcessing}
+                style={{
+                  width: '100%', height: 48, fontSize: 15, fontWeight: 700, borderRadius: 14,
+                  background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)',
+                  boxShadow: '0 8px 20px -5px rgba(0,122,255,0.4)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10
+                }}
+              >
+                {isProcessing ? <><Loader2 className="spin" size={18} /> 處理中...</> : <><Download size={18} /> 開始匯出成品</>}
               </button>
-            )}
+
+              <div style={{ marginTop: 16, textAlign: 'center', fontSize: 11, color: '#444' }}>
+                處理時間取決於影片長度與選取的 AI 功能
+              </div>
+            </div>
           </div>
-        )
-      }
-    </div >
+        </div>
+      )}
+    </div>
   );
 }
-
 
 export default App;

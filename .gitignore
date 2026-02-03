@@ -31,3 +31,10 @@ local_bin/
 public/render_source_*
 temp_props_*.json
 local_bin/ffmpeg
+node_modules
+dist
+build
+
+# Python
+__pycache__/
+*.pyc

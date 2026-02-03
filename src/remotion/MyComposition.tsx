@@ -168,13 +168,23 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
     }];
 
     // Calculate layout for segments in the timeline
-    let accumulatingFrame = 0;
-    const layoutSegments = segments.map(seg => {
-        const startFrame = accumulatingFrame;
+    const layoutSegments = segments.reduce((acc, seg) => {
+        const prevEnd = acc.length > 0 ? acc[acc.length - 1].startFrame + acc[acc.length - 1].durationFrames : 0;
         const durationFrames = Math.floor(seg.duration * FPS);
-        accumulatingFrame += durationFrames;
-        return { ...seg, startFrame, durationFrames };
-    });
+
+        acc.push({
+            ...seg,
+            startFrame: prevEnd,
+            durationFrames: durationFrames
+        });
+        return acc;
+    }, [] as Array<{
+        startInVideo: number;
+        duration: number;
+        zoom: number;
+        startFrame: number;
+        durationFrames: number
+    }>);
 
     return (
         <AbsoluteFill style={{ backgroundColor: '#000' }}>

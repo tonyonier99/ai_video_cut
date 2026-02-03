@@ -1849,6 +1849,165 @@ def detect_face_clip(
         print(f"❌ Preview Detect Error: {e}")
         return {"faceCenterX": 0.5}
 
+@app.post("/upload-proxy")
+async def upload_proxy_endpoint(file: UploadFile = File(...)):
+    try:
+        # 1. Save Original
+        safe_filename = f"{int(time.time())}_{file.filename}"
+        original_path = os.path.join(UPLOAD_DIR, safe_filename)
+        
+        with open(original_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        filename_lower = safe_filename.lower()
+        needs_transcode = not filename_lower.endswith('.mp4') and not filename_lower.endswith('.webm')
+        
+        final_filename = safe_filename
+        final_path = original_path
+        
+        # 2. Transcode if needed (e.g. MOV, MKV -> MP4)
+        if needs_transcode:
+            print(f"🔄 Transcoding {safe_filename} to proxy MP4...")
+            proxy_filename = f"proxy_{safe_filename}.mp4"
+            proxy_path = os.path.join(UPLOAD_DIR, proxy_filename)
+            
+            # Simple FFmpeg command: Fast preset, crf 23, aac audio
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", original_path,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                proxy_path
+            ]
+            
+            subprocess.run(cmd, check=True)
+            
+            final_filename = proxy_filename
+            final_path = proxy_path
+            print(f"✅ Transcode complete: {proxy_path}")
+            
+        # Return URL
+        # We assume server runs on localhost:8000
+        return {
+            "url": f"http://localhost:8000/uploads/{final_filename}",
+            "filename": file.filename,
+            "original_path": os.path.abspath(original_path), # For XML export reference
+            "proxy_path": os.path.abspath(final_path),
+            "is_proxy": needs_transcode
+        }
+    except Exception as e:
+        print(f"❌ Upload/Transcode failed: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+def detect_silence_ffmpeg(input_path, noise_db=-30, duration=0.5):
+    """
+    Detects SILENCE using ffmpeg silencedetect filter.
+    Returns list of SILENT segments: [(start, end), ...]
+    """
+    cmd = [
+        "ffmpeg", "-i", input_path,
+        "-af", f"silencedetect=noise={noise_db}dB:d={duration}",
+        "-f", "null", "-"
+    ]
+    
+    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
+    output = result.stderr
+    
+    silence_starts = []
+    silence_ends = []
+    
+    for line in output.splitlines():
+        if "silence_start" in line:
+            # [silencedetect @ ...] silence_start: 12.345
+            try:
+                t = float(line.split("silence_start: ")[1])
+                silence_starts.append(t)
+            except: pass
+        elif "silence_end" in line:
+             # [silencedetect @ ...] silence_end: 15.678 | silence_duration: ...
+            try:
+                t = float(line.split("silence_end: ")[1].split("|")[0])
+                silence_ends.append(t)
+            except: pass
+            
+    # Zip them
+    # Ensure raw output is matched. Usually silence_start comes before silence_end
+    segments = []
+    if len(silence_starts) > len(silence_ends):
+        # Last silence might be ongoing till end
+        silence_starts.pop()
+        
+    for s, e in zip(silence_starts, silence_ends):
+        segments.append((s, e))
+        
+    return segments
+
+@app.post("/detect-silence")
+async def detect_silence_endpoint(
+    file: UploadFile = File(...),
+    threshold_db: float = Form(-30.0),
+    min_duration: float = Form(0.5),
+    padding: float = Form(0.1)
+):
+    try:
+        # Save temp
+        temp_path = os.path.join(UPLOAD_DIR, f"silence_{int(time.time())}_{file.filename}")
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        print(f"🤫 Analyzing silence: {file.filename} (Threshold: {threshold_db}dB, Min: {min_duration}s)")
+        
+        # Detect Silence
+        silences = detect_silence_ffmpeg(temp_path, noise_db=threshold_db, duration=min_duration)
+        
+        # Invert to get KEEP segments (Speech)
+        # We need total duration
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", temp_path],
+            stdout=subprocess.PIPE, text=True
+        )
+        total_duration = float(probe.stdout.strip())
+        
+        keep_segments = []
+        current_pos = 0.0
+        
+        for s_start, s_end in silences:
+            # Speech is from current_pos to silence_start
+            # Apply padding (don't cut too tight)
+            cut_end = max(0, s_start + padding)
+            cut_start = min(total_duration, s_end - padding)
+            
+            speech_dur = cut_end - current_pos
+             # Ignore tiny gaps
+            if speech_dur > 0.1:
+                keep_segments.append({
+                    "start": round(current_pos, 2),
+                    "end": round(cut_end, 2),
+                    "label": "Speech"
+                })
+            
+            current_pos = cut_start
+            
+        # Add final segment if any
+        if current_pos < total_duration:
+             keep_segments.append({
+                "start": round(current_pos, 2),
+                "end": round(total_duration, 2),
+                "label": "Speech"
+             })
+             
+        # Cleanup
+        if os.path.exists(temp_path): os.remove(temp_path)
+            
+        print(f"✅ Found {len(keep_segments)} speech segments")
+        return keep_segments
+        
+    except Exception as e:
+        print(f"❌ Detect Silence Failed: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
 @app.post("/process-video")
 def process_video(
     file: UploadFile = File(...),
