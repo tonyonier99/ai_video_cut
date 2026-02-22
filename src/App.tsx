@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react'
 import type { DragEvent } from 'react';
 import { Play, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Download, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type, Video, Music, ChevronDown } from 'lucide-react';
 import { loadApiKey, saveApiKey } from './utils/secureApiKeyStorage';
+import { API_BASE_URL } from './config';
 import './App.css';
 
 interface Cut {
@@ -409,7 +410,7 @@ function App() {
 
   const fetchFonts = async () => {
     try {
-      const res = await fetch('http://localhost:8000/list-fonts');
+      const res = await fetch(`${API_BASE_URL}/list-fonts`);
       if (res.ok) {
         const data = await res.json();
         setAvailableFonts(data.fonts);
@@ -428,7 +429,7 @@ function App() {
           css += `
             @font-face {
               font-family: '${font.name}';
-              src: url('http://localhost:8000/fonts/${encodeURIComponent(font.filename)}');
+              src: url('${API_BASE_URL}/fonts/${encodeURIComponent(font.filename)}');
               font-weight: normal;
               font-style: normal;
             }
@@ -455,7 +456,7 @@ function App() {
     if (isProcessing) {
       interval = setInterval(async () => {
         try {
-          const res = await fetch('http://localhost:8000/job-status');
+          const res = await fetch(`${API_BASE_URL}/job-status`);
           if (res.ok) {
             const status = await res.json();
             setCurrentJobStatus(status);
@@ -491,7 +492,7 @@ function App() {
     formData.append('whisper_remove_punctuation', whisperRemovePunc ? 'true' : 'false');
 
     try {
-      const res = await fetch('http://localhost:8000/transcribe', {
+      const res = await fetch(`${API_BASE_URL}/transcribe`, {
         method: 'POST',
         body: formData
       });
@@ -634,7 +635,7 @@ function App() {
     formData.append('file', file);
 
     try {
-      const res = await fetch('http://localhost:8000/upload-proxy', {
+      const res = await fetch(`${API_BASE_URL}/upload-proxy`, {
         method: 'POST',
         body: formData
       });
@@ -1101,7 +1102,7 @@ function App() {
     formData.append('model_name', geminiModel);
 
     try {
-      const res = await fetch('http://localhost:8000/analyze-video', { method: 'POST', body: formData });
+      const res = await fetch(`${API_BASE_URL}/analyze-video`, { method: 'POST', body: formData });
       if (res.ok) {
         const data = await res.json();
         const aiCuts = data.map((c: any, i: number) => ({
@@ -1138,7 +1139,7 @@ function App() {
 
 
     try {
-      const res = await fetch('http://localhost:8000/detect-silence', {
+      const res = await fetch(`${API_BASE_URL}/detect-silence`, {
         method: 'POST',
         body: formData
       });
@@ -1256,7 +1257,7 @@ function App() {
     formData.append('selected_formats', JSON.stringify(selectedFormats));
 
     try {
-      const response = await fetch('http://localhost:8000/process-video', {
+      const response = await fetch(`${API_BASE_URL}/process-video`, {
         method: 'POST',
         body: formData
       });
@@ -1264,7 +1265,7 @@ function App() {
       if (response.ok) {
         const data = await response.json();
         if (data.status === 'success' && data.download_url) {
-          const downloadUrl = `http://localhost:8000${data.download_url}`;
+          const downloadUrl = `${API_BASE_URL}${data.download_url}`;
           const a = document.createElement('a');
           a.href = downloadUrl;
           a.download = data.filename || `export_${Date.now()}.zip`;
@@ -2119,7 +2120,7 @@ function App() {
                                     const formData = new FormData();
                                     formData.append('file', file);
                                     try {
-                                      const res = await fetch('http://localhost:8000/upload-font', { method: 'POST', body: formData });
+                                      const res = await fetch(`${API_BASE_URL}/upload-font`, { method: 'POST', body: formData });
                                       if (res.ok) {
                                         const data = await res.json();
                                         alert('字體上傳成功！');

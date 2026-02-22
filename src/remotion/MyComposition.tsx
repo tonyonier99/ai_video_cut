@@ -2,6 +2,7 @@ import React from 'react';
 import { AbsoluteFill, Video, Sequence, staticFile, useCurrentFrame } from 'remotion';
 import { Subtitle } from './Subtitle';
 import { z } from 'zod';
+import { API_BASE_URL } from '../config';
 import '../App.css'; // Import global styles and Google Fonts
 
 // Helper component for dynamic speaker tracking
@@ -108,7 +109,8 @@ export const myCompSchema = z.object({
         end: z.number(),
         faceCenterX: z.number()
     })).optional(),
-    durationInFrames: z.number().optional()
+    durationInFrames: z.number().optional(),
+    verticalMode: z.string().or(z.boolean()).optional()
 });
 
 export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
@@ -127,7 +129,6 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
     console.log(`[MyComposition] SubtitleConfig:`, JSON.stringify(subtitleConfig, null, 2));
 
     // Inject Custom Font Style if needed
-    // We assume backend is running on localhost:8000
     const customFontStyle = React.useMemo(() => {
         const fontName = subtitleConfig.fontFamily;
         // Skip common system fonts or fonts already in App.css (Inter, Noto Sans TC)
@@ -139,8 +140,8 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({
             <style>{`
                 @font-face {
                     font-family: '${fontName}';
-                    src: url('http://localhost:8000/fonts/${fontName}.ttf') format('truetype'),
-                         url('http://localhost:8000/fonts/${fontName}.otf') format('opentype');
+                    src: url('${API_BASE_URL}/fonts/${fontName}.ttf') format('truetype'),
+                         url('${API_BASE_URL}/fonts/${fontName}.otf') format('opentype');
                     font-weight: normal;
                     font-style: normal;
                 }

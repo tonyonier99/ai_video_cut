@@ -84,7 +84,8 @@ def scan_fonts():
                                      break
                                  if record.nameID == 1 and not family:
                                      family = decoded
-                    except: pass
+                    except (UnicodeDecodeError, Exception):
+                        pass
                 
                 # If no English name found, try any name
                 if not family:
@@ -114,7 +115,7 @@ def hex_to_ass(hex_color, alpha=1.0):
         r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
         a_val = int((1.0 - alpha) * 255)
         return f"&H{a_val:02X}{b:02X}{g:02X}{r:02X}"
-    except:
+    except (ValueError, IndexError):
         return "&H00FFFFFF" # Fallback White
 
 def wrap_text(text, max_chars=12):
@@ -318,7 +319,7 @@ def translate_subtitles(full_subtitles, api_key):
         # Try s2tw (Simplified to Traditional Taiwan) or fallback to s2t
         try:
             cc = OpenCC('s2tw')
-        except:
+        except Exception:
             cc = OpenCC('s2t')
             
         for i, sub in enumerate(full_subtitles):
@@ -384,7 +385,7 @@ except Exception as e:
             face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
             face_detector = "opencv_fallback"
             print("⚠️ Used OpenCV Haar Classifier as fallback")
-        except:
+        except Exception:
             face_detector = None
 
 # Initialize Face Mesh for Lip Movement Detection
@@ -481,35 +482,35 @@ def get_transcribe_options(
     
     # Casting to ensure types are correct for whisper core
     try: opts["beam_size"] = int(beam_size) if beam_size else 5
-    except: opts["beam_size"] = 5
-    
+    except (TypeError, ValueError): opts["beam_size"] = 5
+
     try: opts["temperature"] = float(temperature) if temperature is not None else 0
-    except: opts["temperature"] = 0
-        
+    except (TypeError, ValueError): opts["temperature"] = 0
+
     try: opts["no_speech_threshold"] = float(no_speech_threshold) if no_speech_threshold is not None else 0.6
-    except: opts["no_speech_threshold"] = 0.6
-        
+    except (TypeError, ValueError): opts["no_speech_threshold"] = 0.6
+
     try:
         val = str(condition_on_previous_text).lower() == "true" if isinstance(condition_on_previous_text, str) else bool(condition_on_previous_text)
         opts["condition_on_previous_text"] = val
-    except: opts["condition_on_previous_text"] = True
+    except (TypeError, ValueError): opts["condition_on_previous_text"] = True
 
     try: opts["best_of"] = int(best_of) if best_of else 5
-    except: opts["best_of"] = 5
+    except (TypeError, ValueError): opts["best_of"] = 5
 
     try: opts["patience"] = float(patience) if patience else 1.0
-    except: opts["patience"] = 1.0
+    except (TypeError, ValueError): opts["patience"] = 1.0
 
     try: opts["compression_ratio_threshold"] = float(compression_ratio_threshold) if compression_ratio_threshold else 2.4
-    except: opts["compression_ratio_threshold"] = 2.4
+    except (TypeError, ValueError): opts["compression_ratio_threshold"] = 2.4
 
     try: opts["logprob_threshold"] = float(logprob_threshold) if logprob_threshold else -1.0
-    except: opts["logprob_threshold"] = -1.0
+    except (TypeError, ValueError): opts["logprob_threshold"] = -1.0
 
     try:
         val_fp16 = str(fp16).lower() == "true" if isinstance(fp16, str) else bool(fp16)
         opts["fp16"] = val_fp16
-    except: opts["fp16"] = True
+    except (TypeError, ValueError): opts["fp16"] = True
             
     # User requested NO initial prompt (relying on regex post-processing)
     # if lang in ["zh", "zh-tw"]:
@@ -657,7 +658,8 @@ async def upload_font(file: UploadFile = File(...)):
                 if record.nameID == 1 and not family:
                    family = record.toUnicode()
             if family: real_font_name = family
-        except: pass
+        except Exception:
+            pass
 
         # Update global map
         base_name = os.path.splitext(file.filename)[0]
@@ -812,7 +814,7 @@ def detect_speaker_segments(clip, segment_duration=1.0):
                                 bucket = int(face_center_x_px / 100)  # Use larger bucket for better stability
                                 
                                 frame_faces[bucket] = (face_center_x_px, lip_aperture)
-                            except:
+                            except (IndexError, AttributeError):
                                 pass
                 
                 # Fallback to face_detector if no Face Mesh
@@ -1085,7 +1087,7 @@ def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_
                                         if bucket not in face_lip_data:
                                             face_lip_data[bucket] = []
                                         face_lip_data[bucket].append((face_center_x_px, lip_aperture))
-                                    except:
+                                    except (IndexError, AttributeError):
                                         pass
                         
                         # Fallback: Just use face detection if no Face Mesh
@@ -1457,7 +1459,8 @@ def preview_pipeline_generator(
                 try:
                     loaded_sub = json.loads(srt_json)
                     full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in loaded_sub]
-                except: pass
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
             else:
                 yield json.dumps({"status": "progress", "message": f"正在生成字幕 ({whisper_language})...", "percent": 70}) + "\n"
                 model = ensure_whisper_model(whisper_model_size)
@@ -1691,7 +1694,7 @@ async def preview_clip_legacy(
                 
                 # Boost outline for visibility if white-on-white risk
                 try: outline_width_int = int(subtitle_outline_width)
-                except: outline_width_int = 2
+                except (TypeError, ValueError): outline_width_int = 2
                 if final_color_ass == "&H00FFFFFF" and outline_width_int < 2:
                     outline_width_int = 3
 
@@ -1705,7 +1708,7 @@ async def preview_clip_legacy(
                 border_style = 3 if is_box else 1
                 
                 try: box_pad_int = int(subtitle_box_padding)
-                except: box_pad_int = 10
+                except (TypeError, ValueError): box_pad_int = 10
                 
                 outline_val = box_pad_int if is_box else outline_width_int
                 shadow_val = 0 if is_box else int(subtitle_shadow_size)
@@ -1933,13 +1936,15 @@ def detect_silence_ffmpeg(input_path, noise_db=-30, duration=0.5):
             try:
                 t = float(line.split("silence_start: ")[1])
                 silence_starts.append(t)
-            except: pass
+            except (ValueError, IndexError):
+                pass
         elif "silence_end" in line:
              # [silencedetect @ ...] silence_end: 15.678 | silence_duration: ...
             try:
                 t = float(line.split("silence_end: ")[1].split("|")[0])
                 silence_ends.append(t)
-            except: pass
+            except (ValueError, IndexError):
+                pass
             
     # Zip them
     # Ensure raw output is matched. Usually silence_start comes before silence_end
@@ -2244,7 +2249,7 @@ def process_video(
         # Clear previous exports
         for f in os.listdir(OUTPUT_DIR):
              try: os.remove(os.path.join(OUTPUT_DIR, f))
-             except: pass
+             except OSError: pass
         
         processed_files = []
 
@@ -2258,7 +2263,7 @@ def process_video(
         # Color converting & Config packing
         try:
              gradient_colors_list = json.loads(text_gradient_colors)
-        except:
+        except (json.JSONDecodeError, TypeError):
              gradient_colors_list = ["#FFFFFF", "#FFFFFF"] # Fallback
 
         remotion_config = {
@@ -2370,7 +2375,8 @@ def process_video(
                                     if ret:
                                         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                     cap.release()
-                            except: pass
+                            except Exception:
+                                pass
 
                             # Analyze if frame grabbed
                             if rgb_frame is not None:
