@@ -1,15 +1,26 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import type { DragEvent } from 'react';
-import { Play, Pause, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Settings, Download, ChevronRight, ChevronDown, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type } from 'lucide-react';
+import { Play, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Download, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type, Video, Music, ChevronDown } from 'lucide-react';
+import { loadApiKey, saveApiKey } from './utils/secureApiKeyStorage';
 import './App.css';
 
 interface Cut {
   id: string;
-  start: number;
-  end: number;
+  start: number;       // Timeline position start
+  end: number;         // Timeline position end
+  sourceStart: number; // Start in source video
+  sourceEnd: number;   // End in source video
   label: string;
   trackId: number;
   assetId?: string;
+  style?: {
+    scale: number;
+    x: number;
+    y: number;
+    rotation: number;
+    opacity: number;
+    mirror: boolean;
+  };
 }
 
 interface Asset {
@@ -45,19 +56,66 @@ function App() {
 
   // --- Layout State ---
   const [isVerticalMode, setIsVerticalMode] = useState(false);
-  const [leftPanelTab, setLeftPanelTab] = useState<'project' | 'controls' | 'effects' | 'ai'>('project');
-  const [activeTool, setActiveTool] = useState<'select' | 'blade' | 'text'>('select');
+  const [leftPanelTab, setLeftPanelTab] = useState<'project' | 'controls' | 'effects' | 'roughcut' | 'highlights' | 'subtitles'>('project');
+  const [activeTool, setActiveTool] = useState<'select' | 'blade' | 'text' | 'hand'>('select');
   const [appView, setAppView] = useState<'welcome' | 'editor'>('welcome');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const relinkInputRef = useRef<HTMLInputElement>(null);
 
   // --- Timeline State ---
   const [cuts, setCuts] = useState<Cut[]>([]);
-  const [selectedCutId, setSelectedCutId] = useState<string | null>(null);
+  const [selectedCutIds, setSelectedCutIds] = useState<string[]>([]);
+  const [marqueeRect, setMarqueeRect] = useState<{ startX: number; startY: number; currX: number; currY: number } | null>(null);
   const [zoomLevel, setZoomLevel] = useState(10);
+  const [isMagnetEnabled, setIsMagnetEnabled] = useState(true);
 
   const [videoTracks, setVideoTracks] = useState<TrackConfig[]>([
     { id: 0, type: 'video', name: 'V1', visible: true, locked: false },
-    { id: 1, type: 'text', name: 'T1', visible: true, locked: false }
+    { id: 1, type: 'text', name: 'T1', visible: true, locked: false },
+    { id: 99, type: 'audio', name: 'A1', visible: true, locked: false }
   ]);
+
+  const totalDuration = useMemo(() => {
+    if (cuts.length === 0) return duration;
+    return Math.max(duration, ...cuts.map(c => c.end));
+  }, [cuts, duration]);
+
+  const sortedTracks = useMemo(() => {
+    const subtitles = videoTracks.filter(t => t.type === 'text').sort((a, b) => a.id - b.id);
+    const videos = videoTracks.filter(t => t.type === 'video').sort((a, b) => b.id - a.id);
+    const audios = videoTracks.filter(t => t.type === 'audio').sort((a, b) => a.id - b.id);
+    return [...subtitles, ...videos, ...audios];
+  }, [videoTracks]);
+
+  // --- Enhanced Playback Timer ---
+  useEffect(() => {
+    let lastTime = performance.now();
+    let frameId: number;
+
+    const loop = () => {
+      if (isPlaying) {
+        const now = performance.now();
+        const delta = (now - lastTime) / 1000;
+        lastTime = now;
+
+        setCurrentTime(prev => {
+          const next = prev + delta;
+          if (next >= totalDuration) {
+            setIsPlaying(false);
+            return totalDuration;
+          }
+          return next;
+        });
+        frameId = requestAnimationFrame(loop);
+      }
+    };
+
+    if (isPlaying) {
+      lastTime = performance.now();
+      frameId = requestAnimationFrame(loop);
+    }
+    return () => cancelAnimationFrame(frameId);
+  }, [isPlaying, totalDuration]);
 
   const toggleTrackVisibility = (id: number) => {
     setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, visible: !t.visible } : t));
@@ -67,38 +125,416 @@ function App() {
     setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, locked: !t.locked } : t));
   };
 
+  const handleAddTrack = (type: 'video' | 'audio' | 'text') => {
+    setVideoTracks(prev => {
+      const sameType = prev.filter(t => t.type === type);
+      const prefix = type === 'video' ? 'V' : type === 'audio' ? 'A' : 'T';
+      const nextNum = sameType.length + 1;
+
+      // Find a safe ID
+      let nextId = Math.max(0, ...prev.map(t => t.id < 99 ? t.id : 0)) + 1;
+      if (type === 'audio') {
+        const audioIds = prev.filter(t => t.type === 'audio').map(t => t.id);
+        nextId = audioIds.length > 0 ? Math.max(...audioIds) + 1 : 99;
+      }
+
+      return [...prev, {
+        id: nextId,
+        type,
+        name: `${prefix}${nextNum}`,
+        visible: true,
+        locked: false
+      }];
+    });
+  };
+
+  const handleDeleteTrack = (id: number) => {
+    // Don't delete V1 or A1 by default if preferred, but for now let's allow it if it's not the last one
+    if (videoTracks.length <= 1) return;
+    if (!confirm(`確定要刪除此軌道及其所有內容嗎？`)) return;
+
+    setVideoTracks(prev => prev.filter(t => t.id !== id));
+    setCuts(prev => prev.filter(c => c.trackId !== id));
+  };
+
   // History
   const [history, setHistory] = useState<Cut[][]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const isUndoingRef = useRef(false);
+
+  // Initialize history
+  useEffect(() => {
+    if (history.length === 0 && cuts.length > 0) {
+      setHistory([cuts]);
+      setHistoryIndex(0);
+    }
+  }, [cuts.length]); // Only init on first load
+
+  const addToHistory = (newCuts: Cut[]) => {
+    if (isUndoingRef.current) return;
+
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(newCuts);
+    if (newHistory.length > MAX_HISTORY) {
+      newHistory.shift();
+    } else {
+      // Correct index if shifted? No, if push, length increases.
+    }
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+  };
+
+  const handleUndo = () => {
+    if (historyIndex > 0) {
+      isUndoingRef.current = true;
+      const prevCuts = history[historyIndex - 1];
+      setCuts(prevCuts);
+      setHistoryIndex(historyIndex - 1);
+      // Reset flag after render cycle
+      setTimeout(() => { isUndoingRef.current = false; }, 0);
+    }
+  };
+
+  const handleRedo = () => {
+    if (historyIndex < history.length - 1) {
+      isUndoingRef.current = true;
+      const nextCuts = history[historyIndex + 1];
+      setCuts(nextCuts);
+      setHistoryIndex(historyIndex + 1);
+      setTimeout(() => { isUndoingRef.current = false; }, 0);
+    }
+  };
+
+  // Stop playback if timeline becomes empty
+  useEffect(() => {
+    if (cuts.length === 0 && isPlaying) {
+      if (videoRef.current) videoRef.current.pause();
+      setIsPlaying(false);
+    }
+  }, [cuts, isPlaying]);
+
+  // Color theme helper
+  const getTrackTheme = (type: string) => {
+    switch (type) {
+      case 'video': return { primary: '#3ea6ff', secondary: 'rgba(62,166,255,0.1)', border: '#2563eb' };
+      case 'audio': return { primary: '#10b981', secondary: 'rgba(16,185,129,0.1)', border: '#059669' };
+      case 'text': return { primary: '#6366f1', secondary: 'rgba(99,102,241,0.1)', border: '#4f46e5' };
+      default: return { primary: '#3ea6ff', secondary: 'rgba(62,166,255,0.1)', border: '#007aff' };
+    }
+  };
 
   // Export Modal
   const [showExportModal, setShowExportModal] = useState(false);
-  const [exportFormat, setExportFormat] = useState('xml');
-  const [exportResolution, setExportResolution] = useState('1080p');
 
-  // Dragging State
+  const [exportResolution, setExportResolution] = useState('1080p');
+  const [exportBitrate, setExportBitrate] = useState(16); // Mbps
+  const [selectedFormats, setSelectedFormats] = useState<string[]>(['video']);
+
+  // Improved Dragging State
   const [dragState, setDragState] = useState<{
     isDragging: boolean;
-    type: 'scrub' | 'move' | 'trim-start' | 'trim-end' | null;
+    type: 'scrub' | 'move' | 'trim-start' | 'trim-end' | 'new-asset' | 'marquee' | 'blade' | 'pan' | null;
     targetId: string | null;
     startX: number;
     initialValue: number;
+    initialCuts?: Cut[]; // Snapshot for smooth dragging
+    newAssetId?: string;
+    newAssetDuration?: number;
+    ghostTime?: number;
+    ghostTrackId?: number;
+    initialScrollLeft?: number;
   }>({ isDragging: false, type: null, targetId: null, startX: 0, initialValue: 0 });
 
-  // --- Export States ---
-  const [exportAutoCaption, setExportAutoCaption] = useState(false);
-  const [exportFaceTracking, setExportFaceTracking] = useState(false);
-  const [exportStudioSound, setExportStudioSound] = useState(false);
-  const [exportMergeClips, setExportMergeClips] = useState(true);
+  // Synchronized Ref for heavy background tasks (History/Save)
+  const cutsRef = useRef(cuts);
+  useEffect(() => {
+    cutsRef.current = cuts;
+  }, [cuts]);
+
+  // History & Auto-save management (Optimized Release-Only)
+  useEffect(() => {
+    // ONLY run when isDragging changes from TRUE to FALSE (The Release)
+    if (dragState.isDragging) return;
+
+    // We use the Ref to get the latest state without triggering this effect 
+    // on every intermediate 'cuts' update during the drag.
+    const finalCuts = cutsRef.current;
+    if (finalCuts.length === 0) return;
+
+    // 1. History Commit
+    if (history.length > 0 && historyIndex >= 0) {
+      const currentHistory = history[historyIndex];
+      // Quick check to see if anything actually changed
+      if (currentHistory.length !== finalCuts.length || JSON.stringify(currentHistory) !== JSON.stringify(finalCuts)) {
+        addToHistory(finalCuts);
+      }
+    } else if (history.length === 0) {
+      setHistory([finalCuts]);
+      setHistoryIndex(0);
+    }
+
+    // 2. Auto-save to localStorage
+    const projectData = {
+      cuts: finalCuts,
+      videoUrl,
+      originalVideoPath,
+      isVerticalMode,
+      projectAssets: projectAssets.map(a => ({ ...a, file: undefined }))
+    };
+    localStorage.setItem('antigravity_current_project', JSON.stringify(projectData));
+
+  }, [dragState.isDragging]); // Crucial: Only depends on the Drag State change
+
+  // Snapping Configuration
+  const SNAP_THRESHOLD_PX = 10;
+
+  const getSnapTime = useCallback((time: number, ignoreCutId?: string | null): number | null => {
+    // Snap to: Playhead
+    if (Math.abs(time - currentTime) * zoomLevel < SNAP_THRESHOLD_PX) return currentTime;
+
+    // Snap to: 0
+    if (Math.abs(time) * zoomLevel < SNAP_THRESHOLD_PX) return 0;
+
+    // Snap to: Other cuts (start/end)
+    let closestTime: number | null = null;
+    let minDiff = SNAP_THRESHOLD_PX / zoomLevel;
+
+    for (const cut of cuts) {
+      if (cut.id === ignoreCutId) continue;
+
+      const diffStart = Math.abs(cut.start - time);
+      if (diffStart < minDiff) {
+        minDiff = diffStart;
+        closestTime = cut.start;
+      }
+
+      const diffEnd = Math.abs(cut.end - time);
+      if (diffEnd < minDiff) {
+        minDiff = diffEnd;
+        closestTime = cut.end;
+      }
+    }
+
+    return closestTime ?? null; // Explicitly return null if no snap found
+  }, [cuts, currentTime, zoomLevel]);
+
+  // Contextual Cursor Helper
+  const getTimelineCursor = () => {
+    if (dragState.isDragging) {
+      if (dragState.type === 'scrub') return 'ew-resize';
+      if (dragState.type === 'pan') return 'grabbing';
+      if (dragState.type === 'move') return 'move';
+      if (dragState.type === 'trim-start' || dragState.type === 'trim-end') return 'ew-resize';
+      return 'default';
+    }
+
+    switch (activeTool) {
+      case 'hand': return 'grab';
+      case 'blade': return 'crosshair';
+      case 'text': return 'text';
+      case 'select': return 'default';
+      default: return 'default';
+    }
+  };
+
+
   // --- AI / Tools State ---
-  const [apiKey, setApiKey] = useState(localStorage.getItem('antigravity_api_key') || '');
+  const [apiKey, setApiKey] = useState('');
+  const apiKeyLoaded = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadApiKey().then(key => {
+      if (!cancelled) {
+        setApiKey(key);
+        apiKeyLoaded.current = true;
+      }
+    });
+    // One-time cleanup: remove plaintext key from legacy localStorage
+    localStorage.removeItem('antigravity_api_key');
+    return () => { cancelled = true; };
+  }, []);
+
   const [highlightCount, setHighlightCount] = useState(5);
   const [targetDuration, setTargetDuration] = useState(60);
   const [instruction, setInstruction] = useState('');
+  const [geminiModel, setGeminiModel] = useState('gemini-3-flash-preview');
 
   // Silence Removal Params
   const [silenceThreshold, setSilenceThreshold] = useState(-30);
   const [silenceMinDuration, setSilenceMinDuration] = useState(0.5);
+
+  // Subtitle Params
+  const [whisperModel, setWhisperModel] = useState('turbo');
+  const [whisperLanguage, setWhisperLanguage] = useState('zh');
+  const [whisperBeamSize, setWhisperBeamSize] = useState(5);
+  const [whisperTemperature, setWhisperTemperature] = useState(0);
+  const [whisperCharsPerLine, setWhisperCharsPerLine] = useState(14);
+  const [whisperRemovePunc, setWhisperRemovePunc] = useState(true);
+
+  // Font / Style State
+  const [availableFonts, setAvailableFonts] = useState<any[]>([]);
+  const [subtitleConfig, setSubtitleConfig] = useState({
+    fontFamily: 'Inter',
+    fontSize: 48,
+    primaryColor: '#FFFFFF',
+    // Gradient
+    useGradient: false,
+    gradientStops: [
+      { color: '#FFFFFF', offset: 0 },
+      { color: '#3ea6ff', offset: 100 }
+    ],
+    gradientAngle: 180,
+    safeZoneMargin: 10, // Default 10% from edges
+    // Outline
+    useOutline: true,
+    outlineColor: '#000000',
+    outlineWidth: 4,
+    // Shadow
+    useShadow: true,
+    shadowColor: 'rgba(0,0,0,0.5)',
+    shadowBlur: 8,
+    shadowOffsetX: 2,
+    shadowOffsetY: 2,
+    // Background
+    useBackground: false,
+    backgroundColor: '#000000',
+    backgroundOpacity: 0.5,
+    borderRadius: 8,
+    paddingX: 20,
+    paddingY: 10,
+
+    verticalOffset: 80 // % from top
+  });
+
+  const fetchFonts = async () => {
+    try {
+      const res = await fetch('http://localhost:8000/list-fonts');
+      if (res.ok) {
+        const data = await res.json();
+        setAvailableFonts(data.fonts);
+
+        // Inject Font Face Styles
+        const styleId = 'dynamic-fonts-style';
+        let styleEl = document.getElementById(styleId);
+        if (styleEl) styleEl.remove();
+
+        styleEl = document.createElement('style');
+        styleEl.id = styleId;
+        document.head.appendChild(styleEl);
+
+        let css = '';
+        data.fonts.forEach((font: any) => {
+          css += `
+            @font-face {
+              font-family: '${font.name}';
+              src: url('http://localhost:8000/fonts/${encodeURIComponent(font.filename)}');
+              font-weight: normal;
+              font-style: normal;
+            }
+          `;
+        });
+        styleEl.textContent = css;
+        console.log(`✅ Loaded ${data.fonts.length} custom fonts.`);
+      }
+    } catch (e) {
+      console.error("Font fetch error:", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchFonts();
+  }, []);
+
+  // Global Processing Status
+  const [currentJobStatus, setCurrentJobStatus] = useState<{ progress: number; message: string; step: string } | null>(null);
+
+  // Polling for Progress
+  useEffect(() => {
+    let interval: any;
+    if (isProcessing) {
+      interval = setInterval(async () => {
+        try {
+          const res = await fetch('http://localhost:8000/job-status');
+          if (res.ok) {
+            const status = await res.json();
+            setCurrentJobStatus(status);
+            // If backend says done or error, we might want to stop, 
+            // but usually the main fetch call handles the end.
+          }
+        } catch (e) {
+          console.error("Polling error:", e);
+        }
+      }, 800);
+    } else {
+      setCurrentJobStatus(null);
+    }
+    return () => clearInterval(interval);
+  }, [isProcessing]);
+
+  const handleAISubtitles = async () => {
+    if (!videoFile) {
+      alert("請先上傳影片以便辨識");
+      return;
+    }
+
+    setIsProcessing(true);
+    setCurrentJobStatus({ progress: 0, message: "準備辨識中...", step: "init" });
+
+    const formData = new FormData();
+    formData.append('file', videoFile);
+    formData.append('whisper_language', whisperLanguage);
+    formData.append('whisper_model_size', whisperModel);
+    formData.append('whisper_beam_size', whisperBeamSize.toString());
+    formData.append('whisper_temperature', whisperTemperature.toString());
+    formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
+    formData.append('whisper_remove_punctuation', whisperRemovePunc ? 'true' : 'false');
+
+    try {
+      const res = await fetch('http://localhost:8000/transcribe', {
+        method: 'POST',
+        body: formData
+      });
+
+      if (res.ok) {
+        const segments = await res.json();
+        // Convert segments to Cuts
+        const textTrack = videoTracks.find(t => t.type === 'text');
+        const tid = textTrack ? textTrack.id : 1;
+
+        const newCuts: Cut[] = segments.map((seg: any) => ({
+          id: `subtitle-${Math.random().toString(36).substr(2, 5)}`,
+          start: seg.start,
+          end: seg.end,
+          sourceStart: 0,
+          sourceEnd: 0,
+          label: seg.text,
+          trackId: tid
+        }));
+
+        if (newCuts.length > 0) {
+          // Keep existing non-text cuts if any, or just append? 
+          // Usually user wants to REPLACE or ADD. Let's ADD for now.
+          setCuts(prev => [...prev.filter(c => {
+            const tr = videoTracks.find(t => t.id === c.trackId);
+            return tr && tr.type !== 'text';
+          }), ...newCuts]);
+          console.log("✅ Subtitles loaded:", newCuts.length);
+        } else {
+          alert("未辨識到任何語音內容");
+        }
+      } else {
+        const err = await res.text();
+        alert("辨識失敗: " + err);
+      }
+    } catch (e) {
+      console.error(e);
+      alert("連線後端失敗");
+    } finally {
+      setIsProcessing(false);
+      setCurrentJobStatus(null);
+    }
+  };
 
   // --- Inspector State ---
 
@@ -109,42 +545,14 @@ function App() {
 
   // --- Persistence ---
   useEffect(() => {
-    localStorage.setItem('antigravity_api_key', apiKey);
+    if (!apiKeyLoaded.current) return;
+    saveApiKey(apiKey);
   }, [apiKey]);
 
   // --- Shortcuts ---
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in input/textarea
-      if ((e.target as HTMLElement).tagName === 'INPUT' || (e.target as HTMLElement).tagName === 'TEXTAREA') return;
 
-      if (e.code === 'Space') {
-        e.preventDefault();
-        togglePlay();
-      } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        handleSplit();
-      } else if (e.code === 'Backspace' || e.code === 'Delete') {
-        handleDelete();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPlaying, currentTime, cuts, selectedCutId]);
 
-  // --- Persistence & Auto-Save ---
-  useEffect(() => {
-    const projectData = {
-      cuts,
-      videoUrl,
-      originalVideoPath,
-      isVerticalMode,
-      projectAssets: projectAssets.map(a => ({ ...a, file: undefined })) // Can't serialize File objects
-    };
-    if (cuts.length > 0 || videoUrl) {
-      localStorage.setItem('antigravity_current_project', JSON.stringify(projectData));
-    }
-  }, [cuts, videoUrl, originalVideoPath, isVerticalMode, projectAssets]);
+  // --- Persistence & Auto-Save Moved Above ---
 
   const loadProject = (data: any) => {
     try {
@@ -195,18 +603,7 @@ function App() {
 
   // --- Player Logic ---
   const togglePlay = () => {
-    if (videoRef.current) {
-      if (isPlaying) videoRef.current.pause();
-      else videoRef.current.play();
-      setIsPlaying(!isPlaying);
-    }
-  };
-
-  const handleTimeUpdate = () => {
-    // Only update state from video if NOT scrubbing
-    if (videoRef.current && dragState.type !== 'scrub') {
-      setCurrentTime(videoRef.current.currentTime);
-    }
+    setIsPlaying(!isPlaying);
   };
 
   const handleMetadata = () => {
@@ -214,7 +611,15 @@ function App() {
       setDuration(videoRef.current.duration);
       if (cuts.length === 0) {
         // Initial clip is full video
-        setCuts([{ id: 'full', start: 0, end: videoRef.current.duration, label: 'Full Video', trackId: 0 }]);
+        setCuts([{
+          id: 'full',
+          start: 0,
+          end: videoRef.current.duration,
+          sourceStart: 0,
+          sourceEnd: videoRef.current.duration,
+          label: 'Full Video',
+          trackId: 0
+        }]);
       }
     }
   };
@@ -274,17 +679,28 @@ function App() {
 
 
   // --- Timeline Operations ---
-  const handleSplit = () => {
-    // Find which cut includes currentTime
-    const targetCut = cuts.find(c => currentTime > c.start + 0.1 && currentTime < c.end - 0.1);
+  const handleSplit = (splitTime?: number) => {
+    const time = splitTime !== undefined ? splitTime : currentTime;
+    // Find which cut includes the split time
+    const targetCut = cuts.find(c => time > c.start + 0.01 && time < c.end - 0.01);
     if (!targetCut) return;
 
+    const durationFromStart = time - targetCut.start;
+    const sourceSplitTime = (targetCut.sourceStart ?? targetCut.start) + durationFromStart;
+
     const newCutId = Math.random().toString(36).substr(2, 9);
-    const firstHalf: Cut = { ...targetCut, end: currentTime };
+    const firstHalf: Cut = {
+      ...targetCut,
+      end: time,
+      sourceEnd: sourceSplitTime,
+      sourceStart: targetCut.sourceStart ?? targetCut.start
+    };
     const secondHalf: Cut = {
       id: newCutId,
-      start: currentTime,
+      start: time,
       end: targetCut.end,
+      sourceStart: sourceSplitTime,
+      sourceEnd: targetCut.sourceEnd ?? targetCut.end,
       label: targetCut.label,
       trackId: targetCut.trackId || 0,
       assetId: targetCut.assetId
@@ -295,90 +711,368 @@ function App() {
     newCuts.splice(index + 1, 0, secondHalf);
 
     setCuts([...newCuts]);
-    setSelectedCutId(newCutId);
+    setSelectedCutIds([newCutId]);
   };
 
   const handleDelete = () => {
-    if (!selectedCutId) return;
-    setCuts(cuts.filter(c => c.id !== selectedCutId));
-    setSelectedCutId(null);
+    if (selectedCutIds.length === 0) return;
+    setCuts(cuts.filter(c => !selectedCutIds.includes(c.id)));
+    setSelectedCutIds([]);
   };
 
   // --- DRAG HANDLERS ---
   const handleTimelineMouseDown = (e: React.MouseEvent) => {
-    // If clicking on ruler or empty space, start scrubbing
     if (!timelineRef.current) return;
     const rect = timelineRef.current.getBoundingClientRect();
-    const clickX = e.clientX - rect.left + timelineContainerRef.current!.scrollLeft;
+    const clickX = e.clientX - rect.left;
     const time = Math.max(0, clickX / zoomLevel);
 
-    // Update immediatley
-    setCurrentTime(time);
-    if (videoRef.current) videoRef.current.currentTime = time;
+    const isRuler = (e.target as HTMLElement).closest('.timeline-ruler-container');
 
-    setDragState({
-      isDragging: true,
-      type: 'scrub',
-      startX: e.clientX,
-      targetId: null,
-      initialValue: 0
-    });
+    if (isRuler || activeTool === 'blade') {
+      // Scrub or Split
+      setCurrentTime(time);
+      if (videoRef.current) {
+        const activeCut = cuts.find(c => time >= c.start && time < c.end);
+        if (activeCut) {
+          videoRef.current.currentTime = (activeCut.sourceStart ?? activeCut.start) + (time - activeCut.start);
+        } else {
+          videoRef.current.currentTime = time;
+        }
+      }
+
+      if (activeTool === 'blade') {
+        handleSplit(time);
+        return;
+      }
+
+      setDragState({
+        isDragging: true,
+        type: 'scrub',
+        startX: e.clientX,
+        targetId: null,
+        initialValue: 0
+      });
+    } else if (activeTool === 'hand') {
+      // Start Panning
+      setDragState({
+        isDragging: true,
+        type: 'pan',
+        startX: e.clientX,
+        targetId: null,
+        initialValue: 0,
+        initialScrollLeft: timelineContainerRef.current?.scrollLeft || 0
+      });
+    } else if (activeTool === 'select') {
+      // Start Marquee
+      const containerRect = timelineRef.current.closest('.timeline-tracks-area')?.getBoundingClientRect();
+      if (!containerRect) return;
+
+      const startX = e.clientX;
+      const startY = e.clientY;
+
+      setMarqueeRect({ startX, startY, currX: startX, currY: startY });
+      setDragState({
+        isDragging: true,
+        type: 'marquee',
+        startX,
+        targetId: null,
+        initialValue: 0
+      });
+
+      if (!e.shiftKey && !e.metaKey) {
+        setSelectedCutIds([]);
+      }
+    }
   };
 
   const handleClipMouseDown = (e: React.MouseEvent, cut: Cut, type: 'move' | 'trim-start' | 'trim-end') => {
     e.stopPropagation();
-    setSelectedCutId(cut.id);
+
+    if (activeTool === 'blade') {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const timeAtClick = cut.start + (clickX / zoomLevel);
+      handleSplit(timeAtClick);
+      return;
+    }
+
+    const isShift = e.shiftKey || e.metaKey;
+    if (isShift) {
+      if (selectedCutIds.includes(cut.id)) {
+        setSelectedCutIds(prev => prev.filter(id => id !== cut.id));
+      } else {
+        setSelectedCutIds(prev => [...prev, cut.id]);
+      }
+    } else {
+      if (!selectedCutIds.includes(cut.id)) {
+        setSelectedCutIds([cut.id]);
+      }
+    }
 
     setDragState({
       isDragging: true,
       type,
       targetId: cut.id,
       startX: e.clientX,
-      initialValue: type === 'move' ? cut.start : (type === 'trim-start' ? cut.start : cut.end)
+      initialValue: type === 'move' ? cut.start : (type === 'trim-start' ? cut.start : cut.end),
+      initialCuts: [...cuts]
     });
   };
 
   // Global Mouse Move / Up Listeners
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (!dragState.isDragging) return;
+      if (!dragState.isDragging && !dragState.type) return;
 
       const deltaX = e.clientX - dragState.startX;
       const deltaTime = deltaX / zoomLevel;
 
       if (dragState.type === 'scrub') {
-        if (videoRef.current) {
-          const newTime = Math.max(0, Math.min(duration, videoRef.current.currentTime + deltaTime));
-          // For scrubbing, we simply read the timeline position relative to container is better?
-          // Let's use simplified approach: re-calculate from mouse position relative to container
-          if (timelineRef.current && timelineContainerRef.current) {
-            const rect = timelineRef.current.getBoundingClientRect();
-            // We need to account for scroll
-            const offsetX = e.clientX - rect.left + timelineContainerRef.current.scrollLeft;
-            const absTime = Math.max(0, offsetX / zoomLevel);
-            setCurrentTime(absTime);
-            videoRef.current.currentTime = absTime;
+        if (timelineRef.current && timelineContainerRef.current) {
+          const rect = timelineRef.current.getBoundingClientRect();
+          const offsetX = e.clientX - rect.left;
+          let absTime = Math.max(0, offsetX / zoomLevel);
+
+          // Snap Playhead
+          const snapped = getSnapTime(absTime);
+          if (snapped !== null) absTime = snapped;
+
+          setCurrentTime(absTime);
+          if (videoRef.current) {
+            const activeCut = cuts.find(c => absTime >= c.start && absTime < c.end);
+            if (activeCut) {
+              videoRef.current.currentTime = (activeCut.sourceStart ?? activeCut.start) + (absTime - activeCut.start);
+            } else {
+              videoRef.current.currentTime = absTime;
+            }
           }
         }
       }
+      else if (dragState.type === 'pan') {
+        if (timelineContainerRef.current) {
+          const deltaX = e.clientX - dragState.startX;
+          timelineContainerRef.current.scrollLeft = (dragState.initialScrollLeft || 0) - deltaX;
+        }
+      }
+      else if (dragState.type === 'marquee') {
+        setMarqueeRect(prev => prev ? { ...prev, currX: e.clientX, currY: e.clientY } : null);
+
+        if (marqueeRect) {
+          const x1 = Math.min(marqueeRect.startX, e.clientX);
+          const x2 = Math.max(marqueeRect.startX, e.clientX);
+          const y1 = Math.min(marqueeRect.startY, e.clientY);
+          const y2 = Math.max(marqueeRect.startY, e.clientY);
+
+          const newlySelected: string[] = [];
+          const clipBlocks = document.querySelectorAll('.clip-block');
+          clipBlocks.forEach(el => {
+            const r = el.getBoundingClientRect();
+            const hasOverlap = !(r.right < x1 || r.left > x2 || r.bottom < y1 || r.top > y2);
+            if (hasOverlap) {
+              const cid = el.getAttribute('data-cut-id');
+              if (cid) newlySelected.push(cid);
+            }
+          });
+
+          // If shift key is held, merge with previous selection (additive)
+          // But usually marquee REPLACES unless Shift is held.
+          // For now, let's keep it simple: Marquee replaces selection or adds if shift.
+          setSelectedCutIds(newlySelected);
+        }
+      }
       else if (dragState.type === 'move' && dragState.targetId) {
-        const newStart = Math.max(0, dragState.initialValue + deltaTime);
-        const duration = cuts.find(c => c.id === dragState.targetId)!.end - cuts.find(c => c.id === dragState.targetId)!.start;
-        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, start: newStart, end: newStart + duration } : c));
+        let deltaT = deltaTime;
+        const baseCuts = dragState.initialCuts || cuts;
+        const selectionSet = new Set(selectedCutIds);
+
+        // Pre-calculation for Magnet (Collision Avoidance) Mode
+        if (isMagnetEnabled) {
+          const nonSelectedCuts = baseCuts.filter(c => !selectionSet.has(c.id));
+          let maxBackshift = -Infinity;
+          let maxForwardshift = Infinity;
+
+          // Check boundaries for all selected clips across all tracks
+          baseCuts.filter(c => selectionSet.has(c.id)).forEach(c => {
+            const trackNeighbors = nonSelectedCuts.filter(nc => nc.trackId === c.trackId);
+
+            // Left Bumper
+            const lefties = trackNeighbors.filter(ln => ln.end <= c.start + 0.001);
+            const nearestLeft = lefties.length > 0 ? Math.max(...lefties.map(l => l.end)) : 0;
+            maxBackshift = Math.max(maxBackshift, nearestLeft - c.start);
+
+            // Right Bumper
+            const righties = trackNeighbors.filter(rn => rn.start >= c.end - 0.001);
+            if (righties.length > 0) {
+              const nearestRight = Math.min(...righties.map(r => r.start));
+              maxForwardshift = Math.min(maxForwardshift, nearestRight - c.end);
+            }
+          });
+
+          // Final clamped delta
+          deltaT = Math.max(maxBackshift, Math.min(maxForwardshift, deltaT));
+        }
+
+        if (selectionSet.has(dragState.targetId)) {
+          // Multi-clip movement
+          const draggingAnchor = baseCuts.find(c => c.id === dragState.targetId);
+          if (!draggingAnchor) return;
+
+          let newAnchorStart = Math.max(0, draggingAnchor.start + deltaT);
+          const snapped = getSnapTime(newAnchorStart, dragState.targetId);
+          if (snapped !== null) newAnchorStart = snapped;
+
+          const actualDelta = newAnchorStart - draggingAnchor.start;
+
+          setCuts(baseCuts.map(c => {
+            if (selectionSet.has(c.id)) {
+              return { ...c, start: Math.max(0, c.start + actualDelta), end: Math.max(0.1, c.end + actualDelta) };
+            }
+            return c;
+          }));
+        } else {
+          // Single clip move
+          const targetCut = baseCuts.find(c => c.id === dragState.targetId);
+          if (!targetCut) return;
+
+          let newStart = Math.max(0, targetCut.start + deltaT);
+          const snapped = getSnapTime(newStart, dragState.targetId);
+          if (snapped !== null) newStart = snapped;
+
+          const duration = targetCut.end - targetCut.start;
+          setCuts(baseCuts.map(c => c.id === dragState.targetId ? { ...c, start: newStart, end: newStart + duration } : c));
+        }
       }
       else if (dragState.type === 'trim-start' && dragState.targetId) {
-        const newStart = Math.min(dragState.initialValue + deltaTime, cuts.find(c => c.id === dragState.targetId)!.end - 0.1);
-        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, start: Math.max(0, newStart) } : c));
+        const baseCuts = dragState.initialCuts || cuts;
+        const targetCut = baseCuts.find(c => c.id === dragState.targetId);
+        if (!targetCut) return;
+
+        let newStart = Math.min(targetCut.start + deltaTime, targetCut.end - 0.1);
+        const snapped = getSnapTime(newStart, dragState.targetId);
+        if (snapped !== null && snapped < targetCut.end) newStart = snapped;
+
+        const clampedStart = Math.max(0, newStart);
+        const delta = clampedStart - targetCut.start;
+        const newSourceStart = (targetCut.sourceStart ?? targetCut.start) + delta;
+
+        setCuts(baseCuts.map(c => c.id === dragState.targetId ? {
+          ...c,
+          start: clampedStart,
+          sourceStart: Math.max(0, newSourceStart)
+        } : c));
       }
       else if (dragState.type === 'trim-end' && dragState.targetId) {
-        const newEnd = Math.max(dragState.initialValue + deltaTime, cuts.find(c => c.id === dragState.targetId)!.start + 0.1);
-        setCuts(prev => prev.map(c => c.id === dragState.targetId ? { ...c, end: newEnd } : c));
+        const baseCuts = dragState.initialCuts || cuts;
+        const targetCut = baseCuts.find(c => c.id === dragState.targetId);
+        if (!targetCut) return;
+
+        let newEnd = Math.max(targetCut.end + deltaTime, targetCut.start + 0.1);
+        const snapped = getSnapTime(newEnd, dragState.targetId);
+        if (snapped !== null && snapped > targetCut.start) newEnd = snapped;
+
+        const delta = newEnd - targetCut.end;
+        const newSourceEnd = (targetCut.sourceEnd ?? targetCut.end) + delta;
+
+        setCuts(baseCuts.map(c => c.id === dragState.targetId ? {
+          ...c,
+          end: newEnd,
+          sourceEnd: newSourceEnd
+        } : c));
+      }
+      else if (dragState.type === 'new-asset') {
+        // Update ghost position for new asset
+        if (timelineRef.current && timelineContainerRef.current) {
+          const rect = timelineRef.current.getBoundingClientRect();
+          // Check if mouse is within timeline y-bounds
+          if (e.clientY >= rect.top && e.clientY <= rect.bottom + 300) { // +300 for some leeway
+            const offsetX = e.clientX - rect.left;
+            let ghostTime = Math.max(0, offsetX / zoomLevel);
+
+            const snapped = getSnapTime(ghostTime);
+            if (snapped !== null) ghostTime = snapped;
+
+            // Determine track based on element under cursor
+            let ghostTrackId = dragState.ghostTrackId;
+            const elementUnderCursor = document.elementFromPoint(e.clientX, e.clientY);
+            const trackLane = elementUnderCursor?.closest('.track-lane');
+            if (trackLane) {
+              const tid = Number(trackLane.getAttribute('data-track-id'));
+              if (!isNaN(tid)) ghostTrackId = tid;
+            }
+
+            setDragState(prev => ({ ...prev, ghostTime, ghostTrackId }));
+          }
+        }
       }
     };
 
     const handleMouseUp = () => {
-      if (dragState.isDragging) {
-        setDragState({ ...dragState, isDragging: false, type: null });
+      setMarqueeRect(null);
+      if (dragState.isDragging && dragState.type === 'new-asset' && dragState.ghostTime !== undefined) {
+        const asset = projectAssets.find(a => a.id === dragState.newAssetId);
+        if (!asset) {
+          setDragState({ ...dragState, isDragging: false, type: null, ghostTime: undefined });
+          return;
+        }
+
+        let trackId = dragState.ghostTrackId || 0;
+        const targetTrack = videoTracks.find(t => t.id === trackId);
+
+        // Enforce Track Compatibility
+        // Video/Image -> Video Track
+        // Audio -> Audio Track
+        // Text -> Text Track (Assets shouldn't go here)
+        let isValidTrack = false;
+
+        if (targetTrack) {
+          if ((asset.type === 'video' || asset.type === 'image') && targetTrack.type === 'video') isValidTrack = true;
+          if (asset.type === 'audio' && targetTrack.type === 'audio') isValidTrack = true;
+        }
+
+        // If invalid drop target, auto-assign to best track
+        if (!isValidTrack) {
+          if (asset.type === 'video' || asset.type === 'image') {
+            // Find first video track
+            const vTrack = videoTracks.find(t => t.type === 'video');
+            trackId = vTrack ? vTrack.id : 0;
+          } else if (asset.type === 'audio') {
+            // Find first audio track
+            const aTrack = videoTracks.find(t => t.type === 'audio');
+            trackId = aTrack ? aTrack.id : 99;
+          }
+        }
+
+        const start = dragState.ghostTime;
+        // Use asset duration if available, else fallback (images defaults to 3s in loader)
+        const duration = asset.duration || dragState.newAssetDuration || 3;
+
+        // Auto-init video source if empty and we are dropping a video
+        if (asset.type === 'video' && !videoUrl) {
+          setVideoUrl(asset.url);
+          setVideoFile(asset.file || null);
+          setOriginalVideoPath(null);
+        }
+
+        // Create the new cut
+        const newCut: Cut = {
+          id: Math.random().toString(36).substr(2, 9),
+          start: start,
+          end: start + duration,
+          sourceStart: 0, // Starts at beginning of asset
+          sourceEnd: duration,
+          label: asset.name,
+          trackId: trackId,
+          assetId: dragState.newAssetId
+        };
+
+        setCuts(prev => [...prev, newCut]);
+        setDragState({ ...dragState, isDragging: false, type: null, ghostTime: undefined });
+      } else {
+        // Handle other drag types reset if needed
+        if (dragState.isDragging) {
+          setDragState({ ...dragState, isDragging: false, type: null, ghostTime: undefined });
+        }
       }
     };
 
@@ -392,6 +1086,8 @@ function App() {
 
 
   // --- AI Functions ---
+
+
   const handleGeminiHighlights = async () => {
     if (!videoFile || !apiKey) return;
     setIsProcessing(true);
@@ -402,7 +1098,7 @@ function App() {
     formData.append('target_count', highlightCount.toString());
     formData.append('target_duration', targetDuration.toString());
     formData.append('api_key', apiKey);
-    formData.append('model_name', 'gemini-2.0-flash-exp');
+    formData.append('model_name', geminiModel);
 
     try {
       const res = await fetch('http://localhost:8000/analyze-video', { method: 'POST', body: formData });
@@ -440,6 +1136,7 @@ function App() {
     formData.append('threshold_db', silenceThreshold.toString());
     formData.append('min_duration', silenceMinDuration.toString());
 
+
     try {
       const res = await fetch('http://localhost:8000/detect-silence', {
         method: 'POST',
@@ -452,6 +1149,8 @@ function App() {
           id: `silence-${i}`,
           start: seg.start,
           end: seg.end,
+          sourceStart: seg.start,
+          sourceEnd: seg.end,
           label: 'Speech',
           trackId: 0
         }));
@@ -473,6 +1172,35 @@ function App() {
     }
   };
 
+
+  const handleAlignCuts = () => {
+    if (cuts.length === 0) return;
+
+    // Process only tracks that usually have gaps (video/audio)
+    // Actually, usually we align everything on the primary track and shift others accordingly
+    // To keep it simple for the user: Align all clips on Track 0 (Video) to be contiguous,
+    // and shift all other overlapping or concurrent clips by the same relative amount.
+
+    const sortedCuts = [...cuts].sort((a, b) => a.start - b.start);
+    let timelineOffset = 0;
+
+    const newCuts = sortedCuts.map(cut => {
+      const duration = cut.end - cut.start;
+      const nc = {
+        ...cut,
+        start: timelineOffset,
+        end: timelineOffset + duration,
+        sourceStart: cut.sourceStart ?? cut.start,
+        sourceEnd: cut.sourceEnd ?? cut.end
+      };
+      timelineOffset += duration;
+      return nc;
+    });
+
+    setCuts(newCuts);
+    alert("間隔已成功移除！片段現在已緊密對齊。");
+  };
+
   const handleExportVideo = async () => {
     if (cuts.length === 0 || !videoFile) {
       if (!videoFile) alert("請先上傳影片檔案以進行匯出");
@@ -482,20 +1210,50 @@ function App() {
     setIsProcessing(true);
     setShowExportModal(false);
 
+    // Integrated XML Export
+    if (selectedFormats.includes('xml')) {
+      handleExportXML();
+      // If ONLY xml was selected, we don't need to ping the backend for heavy processing
+      if (selectedFormats.length === 1) {
+        setIsProcessing(false);
+        return;
+      }
+    }
+
+    console.log("🚀 [FRONTEND] Starting Video Export...", {
+      model: whisperModel,
+      language: whisperLanguage,
+    });
+
+    const cutsForBackend = cuts.map(c => ({
+      ...c,
+      start: c.sourceStart ?? c.start, // Send source range to backend
+      end: c.sourceEnd ?? c.end
+    }));
+
     const formData = new FormData();
     formData.append('file', videoFile);
-    formData.append('cuts_json', JSON.stringify(cuts));
+    formData.append('cuts_json', JSON.stringify(cutsForBackend));
     formData.append('output_resolution', exportResolution);
+    formData.append('output_bitrate', `${exportBitrate}M`);
     formData.append('output_mode', 'video'); // Force video render
-    formData.append('whisper_language', 'zh');
+    formData.append('whisper_language', whisperLanguage);
+    formData.append('whisper_model_size', whisperModel);
+    formData.append('whisper_beam_size', whisperBeamSize.toString());
+    formData.append('whisper_temperature', whisperTemperature.toString());
+    formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
+    formData.append('whisper_remove_punctuation', whisperRemovePunc ? 'true' : 'false');
     formData.append('vertical_mode', isVerticalMode ? 'true' : 'false');
 
-    // Linked AI options
-    formData.append('burn_captions', exportAutoCaption ? 'true' : 'false');
-    formData.append('auto_caption', exportAutoCaption ? 'true' : 'false');
-    formData.append('face_tracking', exportFaceTracking ? 'true' : 'false');
-    formData.append('studio_sound', exportStudioSound ? 'true' : 'false');
-    formData.append('merge_clips', exportMergeClips ? 'true' : 'false');
+    // AI options (now managed by backend via process-preview-pipeline or explicit transcription)
+    formData.append('burn_captions', 'false');
+    formData.append('auto_caption', 'false');
+    formData.append('face_tracking', 'false');
+    formData.append('studio_sound', 'false');
+    formData.append('merge_clips', 'true');
+
+    // Multi-format support
+    formData.append('selected_formats', JSON.stringify(selectedFormats));
 
     try {
       const response = await fetch('http://localhost:8000/process-video', {
@@ -577,6 +1335,127 @@ function App() {
     document.body.removeChild(a);
   };
 
+  // --- Zoom Logic ---
+  const handleZoom = (zoomIn: boolean) => {
+    setZoomLevel(prev => {
+      const newZoom = zoomIn ? Math.min(prev * 1.2, 300) : Math.max(prev / 1.2, 1);
+      return newZoom;
+    });
+  };
+
+  const handleWheelZoom = (e: React.WheelEvent) => {
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      const timelineContainer = timelineContainerRef.current;
+      if (!timelineContainer) return;
+
+      const rect = timelineContainer.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left; // Mouse X relative to container viewport
+      const totalScrollLeft = timelineContainer.scrollLeft;
+      const mouseTime = (totalScrollLeft + mouseX) / zoomLevel;
+
+      // Determine direction
+      const delta = e.deltaY;
+      const factor = delta < 0 ? 1.1 : 0.9;
+
+      let newZoom = zoomLevel * factor;
+      newZoom = Math.max(1, Math.min(newZoom, 300));
+
+      // Calculate new scroll to keep mouseTime under mouseX
+      // newScrollLeft = (mouseTime * newZoom) - mouseX
+      const newScrollLeft = (mouseTime * newZoom) - mouseX;
+
+      setZoomLevel(newZoom);
+
+      // React state update is async, but we can try to set scroll immediately if we assume zoom updates fast enough?
+      // Or use a ref to track pending scroll?
+      // Let's try requestAnimationFrame which often syncs well with layout updates.
+      requestAnimationFrame(() => {
+        if (timelineContainerRef.current) {
+          timelineContainerRef.current.scrollLeft = newScrollLeft;
+        }
+      });
+    }
+  };
+
+  // --- Optimized Shortcut Handler ---
+  const handlersRef = useRef<{
+    togglePlay: () => void;
+    handleSplit: () => void;
+    handleDelete: () => void;
+    handleUndo: () => void;
+    handleRedo: () => void;
+    setActiveTool: React.Dispatch<React.SetStateAction<"text" | "select" | "blade" | "hand">>;
+    handleZoom: (zoomIn: boolean) => void;
+  }>({
+    togglePlay,
+    handleSplit,
+    handleDelete,
+    handleUndo,
+    handleRedo,
+    setActiveTool,
+    handleZoom: () => { } // Initial dummy
+  });
+
+  // Update ref on render so it has latest state closures if needed (though mostly state triggers re-render)
+  // Actually, togglePlay uses refs, so it's fine. handleSplit uses state `cuts`... wait.
+  // If `handleSplit` closes over old `cuts`, it will be buggy inside useEffect listener?
+  // `useRef` value is updated on every render? No, I need to update .current.
+  handlersRef.current = {
+    togglePlay,
+    handleSplit,
+    handleDelete,
+    handleUndo,
+    handleRedo,
+    setActiveTool,
+    handleZoom
+  };
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if typing in input/textarea
+      const target = e.target as HTMLElement;
+      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        handlersRef.current.togglePlay();
+      } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handlersRef.current.handleSplit();
+      } else if (e.code === 'KeyC') {
+        // C for Razor/Cut Tool.
+        // If user wants immediate cut, they might expect it. But standard is Tool select.
+        // User said "裁切是 C" (Cut is C).
+        // If adhering to familiar keys: C = Blade Tool.
+        if (!e.metaKey && !e.ctrlKey) {
+          handlersRef.current.setActiveTool('blade');
+        }
+      } else if (e.code === 'KeyV') {
+        if (!e.metaKey && !e.ctrlKey) {
+          handlersRef.current.setActiveTool('select');
+        }
+      } else if (e.code === 'Backspace' || e.code === 'Delete') {
+        handlersRef.current.handleDelete();
+      } else if (e.code === 'KeyZ' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          handlersRef.current.handleRedo();
+        } else {
+          handlersRef.current.handleUndo();
+        }
+      } else if ((e.metaKey || e.ctrlKey) && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
+        e.preventDefault();
+        handlersRef.current.handleZoom(true);
+      } else if ((e.metaKey || e.ctrlKey) && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
+        e.preventDefault();
+        handlersRef.current.handleZoom(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   return (
     <div className="app-container" onDrop={handleDrop} onDragOver={handleDragOver}>
       {/* 1. Compact Header */}
@@ -587,19 +1466,41 @@ function App() {
         </div>
         <div className="header-drag-region" />
         <div style={{ display: 'flex', gap: '8px', WebkitAppRegion: 'no-drag', alignItems: 'center' } as any}>
-          <button className="btn-ghost-sm" onClick={() => setAppView('welcome')} title="主選單">
-            <RotateCcw size={14} />
-          </button>
-          <div style={{ width: 1, height: 16, background: '#333', margin: '0 4px' }} />
-          <button className="btn-ghost-sm" onClick={handleExportProject} title="儲存專案 (Save Project)">
-            <Save size={14} /> 儲存專案
-          </button>
-          <button className="btn-ghost-sm" onClick={handleExportXML} style={{ height: 28, fontSize: 11 }}>
-            XML
-          </button>
-          <button className="btn-primary-sm" onClick={() => setShowExportModal(true)} style={{ height: 28, fontSize: 11, padding: '0 12px', background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)', border: 'none', fontWeight: 600 }}>
-            <Download size={14} /> 匯出影片
-          </button>
+          {appView === 'editor' && (
+            <>
+              <button className="btn-ghost-sm" onClick={() => setAppView('welcome')} title="主選單">
+                <RotateCcw size={14} />
+              </button>
+              <div style={{ width: 1, height: 16, background: '#333', margin: '0 4px' }} />
+
+              {/* Layout Selector Group */}
+              <div style={{ display: 'flex', background: '#222', borderRadius: 6, padding: 2, gap: 2 }}>
+                <button
+                  className={`btn-ghost-sm ${!isVerticalMode ? 'active' : ''}`}
+                  onClick={() => setIsVerticalMode(false)}
+                  style={{ padding: '4px 8px', fontSize: 11, background: !isVerticalMode ? '#333' : 'transparent', color: !isVerticalMode ? '#3ea6ff' : '#888' }}
+                >
+                  <Monitor size={14} style={{ marginRight: 4 }} /> 橫式排版
+                </button>
+                <button
+                  className={`btn-ghost-sm ${isVerticalMode ? 'active' : ''}`}
+                  onClick={() => setIsVerticalMode(true)}
+                  style={{ padding: '4px 8px', fontSize: 11, background: isVerticalMode ? '#333' : 'transparent', color: isVerticalMode ? '#3ea6ff' : '#888' }}
+                >
+                  <Smartphone size={14} style={{ marginRight: 4 }} /> 直式排版
+                </button>
+              </div>
+
+              <div style={{ width: 1, height: 16, background: '#333', margin: '0 4px' }} />
+              <button className="btn-ghost-sm" onClick={handleExportProject} title="儲存專案 (Save Project)">
+                <Save size={14} /> 儲存專案
+              </button>
+
+              <button className="btn-primary-sm" onClick={() => setShowExportModal(true)} style={{ height: 28, fontSize: 11, padding: '0 12px', background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)', border: 'none', fontWeight: 600 }}>
+                <Download size={14} /> 匯出影片
+              </button>
+            </>
+          )}
         </div>
       </header>
 
@@ -645,7 +1546,7 @@ function App() {
               style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s', opacity: localStorage.getItem('antigravity_current_project') ? 1 : 0.5, pointerEvents: localStorage.getItem('antigravity_current_project') ? 'auto' : 'none' }}
               className="welcome-card"
             >
-              <RotateCcw size={40} color="#10b981" style={{ marginBottom: 16 }} />
+              <RotateCcw size={40} color="#3ea6ff" style={{ marginBottom: 16 }} />
               <span style={{ fontWeight: 600, fontSize: 16 }}>恢復上次專案</span>
               <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Resume Project</span>
             </div>
@@ -666,20 +1567,22 @@ function App() {
           </div>
         </div>
       ) : (
-        <div className="premiere-layout">
+        <div className={`premiere-layout ${isVerticalMode ? 'vertical-layout-active' : ''}`}>
           {/* 2. Main Premiere Layout */}
 
           {/* Top Section: Panels */}
           <div className="top-panels">
 
             {/* Left: Project / Inspector Panel */}
-            <div className="panel-container" style={{ width: 340, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
+            <div className="panel-container" style={{ width: 360, display: 'flex', flexDirection: 'column', flexShrink: 0 }}>
               {/* Panel Tabs Header */}
-              <div className="panel-header" style={{ gap: 2, padding: '0 4px' }}>
-                <div className={`panel-tab ${leftPanelTab === 'project' ? 'active' : ''}`} onClick={() => setLeftPanelTab('project')} style={{ flex: 1, justifyContent: 'center' }}>專案</div>
-                <div className={`panel-tab ${leftPanelTab === 'controls' ? 'active' : ''}`} onClick={() => setLeftPanelTab('controls')} style={{ flex: 1, justifyContent: 'center' }}>控制</div>
-                <div className={`panel-tab ${leftPanelTab === 'ai' ? 'active' : ''}`} onClick={() => setLeftPanelTab('ai')} style={{ flex: 1, justifyContent: 'center' }}>AI</div>
-                <div className={`panel-tab ${leftPanelTab === 'effects' ? 'active' : ''}`} onClick={() => setLeftPanelTab('effects')} style={{ flex: 1, justifyContent: 'center' }}>特效</div>
+              <div className="panel-header" style={{ gap: 2, padding: '0 4px', overflowX: 'auto', scrollbarWidth: 'none' }}>
+                <div className={`panel-tab ${leftPanelTab === 'project' ? 'active' : ''}`} onClick={() => setLeftPanelTab('project')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>專案</div>
+                <div className={`panel-tab ${leftPanelTab === 'controls' ? 'active' : ''}`} onClick={() => setLeftPanelTab('controls')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>字幕校正</div>
+                <div className={`panel-tab ${leftPanelTab === 'effects' ? 'active' : ''}`} onClick={() => setLeftPanelTab('effects')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>屬性</div>
+                <div className={`panel-tab ${leftPanelTab === 'roughcut' ? 'active' : ''}`} onClick={() => setLeftPanelTab('roughcut')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>AI 粗剪</div>
+                <div className={`panel-tab ${leftPanelTab === 'subtitles' ? 'active' : ''}`} onClick={() => setLeftPanelTab('subtitles')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>AI 字幕</div>
+                <div className={`panel-tab ${leftPanelTab === 'highlights' ? 'active' : ''}`} onClick={() => setLeftPanelTab('highlights')} style={{ fontSize: 10, flex: 1, justifyContent: 'center', whiteSpace: 'nowrap' }}>AI 精華</div>
               </div>
 
               <div className="panel-content" style={{ padding: 0, overflowY: 'auto' }}>
@@ -691,52 +1594,92 @@ function App() {
                     <div style={{ padding: 8, borderBottom: '1px solid #333', display: 'flex', gap: 8 }}>
                       <label className="btn-primary-sm" style={{ flex: 1, cursor: 'pointer' }}>
                         <Plus size={12} /> 匯入素材
-                        <input type="file" multiple hidden accept="video/*,image/*,audio/*" onChange={(e) => {
-                          if (e.target.files) {
+                        <input type="file" multiple hidden accept="*/*" onChange={(e) => {
+                          if (e.target.files && e.target.files.length > 0) {
                             const newAssets = Array.from(e.target.files).map(f => ({
                               id: Math.random().toString(36).substr(2, 9),
-                              type: f.type.startsWith('video') ? 'video' : f.type.startsWith('audio') ? 'audio' : 'image',
+                              type: f.type.startsWith('video') ? 'video' : (f.type.startsWith('audio') || f.name.endsWith('.mp3') || f.name.endsWith('.wav') || f.name.endsWith('.m4a')) ? 'audio' : 'image',
                               name: f.name,
                               url: URL.createObjectURL(f),
-                              file: f
+                              file: f,
+                              duration: 0 // Init with 0, update later
                             } as Asset));
+
                             setProjectAssets(prev => [...prev, ...newAssets]);
-                            // Auto-load first video if timeline is empty
-                            if (cuts.length === 0 && newAssets[0].type === 'video') {
-                              setVideoUrl(newAssets[0].url);
-                              setVideoFile(newAssets[0].file || null);
-                              setOriginalVideoPath(null); // Local file
-                              // Need to wait for metadata... handled by onLoadedMetadata
-                            }
+
+                            // Reset input value to allow re-selecting same file
+                            e.target.value = '';
+
+                            // Async get duration
+                            newAssets.forEach(asset => {
+                              if (asset.type === 'video' || asset.type === 'audio') {
+                                const el = document.createElement(asset.type === 'video' ? 'video' : 'audio');
+                                el.src = asset.url;
+                                el.onloadedmetadata = () => {
+                                  setProjectAssets(prev => prev.map(p => p.id === asset.id ? { ...p, duration: el.duration } : p));
+                                };
+                              } else {
+                                // Image default duration
+                                setProjectAssets(prev => prev.map(p => p.id === asset.id ? { ...p, duration: 3 } : p));
+                              }
+                            });
                           }
                         }} />
                       </label>
-                      <button className="btn-icon-sm" onClick={() => { if (confirm('清空素材庫？')) setProjectAssets([]) }} title="清空素材庫"><Trash size={14} /></button>
+                      <button className="btn-icon-sm" onClick={() => {
+                        if (confirm('確定要清空所有素材與時間軸嗎？這將會重置專案。')) {
+                          setProjectAssets([]);
+                          setCuts([]);
+                          setVideoUrl(null);
+                          setVideoFile(null);
+                          setOriginalVideoPath(null);
+                          setCurrentTime(0);
+                        }
+                      }} title="清空素材庫與重置專案"><Trash size={14} /></button>
                     </div>
 
                     {/* Assets Grid */}
                     <div style={{ flex: 1, overflowY: 'auto', padding: 8, display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, alignContent: 'start' }}>
                       {projectAssets.length > 0 ? projectAssets.map(asset => (
                         <div key={asset.id}
+                          className="asset-item"
+                          draggable="false" // We implement custom dragging
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            setDragState({
+                              isDragging: true,
+                              type: 'new-asset',
+                              targetId: null,
+                              startX: e.clientX,
+                              initialValue: 0,
+                              newAssetId: asset.id,
+                              newAssetDuration: asset.duration || 5 // Default 5s if unknown
+                            });
+                          }}
                           onClick={() => {
-                            if (asset.type === 'video') {
-                              if (confirm(`要將 "${asset.name}" 載入到預覽視窗嗎?`)) {
+                            // Only click if not dragged
+                            if (!dragState.isDragging && asset.type === 'video') {
+                              if (confirm(`要將 "${asset.name}" 載入到預覽視窗嗎? 這將會重置時間軸。`)) {
                                 setVideoUrl(asset.url);
                                 setVideoFile(asset.file || null);
                                 // Clean restart
                                 setCuts([]);
+                                setCurrentTime(0);
+                                setOriginalVideoPath(null);
                               }
                             }
                           }}
-                          className="asset-item"
                           title={asset.name}
                           style={{ aspectRatio: '1/1', background: '#222', borderRadius: 4, overflow: 'hidden', position: 'relative', border: '1px solid #444', cursor: 'pointer' }}
                         >
-                          {asset.type === 'video' || asset.type === 'image' ? (
+                          {asset.type === 'video' ? (
                             <video src={asset.url} style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }} />
+                          ) : asset.type === 'image' ? (
+                            <img src={asset.url} style={{ width: '100%', height: '100%', objectFit: 'cover', pointerEvents: 'none' }} />
                           ) : (
-                            <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                              <Loader2 size={24} color="#666" />
+                            <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#333' }}>
+                              <Music size={24} color="#666" />
+                              <span style={{ fontSize: 9, color: '#888', marginTop: 4 }}>AUDIO</span>
                             </div>
                           )}
                           <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.8)', fontSize: 10, padding: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
@@ -752,142 +1695,749 @@ function App() {
                   </div>
                 )}
 
-                {/* 2. CONTROLS TAB */}
+                {/* 2. SUBTITLE CORRECTION TAB (formerly controls) */}
                 {leftPanelTab === 'controls' && (
-                  <div style={{ padding: 12 }}>
-                    {selectedCutId ? (
-                      <div style={{ color: '#ddd', fontSize: 11 }}>
-                        <div style={{ marginBottom: 16, fontWeight: 'bold', color: 'var(--primary-color)', borderBottom: '1px solid #333', paddingBottom: 8 }}>
-                          {cuts.find(c => c.id === selectedCutId)?.label}
-                        </div>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 16 }}>
-                          <div>
-                            <label style={{ display: 'block', marginBottom: 4, color: '#888' }}>開始時間 (Start)</label>
-                            <input className="input-dark" readOnly value={cuts.find(c => c.id === selectedCutId)?.start.toFixed(2)} style={{ width: '100%', fontFamily: 'monospace' }} />
-                          </div>
-                          <div>
-                            <label style={{ display: 'block', marginBottom: 4, color: '#888' }}>結束時間 (End)</label>
-                            <input className="input-dark" readOnly value={cuts.find(c => c.id === selectedCutId)?.end.toFixed(2)} style={{ width: '100%', fontFamily: 'monospace' }} />
-                          </div>
-                        </div>
+                  <div style={{ padding: 12, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                    <div style={{ fontSize: 11, color: '#aaa', fontWeight: 700, marginBottom: 12, paddingLeft: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <Type size={14} /> 字幕全清單校正
+                    </div>
 
-                        {cuts.find(c => c.id === selectedCutId)?.trackId === 1 && (
-                          <div style={{ marginBottom: 16, borderTop: '1px solid #333', paddingTop: 16 }}>
-                            <div style={{ fontWeight: 'bold', marginBottom: 8 }}>文字設定</div>
-                            {/* Placeholder for future text styling */}
-                            <input className="input-dark" value={cuts.find(c => c.id === selectedCutId)?.label}
+                    <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 8, paddingRight: 4 }}>
+                      {cuts.filter(c => {
+                        const track = videoTracks.find(t => t.id === c.trackId);
+                        return track && track.type === 'text';
+                      }).length > 0 ? (
+                        cuts.filter(c => {
+                          const track = videoTracks.find(t => t.id === c.trackId);
+                          return track && track.type === 'text';
+                        }).sort((a, b) => a.start - b.start).map(cut => (
+                          <div key={cut.id}
+                            style={{
+                              background: '#1a1a1a',
+                              border: selectedCutIds.includes(cut.id) ? '1px solid #3ea6ff' : '1px solid #333',
+                              borderRadius: 8, padding: 8,
+                              cursor: 'pointer'
+                            }}
+                            onClick={() => {
+                              setSelectedCutIds([cut.id]);
+                              setCurrentTime(cut.start);
+                              if (videoRef.current) videoRef.current.currentTime = cut.start;
+                            }}
+                          >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, fontSize: 10, color: '#666', fontFamily: 'monospace' }}>
+                              <span>{cut.start.toFixed(2)}s - {cut.end.toFixed(2)}s</span>
+                              <div style={{ display: 'flex', gap: 8 }}>
+                                <button onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCuts(prev => prev.filter(p => p.id !== cut.id));
+                                }} style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', padding: 0 }}>刪除</button>
+                              </div>
+                            </div>
+                            <textarea
+                              className="textarea-modern"
+                              value={cut.label}
                               onChange={(e) => {
-                                setCuts(prev => prev.map(c => c.id === selectedCutId ? { ...c, label: e.target.value } : c));
+                                setCuts(prev => prev.map(p => p.id === cut.id ? { ...p, label: e.target.value } : p));
                               }}
-                              style={{ width: '100%' }}
+                              style={{ height: 36, width: '100%', fontSize: 12, padding: 8, background: '#111', resize: 'none' }}
                             />
                           </div>
-                        )}
+                        ))
+                      ) : (
+                        <div style={{ textAlign: 'center', padding: 40, color: '#555', fontSize: 12, border: '1px dashed #333', borderRadius: 12 }}>
+                          尚未生成任何字幕片段
+                        </div>
+                      )}
+                    </div>
 
-                        <button className="btn-ghost-sm" style={{ width: '100%', color: '#ef4444', border: '1px solid #ef4444' }} onClick={handleDelete}>
-                          <Trash size={12} style={{ marginRight: 4 }} /> 刪除片段
-                        </button>
-                      </div>
-                    ) : (
-                      <div style={{ textAlign: 'center', marginTop: 40, color: '#666', fontSize: 11 }}>
-                        未選取任何片段<br />(請點擊時間軸上的片段)
+                    {selectedCutIds.length > 0 && cuts.find(c => c.id === selectedCutIds[0])?.trackId === 1 && (
+                      <div style={{ marginTop: 12, padding: 12, background: '#1c1c1e', borderRadius: 8, border: '1px solid #333' }}>
+                        <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>快速調整選中片段</div>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                          <button className="btn-ghost-sm" onClick={() => {
+                            const sid = selectedCutIds[0];
+                            setCuts(prev => prev.map(c => c.id === sid ? { ...c, start: Math.max(0, c.start - 0.1) } : c));
+                          }}>-0.1s 開始</button>
+                          <button className="btn-ghost-sm" onClick={() => {
+                            const sid = selectedCutIds[0];
+                            setCuts(prev => prev.map(c => c.id === sid ? { ...c, end: c.end + 0.1 } : c));
+                          }}>+0.1s 結束</button>
+                        </div>
                       </div>
                     )}
                   </div>
                 )}
 
-                {/* 3. AI TOOLS TAB (Restored & Moved) */}
-                {leftPanelTab === 'ai' && (
-                  <div style={{ padding: 12 }}>
-
-                    {/* Silence Removal */}
-                    <div className="style-group" style={{ marginTop: 0 }}>
-                      <div style={{ marginBottom: 8, borderBottom: '1px solid #333', paddingBottom: 8 }}>
-                        <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#10b981', display: 'flex', alignItems: 'center' }}>
-                          <Zap size={14} style={{ marginRight: 6 }} /> 智能去氣口
+                {/* 3. ROUGH CUT TAB (Silence Removal) */}
+                {leftPanelTab === 'roughcut' && (
+                  <div style={{ padding: 12, overflowY: 'auto', maxHeight: '100%' }}>
+                    <div className="panel-card" style={{ background: '#1c1c1e', padding: 20, borderRadius: 16, border: '1px solid #333', boxShadow: '0 4px 24px rgba(0,0,0,0.2)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(62,255,255,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                          <Zap size={18} color="#3ea6ff" />
                         </div>
-                        <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>自動偵測並刪除影片中的靜音片段。</div>
-
-                        <div className="style-grid-2" style={{ marginBottom: 8 }}>
-                          <div>
-                            <label className="label-sm">噪音閥值 (dB)</label>
-                            <input type="number" className="input-xs" value={silenceThreshold} onChange={e => setSilenceThreshold(Number(e.target.value))} placeholder="-30" />
-                          </div>
-                          <div>
-                            <label className="label-sm">最短保留 (秒)</label>
-                            <input type="number" className="input-xs" value={silenceMinDuration} onChange={e => setSilenceMinDuration(Number(e.target.value))} placeholder="0.5" />
-                          </div>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: 14, color: '#fff' }}>智能去氣口</div>
+                          <div style={{ fontSize: 11, color: '#666' }}>自動移除靜音</div>
                         </div>
-                        <button className="btn-primary-sm" style={{ width: '100%' }} onClick={handleSilenceRemoval}>
-                          執行去氣口
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                          <label className="label-sm" style={{ color: '#aaa', fontWeight: 500 }}>噪音閥值</label>
+                          <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#3ea6ff', background: 'rgba(62,166,255,0.1)', padding: '2px 6px', borderRadius: 4 }}>
+                            {silenceThreshold} dB
+                          </span>
+                        </div>
+                        <input
+                          type="range" min="-60" max="0" step="1"
+                          className="slider-modern"
+                          style={{ '--fill-percent': `${((silenceThreshold + 60) / 60) * 100}%` } as React.CSSProperties}
+                          value={silenceThreshold}
+                          onChange={e => setSilenceThreshold(Number(e.target.value))}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                          <label className="label-sm" style={{ color: '#aaa', fontWeight: 500 }}>最短保留時長</label>
+                          <span style={{ fontSize: 11, fontFamily: 'monospace', color: '#3ea6ff', background: 'rgba(62,166,255,0.1)', padding: '2px 6px', borderRadius: 4 }}>
+                            {silenceMinDuration}s
+                          </span>
+                        </div>
+                        <input
+                          type="range" min="0" max="2" step="0.1"
+                          className="slider-modern"
+                          style={{ '--fill-percent': `${(silenceMinDuration / 2) * 100}%` } as React.CSSProperties}
+                          value={silenceMinDuration}
+                          onChange={e => setSilenceMinDuration(Number(e.target.value))}
+                        />
+                      </div>
+
+                      <button className="btn-gradient-animate" onClick={handleSilenceRemoval}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+                          <Zap size={16} fill="currentColor" />
+                          <span>開始去氣口處理</span>
+                        </div>
+                      </button>
+
+                      <div style={{ height: 1, background: '#333', margin: '20px 0' }}></div>
+
+                      <div style={{ padding: 12, border: '2px dashed #222', borderRadius: 12, background: 'rgba(255,255,255,0.02)' }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: '#eee', marginBottom: 4 }}>高效剪輯必備</div>
+                        <div style={{ fontSize: 11, color: '#666', marginBottom: 16 }}>處理完靜音後，可以一鍵消除所有間隔，讓字幕與畫面緊密對齊。</div>
+
+                        <button
+                          className="btn-primary"
+                          onClick={handleAlignCuts}
+                          style={{
+                            width: '100%',
+                            background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
+                            boxShadow: '0 4px 15px rgba(16, 185, 129, 0.3)',
+                            border: 'none',
+                            fontWeight: 600,
+                            height: 40
+                          }}
+                        >
+                          <Magnet size={18} /> 一鍵對齊 (消除間隔)
                         </button>
                       </div>
 
-                      {/* AI Highlights */}
-                      <div style={{ marginTop: 16 }}>
-                        <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#818cf8', display: 'flex', alignItems: 'center' }}>
-                          <Film size={14} style={{ marginRight: 6 }} /> AI 精華生成
-                        </div>
-                        <div style={{ fontSize: 11, color: '#888', marginBottom: 8 }}>使用 Gemini AI 分析並剪輯精華片段。</div>
 
-                        <div className="style-grid-2" style={{ marginBottom: 8 }}>
-                          <div>
-                            <label className="label-sm">片段數量</label>
-                            <input type="number" className="input-xs" value={highlightCount} onChange={e => setHighlightCount(Number(e.target.value))} />
-                          </div>
-                          <div>
-                            <label className="label-sm">單片時長 (秒)</label>
-                            <input type="number" className="input-xs" value={targetDuration} onChange={e => setTargetDuration(Number(e.target.value))} />
-                          </div>
-                        </div>
-                        <div style={{ marginBottom: 8 }}>
-                          <label className="label-sm">AI 提示詞</label>
-                          <textarea className="input-dark" rows={2} style={{ width: '100%', fontSize: 11 }}
-                            value={instruction}
-                            onChange={e => setInstruction(e.target.value)}
-                            placeholder="例如：找出最有趣的對話..."
-                          />
-                        </div>
-                        <div style={{ marginBottom: 8 }}>
-                          <label className="label-sm">API Key</label>
-                          <input type="password" className="input-dark" style={{ width: '100%' }}
-                            value={apiKey}
-                            onChange={e => setApiKey(e.target.value)}
-                            placeholder="Gemini API Key"
-                          />
-                        </div>
-
-                        <button className="btn-primary-sm" style={{ width: '100%' }} onClick={handleGeminiHighlights}>
-                          生成精華短片
-                        </button>
-                      </div>
                     </div>
                   </div>
                 )}
 
-                {/* 4. EFFECTS TAB */}
-                {leftPanelTab === 'effects' && (
-                  <div style={{ padding: 12, color: '#888', fontSize: 11 }}>
-                    <div style={{ marginBottom: 16, borderBottom: '1px solid #333', paddingBottom: 8 }}>
-                      <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#fff' }}>標題特效 (Titles)</div>
-                      <div className="effect-item" style={{ background: '#222', padding: 12, marginBottom: 8, cursor: 'pointer', borderRadius: 8, border: '1px solid #333', display: 'flex', alignItems: 'center', gap: 10 }} onClick={() => {
-                        const newCut: Cut = { id: Math.random().toString(36).substr(2, 9), start: currentTime, end: currentTime + 3, label: '新的文字標題', trackId: 1 };
-                        setCuts(prev => [...prev, newCut]);
-                      }}>
-                        <div style={{ width: 24, height: 24, background: 'var(--primary-color)', borderRadius: 4, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 14, fontWeight: 'bold' }}>T</div>
+                {/* 4. AI HIGHLIGHTS TAB */}
+                {leftPanelTab === 'highlights' && (
+                  <div style={{ padding: 12, overflowY: 'auto', maxHeight: '100%' }}>
+                    <div className="panel-card" style={{ background: '#1c1c1e', padding: 20, borderRadius: 16, border: '1px solid #333', boxShadow: '0 4px 24px rgba(0,0,0,0.2)' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 12 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(59,130,246,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                          <Film size={18} color="#3b82f6" />
+                        </div>
                         <div>
-                          <div style={{ color: '#eee', fontWeight: 600 }}>基礎文字標題</div>
-                          <div style={{ fontSize: 10, color: '#666' }}>點擊在當前時間增加文字圖層</div>
+                          <div style={{ fontWeight: 700, fontSize: 14, color: '#fff' }}>AI 精華生成</div>
+                          <div style={{ fontSize: 11, color: '#666' }}>使用 Gemini AI 智能分析</div>
                         </div>
                       </div>
+
+                      <div className="style-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+                        <div>
+                          <label className="label-modern">精華片段數量</label>
+                          <input
+                            type="number" className="input-modern"
+                            value={highlightCount} onChange={e => setHighlightCount(Number(e.target.value))}
+                            min="1" max="50"
+                          />
+                        </div>
+                        <div>
+                          <label className="label-modern">單片時長 (秒)</label>
+                          <input
+                            type="number" className="input-modern"
+                            value={targetDuration} onChange={e => setTargetDuration(Number(e.target.value))}
+                            min="5" max="300"
+                          />
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 16 }}>
+                        <label className="label-modern">AI 模型選擇</label>
+                        <div className="select-wrapper">
+                          <select
+                            className="select-modern"
+                            value={geminiModel}
+                            onChange={(e) => setGeminiModel(e.target.value)}
+                          >
+                            <option value="gemini-3-pro-preview">Gemini 3 Pro</option>
+                            <option value="gemini-3-flash-preview">Gemini 3 Flash</option>
+                            <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                            <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                          </select>
+                          <div className="select-arrow"><ChevronDown size={14} /></div>
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 16 }}>
+                        <label className="label-modern">AI 提示詞 (Prompt)</label>
+                        <textarea
+                          className="textarea-modern" rows={3}
+                          value={instruction} onChange={e => setInstruction(e.target.value)}
+                          placeholder="例如：找出最有趣的對話，或是動作最精彩的片段..."
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <label className="label-modern">API Key</label>
+                        <div style={{ position: 'relative' }}>
+                          <input
+                            className="input-modern" type="password"
+                            value={apiKey} onChange={e => setApiKey(e.target.value)}
+                            placeholder="輸入您的 Gemini API Key"
+                            style={{ paddingRight: 36 }}
+                          />
+                          <div style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', opacity: 0.5 }}>
+                            <Zap size={14} />
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        className="btn-gradient-animate btn-gradient-blue"
+                        onClick={handleGeminiHighlights}
+                        disabled={isProcessing}
+                        style={{ opacity: isProcessing ? 0.7 : 1, cursor: isProcessing ? 'wait' : 'pointer', width: '100% ' }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+                          {isProcessing ? (
+                            <Loader2 size={16} className="spin" />
+                          ) : (
+                            <Film size={16} fill="currentColor" />
+                          )}
+                          <span>{isProcessing ? 'AI 分析生成中...' : '生成精華短片'}</span>
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* 5. SUBTITLES TAB */}
+                {leftPanelTab === 'subtitles' && (
+                  <div style={{ padding: 12, height: '100%', display: 'flex', flexDirection: 'column' }}>
+                    <div className="panel-card" style={{ background: '#1c1c1e', padding: 20, borderRadius: 16, border: '1px solid #333', boxShadow: '0 4px 24px rgba(0,0,0,0.2)', marginBottom: 16 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+                        <div style={{ width: 32, height: 32, borderRadius: 8, background: 'rgba(59,130,246,0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                          <Type size={18} color="#3b82f6" />
+                        </div>
+                        <div>
+                          <div style={{ fontWeight: 700, fontSize: 14, color: '#fff' }}>SRT 語音辨識</div>
+                          <div style={{ fontSize: 11, color: '#666' }}>自動提取影片對話</div>
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 16 }}>
+                        <label className="label-sm" style={{ display: 'block', marginBottom: 8, color: '#aaa' }}>辨識模型</label>
+                        <div className="select-wrapper">
+                          <select
+                            className="select-modern"
+                            value={whisperModel}
+                            onChange={(e) => setWhisperModel(e.target.value)}
+                          >
+                            <option value="turbo">Turbo</option>
+                            <option value="large">Large</option>
+                            <option value="medium">Medium</option>
+                            <option value="base">Base</option>
+                            <option value="tiny">Tiny</option>
+                          </select>
+                          <div className="select-arrow"><ChevronDown size={14} /></div>
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <label className="label-sm" style={{ display: 'block', marginBottom: 8, color: '#aaa' }}>辨識語言</label>
+                        <div className="select-wrapper">
+                          <select
+                            className="select-modern"
+                            value={whisperLanguage}
+                            onChange={(e) => setWhisperLanguage(e.target.value)}
+                          >
+                            <option value="zh">繁體中文</option>
+                            <option value="en">英文</option>
+                            <option value="ja">日文</option>
+                            <option value="auto">自動偵測</option>
+                          </select>
+                          <div className="select-arrow"><ChevronDown size={14} /></div>
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 16 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                          <div>
+                            <label className="label-sm" style={{ display: 'block', marginBottom: 8, color: '#aaa' }}>Beam Size</label>
+                            <input
+                              type="number" className="input-modern" style={{ height: 32, fontSize: 12 }}
+                              value={whisperBeamSize} onChange={e => setWhisperBeamSize(Number(e.target.value))}
+                              min="1" max="10"
+                            />
+                          </div>
+                          <div>
+                            <label className="label-sm" style={{ display: 'block', marginBottom: 8, color: '#aaa' }}>溫度 (Temp)</label>
+                            <input
+                              type="number" className="input-modern" style={{ height: 32, fontSize: 12 }}
+                              value={whisperTemperature} onChange={e => setWhisperTemperature(Number(e.target.value))}
+                              step="0.1" min="0" max="1"
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                          <label className="label-sm" style={{ color: '#aaa' }}>每行字數限制</label>
+                          <span style={{ fontSize: 11, color: '#3ea6ff', fontWeight: 700 }}>{whisperCharsPerLine}</span>
+                        </div>
+                        <input
+                          type="range" min="5" max="30" step="1"
+                          className="slider-modern"
+                          style={{ '--fill-percent': `${((whisperCharsPerLine - 5) / 25) * 100}%` } as React.CSSProperties}
+                          value={whisperCharsPerLine}
+                          onChange={e => setWhisperCharsPerLine(Number(e.target.value))}
+                        />
+                      </div>
+
+                      <div style={{ marginBottom: 20 }}>
+                        <div
+                          onClick={() => setWhisperRemovePunc(!whisperRemovePunc)}
+                          style={{
+                            padding: '10px 14px', borderRadius: 12, background: whisperRemovePunc ? 'rgba(62,166,255,0.08)' : 'rgba(255,255,255,0.02)',
+                            border: `1px solid ${whisperRemovePunc ? 'rgba(62,166,255,0.3)' : 'rgba(255,255,255,0.05)'}`,
+                            display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer'
+                          }}
+                        >
+                          <span style={{ fontSize: 12, color: whisperRemovePunc ? '#eee' : '#666' }}>自動移除標點符號</span>
+                          <div style={{ width: 12, height: 12, borderRadius: 3, background: whisperRemovePunc ? '#3ea6ff' : '#333' }} />
+                        </div>
+                      </div>
+
+                      <button
+                        className="btn-gradient-animate btn-gradient-blue"
+                        onClick={handleAISubtitles}
+                        disabled={isProcessing}
+                        style={{ width: '100%', opacity: isProcessing ? 0.7 : 1 }}
+                      >
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}>
+                          <RotateCcw size={16} />
+                          <span>開始 AI 字幕辨識</span>
+                        </div>
+                      </button>
                     </div>
 
-                    <div style={{ opacity: 0.5 }}>
-                      <div style={{ fontWeight: 'bold', marginBottom: 8, color: '#fff' }}>更多轉場即將推出...</div>
-                      <div style={{ background: '#1a1a1a', padding: 20, borderRadius: 8, textAlign: 'center', border: '1px dashed #333' }}>
-                        AI 智能轉場開發中
-                      </div>
-                    </div>
+                    {/* Redundant Editor Section Removed: Moved to Subtitle Correction Tab */}
+                  </div>
+                )}
+
+                {/* 3. EFFECTS / INSPECTOR TAB */}
+                {leftPanelTab === 'effects' && (
+                  <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
+                    {(() => {
+                      const activeCut = cuts.find(c => selectedCutIds.includes(c.id));
+
+                      if (!activeCut) {
+                        return (
+                          <div style={{ padding: 20, textAlign: 'center', color: '#666', fontSize: 13, marginTop: 40 }}>
+                            請選擇時間軸上的一個片段<br />以編輯屬性
+                          </div>
+                        );
+                      }
+
+                      if (activeCut.trackId === 1) {
+                        // Text Track -> Show Subtitle Settings
+                        return (
+                          <div style={{ padding: 12, height: '100%', overflowY: 'auto' }}>
+                            {/* ... Existing Subtitle UI ... */}
+                            <div className="panel-card" style={{ background: '#1c1c1e', padding: 16, borderRadius: 12, border: '1px solid #333', marginBottom: 12 }}>
+                              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 8 }}>
+                                <Type size={16} color="#3ea6ff" />
+                                <div style={{ fontWeight: 700, fontSize: 13, color: '#fff' }}>字體設定</div>
+                              </div>
+                              {/* Existing Font Controls - Reusing state directly */}
+                              <div style={{ marginBottom: 16 }}>
+                                <label className="label-sm" style={{ display: 'block', marginBottom: 6, color: '#888' }}>選擇字體</label>
+                                <div className="select-wrapper">
+                                  <select
+                                    className="select-modern"
+                                    style={{ height: 32, fontSize: 12 }}
+                                    value={subtitleConfig.fontFamily}
+                                    onChange={(e) => setSubtitleConfig(prev => ({ ...prev, fontFamily: e.target.value }))}
+                                  >
+                                    <option value="Inter, system-ui, sans-serif">系統預設 (Inter)</option>
+                                    {availableFonts.map((font: any) => (
+                                      <option key={font.name} value={font.name}>{font.name}</option>
+                                    ))}
+                                  </select>
+                                  <ChevronDown size={14} className="select-arrow" color="#888" />
+                                </div>
+                              </div>
+
+                              <div>
+                                <label className="label-sm" style={{ display: 'block', marginBottom: 6, color: '#888' }}>上傳字體 (.ttf, .otf, .woff2)</label>
+                                <button
+                                  className="btn-secondary-sm"
+                                  style={{ width: '100%', justifyContent: 'center', cursor: 'pointer', border: 'none' }}
+                                  onClick={() => document.getElementById('font-upload-input')?.click()}
+                                >
+                                  <Upload size={12} /> 上傳字體檔案
+                                </button>
+                                <input
+                                  id="font-upload-input"
+                                  type="file"
+                                  hidden
+                                  accept=".ttf,.otf,.woff2"
+                                  onChange={async (e) => {
+                                    const file = e.target.files?.[0];
+                                    if (!file) return;
+                                    const formData = new FormData();
+                                    formData.append('file', file);
+                                    try {
+                                      const res = await fetch('http://localhost:8000/upload-font', { method: 'POST', body: formData });
+                                      if (res.ok) {
+                                        const data = await res.json();
+                                        alert('字體上傳成功！');
+                                        fetchFonts();
+                                        setSubtitleConfig(prev => ({ ...prev, fontFamily: data.font_name }));
+                                      }
+                                    } catch (err) { alert('上傳失敗'); }
+                                  }}
+                                />
+                              </div>
+
+                              {/* Safe Zone Control */}
+                              <div style={{ marginTop: 16 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                                  <label className="label-sm" style={{ display: 'block', marginBottom: 6, color: '#888' }}>安全框邊距 (Safe Zone)</label>
+                                  <span style={{ fontSize: 10, color: '#555' }}>{subtitleConfig.safeZoneMargin}%</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min="0"
+                                  max="30"
+                                  step="1"
+                                  className="slider-modern"
+                                  style={{ width: '100%' }}
+                                  value={subtitleConfig.safeZoneMargin}
+                                  onChange={(e) => setSubtitleConfig(prev => ({ ...prev, safeZoneMargin: Number(e.target.value) }))}
+                                />
+                              </div>
+                            </div>
+
+                            {/* Styling Params Panel (The existing one below will need to be rendered here or keep structure) */}
+                            {/* Moving the logic from below to here is tricky if I want to keep the file structure clean. 
+                                 For now, I will just render the Subtitle Properites Panel here directly.
+                             */}
+                            <div className="panel-card" style={{ background: '#1c1c1e', padding: 16, borderRadius: 12, border: '1px solid #333' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 8 }}>
+                                <Zap size={16} color="#3ea6ff" />
+                                <div style={{ fontWeight: 700, fontSize: 13, color: '#fff' }}>樣式詳細參數 (全域)</div>
+                              </div>
+
+                              {/* Basic Size & Pos */}
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16 }}>
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                                    <label className="label-sm" style={{ color: '#888' }}>字體大小</label>
+                                    <input
+                                      type="number"
+                                      className="input-modern"
+                                      style={{ width: 60, padding: 4, height: 24, fontSize: 12, textAlign: 'right' }}
+                                      value={subtitleConfig.fontSize}
+                                      onChange={(e) => setSubtitleConfig(prev => ({ ...prev, fontSize: Number(e.target.value) }))}
+                                    />
+                                  </div>
+                                  <input type="range" min="12" max="200" className="slider-modern" value={subtitleConfig.fontSize} onChange={(e) => setSubtitleConfig(prev => ({ ...prev, fontSize: Number(e.target.value) }))} />
+                                </div>
+                                <div>
+                                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                                    <label className="label-sm" style={{ color: '#888' }}>垂直位置 (%)</label>
+                                    <input
+                                      type="number"
+                                      className="input-modern"
+                                      style={{ width: 60, padding: 4, height: 24, fontSize: 12, textAlign: 'right' }}
+                                      value={subtitleConfig.verticalOffset}
+                                      onChange={(e) => setSubtitleConfig(prev => ({ ...prev, verticalOffset: Number(e.target.value) }))}
+                                    />
+                                  </div>
+                                  <input type="range" min="0" max="100" className="slider-modern" value={subtitleConfig.verticalOffset} onChange={(e) => setSubtitleConfig(prev => ({ ...prev, verticalOffset: Number(e.target.value) }))} />
+                                </div>
+                              </div>
+
+                              {/* A. Text Color & Gradient */}
+                              <div style={{ marginBottom: 16, borderBottom: '1px solid #222', paddingBottom: 16 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: '#aaa' }}>文字顏色</div>
+                                  <div
+                                    onClick={() => setSubtitleConfig(prev => ({ ...prev, useGradient: !prev.useGradient }))}
+                                    style={{
+                                      fontSize: 10, padding: '2px 8px', borderRadius: 4,
+                                      background: subtitleConfig.useGradient ? '#3ea6ff' : '#333',
+                                      color: subtitleConfig.useGradient ? '#fff' : '#666',
+                                      cursor: 'pointer', transition: '0.2s'
+                                    }}
+                                  >
+                                    漸層模式 {subtitleConfig.useGradient ? 'ON' : 'OFF'}
+                                  </div>
+                                </div>
+
+                                {!subtitleConfig.useGradient ? (
+                                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                    <input
+                                      type="color"
+                                      style={{ width: '100%', height: 36, padding: 0, border: 'none', background: 'none' }}
+                                      value={subtitleConfig.primaryColor}
+                                      onChange={(e) => setSubtitleConfig(prev => ({ ...prev, primaryColor: e.target.value }))}
+                                    />
+                                    <input className="input-modern" style={{ fontSize: 10, width: 85 }} value={subtitleConfig.primaryColor} readOnly />
+                                  </div>
+                                ) : (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                                    {/* Gradient Preview Bar */}
+                                    <div style={{
+                                      height: 12, borderRadius: 6, width: '100%',
+                                      background: `linear-gradient(90deg, ${subtitleConfig.gradientStops.map(s => `${s.color} ${s.offset}%`).join(', ')})`,
+                                      border: '1px solid #444', marginBottom: 4
+                                    }} />
+
+                                    {/* Stops List */}
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                                      {subtitleConfig.gradientStops.map((stop, idx) => (
+                                        <div key={idx} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                          <div style={{ width: 24, height: 24, borderRadius: 4, overflow: 'hidden', border: '1px solid #444', flexShrink: 0 }}>
+                                            <input type="color" style={{ width: 40, height: 40, cursor: 'pointer', margin: -8 }}
+                                              value={stop.color}
+                                              onChange={e => {
+                                                const newStops = [...subtitleConfig.gradientStops];
+                                                newStops[idx].color = e.target.value;
+                                                setSubtitleConfig(prev => ({ ...prev, gradientStops: newStops }));
+                                              }}
+                                            />
+                                          </div>
+                                          <div style={{ flex: 1 }}>
+                                            <input type="range" min="0" max="100" className="slider-modern"
+                                              value={stop.offset}
+                                              onChange={e => {
+                                                const newStops = [...subtitleConfig.gradientStops];
+                                                newStops[idx].offset = Number(e.target.value);
+                                                // Auto sort would be annoying while dragging, maybe sort after?
+                                                setSubtitleConfig(prev => ({ ...prev, gradientStops: newStops }));
+                                              }}
+                                            />
+                                          </div>
+                                          <span style={{ fontSize: 10, color: '#666', width: 28, textAlign: 'right' }}>{stop.offset}%</span>
+                                          {subtitleConfig.gradientStops.length > 2 && (
+                                            <button onClick={() => {
+                                              setSubtitleConfig(prev => ({ ...prev, gradientStops: prev.gradientStops.filter((_, i) => i !== idx) }));
+                                            }} style={{ background: 'none', border: 'none', color: '#ef4444', padding: 4, cursor: 'pointer', fontSize: 14 }}>×</button>
+                                          )}
+                                        </div>
+                                      ))}
+
+                                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+                                        <button className="btn-ghost-sm" style={{ fontSize: 10, padding: '4px 8px', borderColor: '#444' }} onClick={() => {
+                                          // Add a stop at 50% or appropriate gap
+                                          const lastStop = subtitleConfig.gradientStops[subtitleConfig.gradientStops.length - 1];
+                                          const newOffset = Math.min(100, lastStop.offset + 10);
+                                          setSubtitleConfig(prev => ({ ...prev, gradientStops: [...prev.gradientStops, { color: '#ffffff', offset: newOffset }].sort((a, b) => a.offset - b.offset) }));
+                                        }}>+ 新增顏色點</button>
+
+                                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                          <span style={{ fontSize: 10, color: '#666' }}>角度: {subtitleConfig.gradientAngle}°</span>
+                                          <input type="range" min="0" max="360" className="slider-modern" style={{ width: 60 }} value={subtitleConfig.gradientAngle} onChange={e => setSubtitleConfig(prev => ({ ...prev, gradientAngle: Number(e.target.value) }))} />
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* B. Outline Section */}
+                              <div style={{ marginBottom: 16, borderBottom: '1px solid #222', paddingBottom: 16 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: '#aaa' }}>描邊 (Outline)</div>
+                                  <input type="checkbox" checked={subtitleConfig.useOutline} onChange={e => setSubtitleConfig(prev => ({ ...prev, useOutline: e.target.checked }))} />
+                                </div>
+                                {subtitleConfig.useOutline && (
+                                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                    <input
+                                      type="color"
+                                      style={{ width: 40, height: 32, padding: 0, border: 'none', background: 'none' }}
+                                      value={subtitleConfig.outlineColor}
+                                      onChange={(e) => setSubtitleConfig(prev => ({ ...prev, outlineColor: e.target.value }))}
+                                    />
+                                    <div style={{ flex: 1 }}>
+                                      <input
+                                        type="range" min="0" max="20" step="0.5"
+                                        className="slider-modern"
+                                        value={subtitleConfig.outlineWidth}
+                                        onChange={(e) => setSubtitleConfig(prev => ({ ...prev, outlineWidth: Number(e.target.value) }))}
+                                      />
+                                    </div>
+                                    <span style={{ fontSize: 10, color: '#666', width: 20 }}>{subtitleConfig.outlineWidth}</span>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* C. Shadow Section */}
+                              <div style={{ marginBottom: 16, borderBottom: '1px solid #222', paddingBottom: 16 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: '#aaa' }}>陰影 (Shadow)</div>
+                                  <input type="checkbox" checked={subtitleConfig.useShadow} onChange={e => setSubtitleConfig(prev => ({ ...prev, useShadow: e.target.checked }))} />
+                                </div>
+                                {subtitleConfig.useShadow && (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                      <input type="color" style={{ width: 40, height: 32, border: 'none', background: 'none' }} value={subtitleConfig.shadowColor.startsWith('rgba') ? '#000000' : subtitleConfig.shadowColor} onChange={e => setSubtitleConfig(prev => ({ ...prev, shadowColor: e.target.value }))} />
+                                      <div style={{ flex: 1 }}>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>模糊度</label>
+                                        <input type="range" min="0" max="40" className="slider-modern" value={subtitleConfig.shadowBlur} onChange={e => setSubtitleConfig(prev => ({ ...prev, shadowBlur: Number(e.target.value) }))} />
+                                      </div>
+                                    </div>
+                                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                                      <div>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>X 偏移: {subtitleConfig.shadowOffsetX}</label>
+                                        <input type="range" min="-20" max="20" className="slider-modern" value={subtitleConfig.shadowOffsetX} onChange={e => setSubtitleConfig(prev => ({ ...prev, shadowOffsetX: Number(e.target.value) }))} />
+                                      </div>
+                                      <div>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>Y 偏移: {subtitleConfig.shadowOffsetY}</label>
+                                        <input type="range" min="-20" max="20" className="slider-modern" value={subtitleConfig.shadowOffsetY} onChange={e => setSubtitleConfig(prev => ({ ...prev, shadowOffsetY: Number(e.target.value) }))} />
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* D. Background Section */}
+                              <div style={{ marginBottom: 8 }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: '#aaa' }}>背景底盒 (Background)</div>
+                                  <input type="checkbox" checked={subtitleConfig.useBackground} onChange={e => setSubtitleConfig(prev => ({ ...prev, useBackground: e.target.checked }))} />
+                                </div>
+                                {subtitleConfig.useBackground && (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                      <input type="color" style={{ width: 40, height: 32, border: 'none', background: 'none' }} value={subtitleConfig.backgroundColor} onChange={e => setSubtitleConfig(prev => ({ ...prev, backgroundColor: e.target.value }))} />
+                                      <div style={{ flex: 1 }}>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>透明度: {subtitleConfig.backgroundOpacity}</label>
+                                        <input type="range" min="0" max="1" step="0.1" className="slider-modern" value={subtitleConfig.backgroundOpacity} onChange={e => setSubtitleConfig(prev => ({ ...prev, backgroundOpacity: Number(e.target.value) }))} />
+                                      </div>
+                                    </div>
+                                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                                      <div>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>圓角弧度: {subtitleConfig.borderRadius}</label>
+                                        <input type="range" min="0" max="50" className="slider-modern" value={subtitleConfig.borderRadius} onChange={e => setSubtitleConfig(prev => ({ ...prev, borderRadius: Number(e.target.value) }))} />
+                                      </div>
+                                      <div>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>上下內距 (Y): {subtitleConfig.paddingY}</label>
+                                        <input type="range" min="0" max="50" className="slider-modern" value={subtitleConfig.paddingY} onChange={e => setSubtitleConfig(prev => ({ ...prev, paddingY: Number(e.target.value) }))} />
+                                      </div>
+                                      <div>
+                                        <label className="label-sm" style={{ fontSize: 9 }}>左右內距 (X): {subtitleConfig.paddingX}</label>
+                                        <input type="range" min="0" max="100" className="slider-modern" value={subtitleConfig.paddingX} onChange={e => setSubtitleConfig(prev => ({ ...prev, paddingX: Number(e.target.value) }))} />
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      // Video/Image Inspector (The New Request)
+                      const style = activeCut.style || { scale: 1, x: 0, y: 0, rotation: 0, opacity: 1, mirror: false };
+                      const updateStyle = (key: string, val: any) => {
+                        setCuts(prev => prev.map(c => c.id === activeCut.id ? { ...c, style: { ...style, [key]: val } } : c));
+                      };
+
+                      return (
+                        <div style={{ padding: 12, height: '100%', overflowY: 'auto' }}>
+                          <div className="panel-card" style={{ background: '#1c1c1e', padding: 16, borderRadius: 12, border: '1px solid #333' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 8 }}>
+                              <Monitor size={16} color="#3ea6ff" />
+                              <div style={{ fontWeight: 700, fontSize: 13, color: '#fff' }}>變形 (Transform)</div>
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 16 }}>
+                              <div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                                  <label className="label-sm" style={{ color: '#888' }}>縮放 (Scale)</label>
+                                  <span className="label-sm" style={{ color: '#ccc' }}>{(style.scale * 100).toFixed(0)}%</span>
+                                </div>
+                                <input type="range" min="0" max="3" step="0.01" className="slider-modern" value={style.scale} onChange={e => updateStyle('scale', Number(e.target.value))} />
+                              </div>
+
+                              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                                <div>
+                                  <label className="label-sm" style={{ display: 'block', marginBottom: 6, color: '#888' }}>X 位置</label>
+                                  <input type="number" className="input-modern" value={style.x} onChange={e => updateStyle('x', Number(e.target.value))} />
+                                </div>
+                                <div>
+                                  <label className="label-sm" style={{ display: 'block', marginBottom: 6, color: '#888' }}>Y 位置</label>
+                                  <input type="number" className="input-modern" value={style.y} onChange={e => updateStyle('y', Number(e.target.value))} />
+                                </div>
+                              </div>
+
+                              <div>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                                  <label className="label-sm" style={{ color: '#888' }}>旋轉 (Rotation)</label>
+                                  <span className="label-sm" style={{ color: '#ccc' }}>{style.rotation}°</span>
+                                </div>
+                                <input type="range" min="-180" max="180" className="slider-modern" value={style.rotation} onChange={e => updateStyle('rotation', Number(e.target.value))} />
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="panel-card" style={{ background: '#1c1c1e', padding: 16, borderRadius: 12, border: '1px solid #333', marginTop: 12 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16, gap: 8 }}>
+                              <Zap size={16} color="#3ea6ff" />
+                              <div style={{ fontWeight: 700, fontSize: 13, color: '#fff' }}>不透明度 (Opacity)</div>
+                            </div>
+                            <div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                                <label className="label-sm" style={{ color: '#888' }}>透明度</label>
+                                <span className="label-sm" style={{ color: '#ccc' }}>{(style.opacity * 100).toFixed(0)}%</span>
+                              </div>
+                              <input type="range" min="0" max="1" step="0.01" className="slider-modern" value={style.opacity} onChange={e => updateStyle('opacity', Number(e.target.value))} />
+                            </div>
+                          </div>
+
+                          <div className="panel-card" style={{ background: '#1c1c1e', padding: 16, borderRadius: 12, border: '1px solid #333', marginTop: 12 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, gap: 8 }}>
+                              <input type="checkbox" checked={style.mirror || false} onChange={e => updateStyle('mirror', e.target.checked)} />
+                              <span style={{ fontSize: 13, color: '#ddd' }}>水平鏡像 (Mirror)</span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                 )}
               </div>
@@ -895,49 +2445,103 @@ function App() {
 
             {/* Center: Program Monitor */}
             <div className="panel-container" style={{ flex: 1 }}>
-              <div className="panel-header" style={{ justifyContent: 'space-between' }}>
+              <div className="panel-header">
                 <div className="panel-tab active">節目檢視: 序列 01</div>
-                {/* Layout Toggle */}
-                <div style={{ display: 'flex', gap: 4, marginRight: 8 }}>
-                  <button className={`btn-icon-sm ${!isVerticalMode ? 'active' : ''}`} onClick={() => setIsVerticalMode(false)} style={{ padding: 4, opacity: !isVerticalMode ? 1 : 0.5 }}>
-                    <Monitor size={14} />
-                  </button>
-                  <button className={`btn-icon-sm ${isVerticalMode ? 'active' : ''}`} onClick={() => setIsVerticalMode(true)} style={{ padding: 4, opacity: isVerticalMode ? 1 : 0.5 }}>
-                    <Smartphone size={14} />
-                  </button>
-                </div>
               </div>
               <div
                 className={`preview-area ${isVerticalMode ? 'vertical-mode' : 'horizontal-mode'}`}
                 style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', overflow: 'hidden', position: 'relative' }}
               >
-                {(videoUrl || cuts.length > 0) && !(cuts.length > 0 && !videoUrl && cuts.some(c => c.trackId === 0)) ? (
+                {(cuts.length > 0 || (videoUrl && duration === 0)) ? (
                   <div className="video-container" style={{ position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '100%', height: '100%' }}>
-                    {videoUrl ? (
-                      <video
-                        ref={videoRef}
-                        src={videoUrl}
-                        crossOrigin="anonymous"
-                        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                        onTimeUpdate={handleTimeUpdate}
-                        onLoadedMetadata={handleMetadata}
-                        onClick={togglePlay}
-                        onError={(e) => {
-                          console.error("Video element error:", e);
-                          if (videoUrl && videoUrl.startsWith('http') && videoFile) {
-                            console.log("♻️ Server video failed, falling back to local Blob URL...");
-                            setVideoUrl(URL.createObjectURL(videoFile));
-                          } else if (videoUrl) {
-                            alert("影片載入失敗！這可能是由於格式不支援 (例如 HEVC) 或檔案毀損。請嘗試將其轉換為標準 H.264 MP4 後再試。");
-                          }
-                        }}
-                      />
-                    ) : (
-                      // Text Only / Blank Mode
-                      <div style={{ width: '100%', height: '100%', background: '#000', display: 'flex', alignItems: 'center', justifyItems: 'center' }}>
-                        {/* Placeholder for size if needed, or just relying on container */}
-                      </div>
-                    )}
+
+                    {/* Multi-Track Media Renderer */}
+                    <div className="media-renderer-layer" style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}>
+                      {sortedTracks.filter(t => t.type !== 'text' && t.visible).map(track => {
+                        // 1. Try to find an active cut
+                        const activeCut = cuts.find(c => c.trackId === track.id && currentTime >= c.start && currentTime < c.end);
+
+                        // 2. Handle Initialization Case:
+                        // If we are on the main video track (0), and there are NO cuts at all (first load),
+                        // and we have a videoUrl, we MUST render the video to trigger onLoadedMetadata.
+                        const isInit = !activeCut && track.id === 0 && cuts.length === 0 && !!videoUrl;
+
+                        if (!activeCut && !isInit) return null;
+
+                        const asset = activeCut?.assetId ? projectAssets.find(a => a.id === activeCut.assetId) : null;
+
+                        // Default to track type if no asset (source video track 0)
+                        const mediaType = asset ? asset.type : track.type;
+                        const url = asset ? asset.url : (track.id === 0 ? videoUrl : null);
+                        if (!url) return null;
+
+                        // Calculate local time for the media element
+                        const localTime = activeCut
+                          ? (currentTime - activeCut.start) + (activeCut.sourceStart || 0)
+                          : 0; // In init mode, start at 0
+
+                        if (mediaType === 'video') {
+                          return (
+                            <video
+                              key={activeCut?.id || 'init-video'}
+                              src={url}
+                              onLoadedMetadata={track.id === 0 ? handleMetadata : undefined}
+                              style={{
+                                position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                                objectFit: 'contain', zIndex: track.id,
+                                // Apply Transform
+                                transform: activeCut?.style ? `translate(${activeCut.style.x}px, ${activeCut.style.y}px) scale(${activeCut.style.scale}) rotate(${activeCut.style.rotation}deg) scaleX(${activeCut.style.mirror ? -1 : 1})` : 'none',
+                                opacity: activeCut?.style ? activeCut.style.opacity : 1
+                              }}
+                              ref={(el) => {
+                                if (el) {
+                                  if (track.id === 0) (videoRef as any).current = el;
+
+                                  // Only sync time if established, otherwise let it load
+                                  if (Math.abs(el.currentTime - localTime) > 0.3) el.currentTime = localTime;
+
+                                  if (isPlaying && el.paused) el.play().catch(() => { });
+                                  else if (!isPlaying && !el.paused) el.pause();
+                                }
+                              }}
+                            />
+                          );
+                        }
+
+                        if (mediaType === 'image') {
+                          return (
+                            <img
+                              key={activeCut?.id || 'init-image'}
+                              src={url}
+                              style={{
+                                position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+                                objectFit: 'contain', zIndex: track.id,
+                                // Apply Transform for Images too
+                                transform: activeCut?.style ? `translate(${activeCut.style.x}px, ${activeCut.style.y}px) scale(${activeCut.style.scale}) rotate(${activeCut.style.rotation}deg) scaleX(${activeCut.style.mirror ? -1 : 1})` : 'none',
+                                opacity: activeCut?.style ? activeCut.style.opacity : 1
+                              }}
+                            />
+                          );
+                        }
+
+                        if (mediaType === 'audio') {
+                          return (
+                            <audio
+                              key={activeCut?.id || 'init-audio'}
+                              src={url}
+                              ref={(el) => {
+                                if (el) {
+                                  if (Math.abs(el.currentTime - localTime) > 0.3) el.currentTime = localTime;
+                                  if (isPlaying && el.paused) el.play().catch(() => { });
+                                  else if (!isPlaying && !el.paused) el.pause();
+                                }
+                              }}
+                            />
+                          );
+                        }
+                        return null;
+                      })}
+                    </div>
 
                     {/* Text Overlays Layer */}
                     <div className="text-overlay-renderer" style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, pointerEvents: 'none', overflow: 'hidden' }}>
@@ -945,14 +2549,62 @@ function App() {
                         const track = videoTracks.find(t => t.id === c.trackId);
                         return track && track.type === 'text' && currentTime >= c.start && currentTime < c.end;
                       }).map(cut => (
-                        <div key={cut.id} className="text-element" style={{
-                          position: 'absolute',
-                          top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-                          fontSize: 48, color: 'white', fontWeight: 'bold',
-                          textShadow: '0 2px 4px rgba(0,0,0,0.8)',
-                        }}>
-                          {cut.label}
-                        </div>
+                        <React.Fragment key={cut.id}>
+                          {/* Safe Zone Visualizer (Optional: Only show when editing subtitles?) */}
+                          {selectedCutIds.includes(cut.id) && (
+                            <div style={{
+                              position: 'absolute',
+                              top: 0, left: 0, right: 0, bottom: 0,
+                              margin: `0 ${subtitleConfig.safeZoneMargin}%`,
+                              borderLeft: '1px dashed rgba(255, 255, 0, 0.3)',
+                              borderRight: '1px dashed rgba(255, 255, 0, 0.3)',
+                              pointerEvents: 'none',
+                              zIndex: 0
+                            }} />
+                          )}
+                          <div key={cut.id} className="text-element" style={{
+                            position: 'absolute',
+                            top: `${subtitleConfig.verticalOffset}%`,
+                            left: '50%', transform: 'translate(-50%, -50%)',
+                            fontSize: `${subtitleConfig.fontSize}px`,
+                            fontFamily: `'${subtitleConfig.fontFamily}', sans-serif`,
+                            fontWeight: 'bold',
+                            textAlign: 'center',
+                            width: `${100 - (subtitleConfig.safeZoneMargin * 2)}%`, // Apply Safe Zone Width
+                            pointerEvents: 'none',
+                            display: 'flex',
+                            justifyContent: 'center',
+                            // Debug / Visual Guide for safe zone (only when selected?)
+                            // outline: '1px dashed rgba(255,255,0,0.3)' 
+                          }}>
+                            <span style={{
+                              padding: subtitleConfig.useBackground ? `${subtitleConfig.paddingY}px ${subtitleConfig.paddingX}px` : 0,
+                              borderRadius: subtitleConfig.useBackground ? `${subtitleConfig.borderRadius}px` : 0,
+                              background: subtitleConfig.useBackground
+                                ? `${subtitleConfig.backgroundColor}${Math.round(subtitleConfig.backgroundOpacity * 255).toString(16).padStart(2, '0')}`
+                                : 'transparent',
+                              // Text Color & Gradient
+                              color: subtitleConfig.useGradient ? 'transparent' : subtitleConfig.primaryColor,
+                              backgroundImage: subtitleConfig.useGradient
+                                ? `linear-gradient(${subtitleConfig.gradientAngle}deg, ${subtitleConfig.gradientStops.map(s => `${s.color} ${s.offset}%`).join(', ')})`
+                                : 'none',
+                              WebkitBackgroundClip: subtitleConfig.useGradient ? 'text' : 'unset',
+                              // Outline - Only if enabled
+                              // Outline - proper outward stroke using paint-order
+                              WebkitTextStroke: subtitleConfig.useOutline ? `${subtitleConfig.outlineWidth * 2}px ${subtitleConfig.outlineColor}` : 'unset',
+                              paintOrder: 'stroke fill',
+                              WebkitPaintOrder: 'stroke fill', // Important for reliable "outward" look
+
+                              // Shadow - Only if enabled (independent of outline now)
+                              textShadow: subtitleConfig.useShadow ? `${subtitleConfig.shadowOffsetX}px ${subtitleConfig.shadowOffsetY}px ${subtitleConfig.shadowBlur}px ${subtitleConfig.shadowColor}` : 'none',
+                              WebkitFontSmoothing: 'antialiased',
+                              display: 'inline-block',
+                              whiteSpace: 'pre-wrap'
+                            } as React.CSSProperties}>
+                              {cut.label}
+                            </span>
+                          </div>
+                        </React.Fragment>
                       ))}
                     </div>
 
@@ -985,10 +2637,20 @@ function App() {
                             <div style={{ color: '#ff4444', fontWeight: 'bold', marginBottom: 12, fontSize: 20 }}>⚠️ 媒體連結中斷</div>
                             <p style={{ color: '#aaa', fontSize: 13, marginBottom: 20 }}>目前專案中有剪輯進度，但預覽影片未載入。<br />請重新選取影片檔案以繼續編輯。</p>
                             <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
-                              <label className="btn-primary-sm" style={{ cursor: 'pointer', background: '#d32f2f', border: 'none' }}>
+                              <button
+                                className="btn-primary-sm"
+                                style={{ cursor: 'pointer', background: '#d32f2f', border: 'none' }}
+                                onClick={() => relinkInputRef.current?.click()}
+                              >
                                 🚀 重新連結影片
-                                <input type="file" hidden onChange={handleFileUpload} accept="video/*" />
-                              </label>
+                              </button>
+                              <input
+                                type="file"
+                                hidden
+                                ref={relinkInputRef}
+                                onChange={handleFileUpload}
+                                accept="video/*"
+                              />
                               <button className="btn-ghost-sm" onClick={() => { if (confirm('要清空目前進度嗎？')) { setCuts([]); localStorage.removeItem('antigravity_cuts'); window.location.reload(); } }}>
                                 捨棄進度
                               </button>
@@ -999,10 +2661,20 @@ function App() {
                             <div style={{ marginBottom: 20, opacity: 0.5 }}>
                               <Upload size={64} strokeWidth={1} />
                             </div>
-                            <label className="btn-primary-sm" style={{ padding: '10px 24px', fontSize: 14 }}>
+                            <button
+                              className="btn-primary-sm"
+                              style={{ padding: '10px 24px', fontSize: 14, cursor: 'pointer', border: 'none' }}
+                              onClick={() => fileInputRef.current?.click()}
+                            >
                               點擊匯入或拖曳影片至此
-                              <input type="file" hidden onChange={handleFileUpload} accept="video/*" />
-                            </label>
+                            </button>
+                            <input
+                              type="file"
+                              hidden
+                              ref={fileInputRef}
+                              onChange={handleFileUpload}
+                              accept="video/*,audio/*,image/*,.mkv,.ts,.flv"
+                            />
                             <p style={{ marginTop: 12, fontSize: 11, color: '#555' }}>支援 MP4, MOV, WEBM 等常見格式</p>
                           </>
                         )}
@@ -1012,8 +2684,9 @@ function App() {
                 )}
               </div>
             </div>
-
           </div>
+
+
 
           {/* Bottom Section: Timeline */}
           <div className="timeline-section" style={{ display: 'flex', flexDirection: 'column' }}>
@@ -1035,11 +2708,11 @@ function App() {
                   >
                     <Scissors size={18} />
                   </div>
-                  {/* Hand Tool (Visual only for now) */}
+                  {/* Hand Tool */}
                   <div
-                    className={`tool-btn ${dragState.type === 'move' ? '' : ''}`} // Just visual toggle for now
-                    title="手形工具 (H) - 暫未開放"
-                    style={{ opacity: 0.5, cursor: 'not-allowed' }}
+                    className={`tool-btn ${activeTool === 'hand' ? 'active' : ''}`}
+                    title="手形工具 (H) - 拖拽平移時間軸"
+                    onClick={() => setActiveTool('hand')}
                   >
                     <Hand size={18} />
                   </div>
@@ -1048,15 +2721,16 @@ function App() {
                 {/* Actions Group */}
                 <div className="tool-group">
                   <div
-                    className="tool-btn"
-                    title="分割目前片段 (Cmd+K)"
-                    onClick={handleSplit}
+                    className="tool-btn action-btn-accent"
+                    title="分割 (Cmd+K) - 在播放頭位置切割"
+                    onClick={() => handleSplit()}
+                    style={{ color: '#3ea6ff' }}
                   >
                     <SplitSquareHorizontal size={18} />
                   </div>
                   <div
                     className="tool-btn danger"
-                    title="刪除選取片段 (Delete)"
+                    title="刪除 (Delete) - 移除選定片段"
                     onClick={handleDelete}
                   >
                     <Trash size={18} />
@@ -1070,12 +2744,38 @@ function App() {
                     title="新增文字 (T)"
                     onClick={() => {
                       setActiveTool('text');
+                      const duration = 3;
+                      const start = currentTime;
+                      const end = start + duration;
+
+                      // Smart Track Allocation
+                      let targetTrackId = -1;
+                      // Check existing text tracks (id > 0)
+                      const textTracks = videoTracks.filter(t => t.type === 'text');
+
+                      for (const track of textTracks) {
+                        const hasOverlap = cuts.some(c => c.trackId === track.id && !(c.end <= start || c.start >= end));
+                        if (!hasOverlap) {
+                          targetTrackId = track.id;
+                          break;
+                        }
+                      }
+
+                      // If all occupied or none, create new track
+                      if (targetTrackId === -1) {
+                        const newId = videoTracks.length > 0 ? Math.max(...videoTracks.map(t => t.id)) + 1 : 1;
+                        setVideoTracks(prev => [...prev, { id: newId, type: 'text', name: `T${newId}`, visible: true, locked: false }]);
+                        targetTrackId = newId;
+                      }
+
                       const newCut: Cut = {
                         id: Math.random().toString(36).substr(2, 9),
-                        start: currentTime,
-                        end: currentTime + 3,
+                        start,
+                        end,
+                        sourceStart: 0,
+                        sourceEnd: 0,
                         label: '文字圖層',
-                        trackId: 1
+                        trackId: targetTrackId
                       };
                       setCuts(prev => [...prev, newCut]);
                       setActiveTool('select');
@@ -1083,7 +2783,15 @@ function App() {
                   >
                     <Type size={18} />
                   </div>
-                  <div className="tool-btn" title="磁吸對齊 (S) - 開發中" style={{ opacity: 0.5 }}>
+                  <div
+                    className={`tool-btn ${isMagnetEnabled ? 'active' : ''}`}
+                    title="磁吸防重疊模組 (S)"
+                    onClick={() => setIsMagnetEnabled(!isMagnetEnabled)}
+                    style={{
+                      color: isMagnetEnabled ? '#10b981' : undefined,
+                      background: isMagnetEnabled ? 'rgba(16,185,129,0.1)' : undefined
+                    }}
+                  >
                     <Magnet size={18} />
                   </div>
                 </div>
@@ -1114,56 +2822,123 @@ function App() {
               <div className="timeline-headers-container">
                 {/* Track Headers V1/A1 */}
                 <div className="track-headers">
-                  {/* V1 Header */}
-                  <div className={`track-header-item ${videoTracks[0].locked ? 'locked' : ''}`} style={{ opacity: videoTracks[0].visible ? 1 : 0.5 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <span style={{ color: '#999', fontWeight: 'bold' }}>V1</span>
-                      <div style={{ display: 'flex', gap: 4 }}>
-                        <div
-                          onClick={() => toggleTrackVisibility(0)}
-                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[0].visible ? '#3ea6ff' : '#666', cursor: 'pointer' }}
-                        >
-                          {videoTracks[0].visible ? '👁️' : '🚫'}
-                        </div>
-                        <div
-                          onClick={() => toggleTrackLock(0)}
-                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[0].locked ? '#ef4444' : '#666', cursor: 'pointer' }}
-                        >
-                          {videoTracks[0].locked ? '🔒' : '🔓'}
-                        </div>
-                      </div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 2 }}>
-                      <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3ea6ff', opacity: 0.5 }}></div>
-                    </div>
-                  </div>
-                  {/* A1 Header (Subtitles/Text Track) */}
-                  <div className={`track-header-item ${videoTracks[1].locked ? 'locked' : ''}`} style={{ opacity: videoTracks[1].visible ? 1 : 0.5 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                      <span style={{ color: '#999', fontWeight: 'bold' }}>T1</span>
-                      <div style={{ display: 'flex', gap: 4 }}>
-                        <div
-                          onClick={() => toggleTrackVisibility(1)}
-                          style={{ border: '1px solid #555', padding: '0 4px', borderRadius: 2, fontSize: 9, color: videoTracks[1].visible ? '#10b981' : '#666', cursor: 'pointer' }}
-                        >
-                          {videoTracks[1].visible ? '👁️' : '🚫'}
-                        </div>
-                      </div>
-                    </div>
-                    {/* Fake Audio Meter visualization */}
-                    <div style={{ height: 4, width: '100%', background: '#333', marginTop: 8, borderRadius: 2, overflow: 'hidden' }}>
-                      <div style={{ height: '100%', width: isPlaying ? '70%' : '10%', background: 'linear-gradient(90deg, #10b981, #f59e0b, #ef4444)', transition: 'width 0.1s' }}></div>
+                  {/* Track Add Toolbar Optimized */}
+                  <div style={{
+                    display: 'flex',
+                    borderBottom: '1px solid #333',
+                    background: '#1a1a1a',
+                    height: 24,
+                    alignItems: 'center',
+                    padding: '0 8px',
+                    gap: 6
+                  }}>
+                    <span style={{ fontSize: 9, fontWeight: 800, color: '#555', letterSpacing: 1 }}>ADD</span>
+                    <div style={{ display: 'flex', gap: 2, background: '#111', padding: 2, borderRadius: 4 }}>
+                      <button
+                        onClick={() => handleAddTrack('text')}
+                        title="新增字幕軌"
+                        className="track-add-btn"
+                        style={{ background: 'none', border: 'none', color: '#6366f1', cursor: 'pointer', padding: 3, display: 'flex', borderRadius: 3 }}
+                      >
+                        <Type size={11} strokeWidth={2.5} />
+                      </button>
+                      <button
+                        onClick={() => handleAddTrack('video')}
+                        title="新增影像軌"
+                        className="track-add-btn"
+                        style={{ background: 'none', border: 'none', color: '#3ea6ff', cursor: 'pointer', padding: 3, display: 'flex', borderRadius: 3 }}
+                      >
+                        <Video size={11} strokeWidth={2.5} />
+                      </button>
+                      <button
+                        onClick={() => handleAddTrack('audio')}
+                        title="新增音訊軌"
+                        className="track-add-btn"
+                        style={{ background: 'none', border: 'none', color: '#3ea6ff', cursor: 'pointer', padding: 3, display: 'flex', borderRadius: 3 }}
+                      >
+                        <Music size={11} strokeWidth={2.5} />
+                      </button>
                     </div>
                   </div>
+                  {sortedTracks.map(track => {
+                    const isThin = track.type === 'text';
+                    const theme = getTrackTheme(track.type);
+                    return (
+                      <div
+                        key={track.id}
+                        className={`track-header-item ${track.locked ? 'locked' : ''}`}
+                        style={{
+                          height: isThin ? 24 : 60,
+                          opacity: track.visible ? 1 : 0.5,
+                          marginBottom: 1
+                        }}
+                      >
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: isThin ? 0 : 4, alignItems: 'center', width: '100%' }}>
+                          <div style={{
+                            background: theme.secondary,
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4
+                          }}>
+                            <span style={{
+                              color: theme.primary,
+                              fontWeight: 800,
+                              fontSize: 9,
+                              fontFamily: 'monospace'
+                            }}>{track.name}</span>
+                          </div>
+
+                          <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                            <div
+                              onClick={() => toggleTrackVisibility(track.id)}
+                              className="track-control-btn"
+                              style={{ color: track.visible ? '#fff' : '#444' }}
+                            >
+                              {track.visible ? '👁️' : '🚫'}
+                            </div>
+                            {!isThin && (
+                              <div
+                                onClick={() => toggleTrackLock(track.id)}
+                                className="track-control-btn"
+                                style={{ color: track.locked ? '#ef4444' : '#444' }}
+                              >
+                                {track.locked ? '🔒' : '🔓'}
+                              </div>
+                            )}
+                            <div
+                              onClick={() => handleDeleteTrack(track.id)}
+                              className="track-control-btn delete-track"
+                              title="刪除軌道"
+                            >
+                              <X size={10} />
+                            </div>
+                          </div>
+                        </div>
+                        {track.type === 'video' && !isThin && (
+                          <div style={{ display: 'flex', gap: 2 }}>
+                            <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3ea6ff', opacity: 0.5 }}></div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
+
 
                 {/* Tracks Area */}
                 <div className="timeline-tracks-area"
                   ref={timelineContainerRef}
+                  onWheel={handleWheelZoom}
                 >
                   {/* Ruler */}
                   <div className="timeline-ruler-container"
-                    style={{ width: Math.max(100, duration * zoomLevel) + 'px' }}
+                    style={{
+                      minWidth: '100%',
+                      width: Math.max(100, duration * zoomLevel) + 'px',
+                      cursor: getTimelineCursor()
+                    }}
                     onMouseDown={handleTimelineMouseDown}
                   >
                     {/* Scrubbing Playhead Head (The Triangle) inside ruler */}
@@ -1186,185 +2961,379 @@ function App() {
 
                   {/* Tracks Content */}
                   <div className="tracks-content"
-                    style={{ width: Math.max(100, duration * zoomLevel) + 'px', cursor: dragState.type === 'scrub' ? 'ew-resize' : 'default' }}
+                    style={{
+                      minWidth: '100%',
+                      width: Math.max(100, duration * zoomLevel) + 'px',
+                      cursor: getTimelineCursor()
+                    }}
                     onMouseDown={handleTimelineMouseDown}
                     ref={timelineRef}
                   >
                     {/* Playhead Line */}
-                    <div className="playhead-marker" style={{ left: currentTime * zoomLevel }}></div>
+                    <div className="playhead-marker" style={{ left: currentTime * zoomLevel }}>
+                      {/* Floating time code */}
+                      <div style={{ position: 'absolute', top: -14, left: 4, background: '#3ea6ff', color: 'white', padding: '1px 4px', borderRadius: 2, fontSize: 8, fontWeight: 'bold', pointerEvents: 'none', whiteSpace: 'nowrap' }}>
+                        {currentTime.toFixed(2)}s
+                      </div>
+                    </div>
 
-                    {/* V1 Track */}
-                    <div className="track-lane">
-                      {cuts.map(cut => (
+                    {/* Header Alignment Spacer */}
+                    <div style={{ height: 24, borderBottom: '1px solid #333', background: 'rgba(255,255,255,0.02)' }}></div>
+
+                    {/* Dynamic Tracks Loop */}
+                    {sortedTracks.map(track => {
+                      // For A1 (Audio) track, we also show V1 (Video) clips as "Audio"
+                      const trackCuts = track.id === 99
+                        ? cuts.filter(c => c.trackId === track.id || c.trackId === 0)
+                        : cuts.filter(c => c.trackId === track.id);
+
+                      const isThin = track.type === 'text';
+
+                      return (
                         <div
-                          key={cut.id}
-                          className={`clip-block ${selectedCutId === cut.id ? 'selected' : ''}`}
+                          key={track.id}
+                          data-track-id={track.id}
+                          className={`track-lane ${isThin ? 'thin' : ''}`}
                           style={{
-                            left: cut.start * zoomLevel,
-                            width: Math.max(10, (cut.end - cut.start) * zoomLevel) + 'px'
+                            height: isThin ? 24 : 48,
+                            background: track.id % 2 === 0 ? 'transparent' : 'rgba(255,255,255,0.02)',
+                            borderBottom: '1px solid #333',
+                            position: 'relative',
+                            display: 'flex',
+                            alignItems: 'center'
                           }}
-                          onMouseDown={(e) => handleClipMouseDown(e, cut, 'move')}
                         >
-                          {/* Drag Handles */}
-                          <div
-                            className="clip-handle-area"
-                            style={{ position: 'absolute', left: 0, width: 6, height: '100%', cursor: 'ew-resize', zIndex: 20, background: 'rgba(255,255,255,0.1)' }}
-                            onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-start')}
-                          />
-                          <div
-                            className="clip-handle-area"
-                            style={{ position: 'absolute', right: 0, width: 6, height: '100%', cursor: 'ew-resize', zIndex: 20, background: 'rgba(255,255,255,0.1)' }}
-                            onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-end')}
-                          />
+                          {/* Ghost Overlay for New Asset Dragging */}
+                          {dragState.type === 'new-asset' && dragState.ghostTime !== undefined && dragState.ghostTrackId === track.id && (
+                            <div
+                              style={{
+                                position: 'absolute',
+                                left: dragState.ghostTime * zoomLevel,
+                                width: (dragState.newAssetDuration || 5) * zoomLevel,
+                                height: isThin ? 16 : 36,
+                                top: isThin ? 4 : 6,
+                                background: 'rgba(255, 255, 255, 0.2)',
+                                border: '1px dashed rgba(255, 255, 255, 0.6)',
+                                pointerEvents: 'none',
+                                zIndex: 100
+                              }}
+                            />
+                          )}
+                          {trackCuts.map(cut => (
+                            <div
+                              key={cut.id + (track.id === 99 ? '-audio' : '')} // Unique key for ghost
+                              data-cut-id={cut.id}
+                              className={`clip-block ${selectedCutIds.includes(cut.id) ? 'selected' : ''}`}
+                              style={{
+                                position: 'absolute',
+                                left: cut.start * zoomLevel,
+                                width: Math.max(10, (cut.end - cut.start) * zoomLevel) + 'px',
+                                background: getTrackTheme(track.type).primary,
+                                border: `1px solid ${getTrackTheme(track.type).border}`,
+                                opacity: track.visible ? 0.9 : 0.4,
+                                height: isThin ? '16px' : '36px',
+                                top: isThin ? '4px' : '6px',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                overflow: 'visible',
+                                borderColor: selectedCutIds.includes(cut.id) ? '#fff' : undefined,
+                                boxShadow: selectedCutIds.includes(cut.id) ? '0 0 10px rgba(255,255,255,0.4)' : 'none',
+                                zIndex: selectedCutIds.includes(cut.id) ? 10 : 1,
+                                cursor: activeTool === 'select' ? 'move' : 'inherit'
+                              }}
+                              onMouseDown={(e) => !track.locked && handleClipMouseDown(e, cut, 'move')}
+                            >
+                              {!track.locked && (
+                                <>
+                                  <div
+                                    className="clip-handle-area"
+                                    style={{
+                                      position: 'absolute', left: 0, width: 8, height: '100%',
+                                      cursor: 'ew-resize', zIndex: 20,
+                                      background: 'rgba(255,255,255,0.2)',
+                                      borderRight: '1px solid rgba(0,0,0,0.1)'
+                                    }}
+                                    onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-start')}
+                                  />
+                                  <div
+                                    className="clip-handle-area"
+                                    style={{
+                                      position: 'absolute', right: 0, width: 8, height: '100%',
+                                      cursor: 'ew-resize', zIndex: 20,
+                                      background: 'rgba(255,255,255,0.2)',
+                                      borderLeft: '1px solid rgba(0,0,0,0.1)'
+                                    }}
+                                    onMouseDown={(e) => handleClipMouseDown(e, cut, 'trim-end')}
+                                  />
 
-                          <span className="clip-label">{cut.label}</span>
+
+                                </>
+                              )}
+
+                              <span className="clip-label" style={{
+                                fontSize: isThin ? '9px' : '11px',
+                                padding: '0 10px',
+                                whiteSpace: 'nowrap',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                maxWidth: '100%',
+                                pointerEvents: 'none'
+                              }}>{cut.label}</span>
+                            </div>
+                          ))}
                         </div>
-                      ))}
-                    </div>
-
-                    {/* A1 Track (Mirror V1 for now) */}
-                    <div className="track-lane" style={{ background: '#1a1a1a' }}>
-                      {cuts.map(cut => (
-                        <div
-                          key={'audio-' + cut.id}
-                          className="clip-block"
-                          style={{
-                            left: cut.start * zoomLevel,
-                            width: Math.max(10, (cut.end - cut.start) * zoomLevel) + 'px',
-                            background: '#10b981', // Audio Green
-                            border: '1px solid #059669',
-                            opacity: 0.8
-                          }}
-                        />
-                      ))}
-                    </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>
             </div>
           </div>
 
-        </div>
-      )}
 
-      {/* Export Modal */}
-      {showExportModal && (
-        <div className="modal-overlay" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div className="export-modal-content" style={{ width: 420, background: '#121212', borderRadius: 20, border: '1px solid #333', overflow: 'hidden', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.5)' }}>
-            <div style={{ padding: '20px 24px', borderBottom: '1px solid #222', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#1a1a1a' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                <div style={{ padding: 8, background: 'rgba(62,166,255,0.1)', borderRadius: 10 }}>
-                  <Download size={20} color="#3ea6ff" />
-                </div>
-                <div>
-                  <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#fff' }}>匯出影片</h3>
-                  <div style={{ fontSize: 11, color: '#666' }}>設定您的匯出偏好</div>
-                </div>
-              </div>
-              <button
-                onClick={() => setShowExportModal(false)}
-                className="btn-icon-sm"
-                style={{ background: '#222', borderRadius: '50%', border: '1px solid #333' }}
-              >
-                <X size={16} />
-              </button>
-            </div>
 
-            <div style={{ padding: 24 }}>
-              {/* Resolution Toggle */}
-              <div style={{ marginBottom: 24 }}>
-                <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出解析度</label>
-                <div style={{ display: 'flex', gap: 10 }}>
-                  {[{ id: '1080p', label: '1080p', desc: 'Full HD' }, { id: '720p', label: '720p', desc: 'HD Ready' }].map(res => (
-                    <div
-                      key={res.id}
-                      onClick={() => setExportResolution(res.id)}
+
+
+          {/* Export Sidebar Panel (Addressing: "How do I check if it covers the screen?") */}
+          {
+            showExportModal && (
+              <div className="modal-overlay" style={{ display: 'flex', alignItems: 'stretch', justifyContent: 'flex-end', zIndex: 1001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(2px)' }}>
+                <div
+                  className="export-side-panel"
+                  style={{
+                    width: 400,
+                    background: '#121212',
+                    borderLeft: '1px solid #333',
+                    overflowY: 'auto',
+                    boxShadow: '-10px 0 30px rgba(0,0,0,0.5)',
+                    animation: 'slideInRight 0.3s ease-out'
+                  }}
+                >
+                  <div style={{ padding: '20px 24px', borderBottom: '1px solid #222', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#1a1a1a' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div style={{ padding: 8, background: 'rgba(62,166,255,0.1)', borderRadius: 10 }}>
+                        <Download size={20} color="#3ea6ff" />
+                      </div>
+                      <div>
+                        <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#fff' }}>匯出影片</h3>
+                        <div style={{ fontSize: 11, color: '#666' }}>設定您的匯出偏好</div>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setShowExportModal(false)}
+                      className="btn-icon-sm"
+                      style={{ background: '#222', borderRadius: '50%', border: '1px solid #333' }}
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div style={{ padding: 24 }}>
+                    {/* Project Status Summary (Addressing user check request) */}
+                    <div className="panel-card" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid #333', padding: 20, borderRadius: 12, marginBottom: 24 }}>
+                      <label style={{ display: 'block', marginBottom: 16, fontSize: 13, fontWeight: 700, color: '#3ea6ff', textTransform: 'uppercase', letterSpacing: 0.5 }}>專案匯出概覽</label>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                        <div>
+                          <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>總片段數</div>
+                          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>{cuts.length} <span style={{ fontSize: 11, fontWeight: 400, color: '#555' }}>segments</span></div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>預估匯出時長</div>
+                          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>
+                            {Math.max(0, ...cuts.map(c => c.end)).toFixed(1)} <span style={{ fontSize: 11, fontWeight: 400, color: '#555' }}>sec</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: videoUrl ? '#3ea6ff' : '#ef4444', boxShadow: videoUrl ? '0 0 8px #3ea6ff' : 'none' }} />
+                        <span style={{ fontSize: 11, color: '#aaa' }}>{videoUrl ? '媒體來源已連結，準備就緒' : '請注意：尚未連結原始影片素材'}</span>
+                      </div>
+                    </div>
+
+                    {/* Resolution Toggle */}
+                    <div style={{ marginBottom: 24 }}>
+                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出解析度</label>
+                      <div style={{ display: 'flex', gap: 10 }}>
+                        {[
+                          { id: '4k', label: '4K', desc: 'Ultra HD' },
+                          { id: '1080p', label: '1080p', desc: 'Full HD' },
+                          { id: '720p', label: '720p', desc: 'HD Ready' }
+                        ].map(res => (
+                          <div
+                            key={res.id}
+                            onClick={() => {
+                              setExportResolution(res.id);
+                              // Auto-adjust bitrate for 4K presets
+                              if (res.id === '4k' && exportBitrate < 30) setExportBitrate(50);
+                              if (res.id === '1080p' && exportBitrate > 30) setExportBitrate(16);
+                            }}
+                            style={{
+                              flex: 1, padding: '12px 16px', borderRadius: 12, cursor: 'pointer', transition: 'all 0.2s',
+                              border: `1px solid ${exportResolution === res.id ? '#3ea6ff' : '#222'}`,
+                              background: exportResolution === res.id ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
+                              textAlign: 'center'
+                            }}
+                          >
+                            <div style={{ fontSize: 14, fontWeight: 700, color: exportResolution === res.id ? '#3ea6ff' : '#eee' }}>{res.label}</div>
+                            <div style={{ fontSize: 10, color: exportResolution === res.id ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{res.desc}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Bitrate Presets */}
+                    <div style={{ marginBottom: 24 }}>
+                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出畫質碼率</label>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+                        {[
+                          { val: 8, label: '標準', desc: '8M' },
+                          { val: 16, label: '高清', desc: '16M' },
+                          { val: 32, label: '極致', desc: '32M' },
+                          { val: 50, label: '大師', desc: '50M' }
+                        ].map(opt => (
+                          <div
+                            key={opt.val}
+                            onClick={() => setExportBitrate(opt.val)}
+                            style={{
+                              padding: '10px 4px', borderRadius: 10, cursor: 'pointer', transition: 'all 0.2s',
+                              border: `1px solid ${exportBitrate === opt.val ? '#3ea6ff' : '#222'}`,
+                              background: exportBitrate === opt.val ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
+                              textAlign: 'center'
+                            }}
+                          >
+                            <div style={{ fontSize: 12, fontWeight: 700, color: exportBitrate === opt.val ? '#3ea6ff' : '#eee' }}>{opt.label}</div>
+                            <div style={{ fontSize: 9, color: exportBitrate === opt.val ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{opt.desc}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Format Selector (Multi-select requested by user) */}
+                    <div style={{ marginBottom: 24 }}>
+                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 700, color: '#aaa', textTransform: 'uppercase' }}>匯出格式選擇 (可多選)</label>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                        {[
+                          { id: 'video', label: '影片 (MP4)', icon: <Video size={16} /> },
+                          { id: 'audio', label: '音訊 (MP3)', icon: <Music size={16} /> },
+                          { id: 'xml', label: '工程 (XML)', icon: <SplitSquareHorizontal size={16} /> },
+                          { id: 'srt', label: '字幕 (SRT)', icon: <Type size={16} /> },
+                        ].map(format => {
+                          const isSelected = selectedFormats.includes(format.id);
+                          return (
+                            <div
+                              key={format.id}
+                              onClick={() => {
+                                setSelectedFormats(prev =>
+                                  prev.includes(format.id)
+                                    ? prev.filter(f => f !== format.id)
+                                    : [...prev, format.id]
+                                );
+                              }}
+                              style={{
+                                padding: '12px', borderRadius: 12, background: isSelected ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
+                                border: `1px solid ${isSelected ? '#3ea6ff' : '#222'}`,
+                                cursor: 'pointer', transition: 'all 0.2s',
+                                display: 'flex', alignItems: 'center', gap: 10
+                              }}
+                            >
+                              <span style={{ color: isSelected ? '#3ea6ff' : '#555' }}>{format.icon}</span>
+                              <span style={{ fontSize: 12, fontWeight: 600, color: isSelected ? '#eee' : '#666' }}>{format.label}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <button
+                      className="btn-primary"
+                      onClick={handleExportVideo}
+                      disabled={isProcessing || selectedFormats.length === 0}
                       style={{
-                        flex: 1, padding: '12px 16px', borderRadius: 12, cursor: 'pointer', transition: 'all 0.2s',
-                        border: `1px solid ${exportResolution === res.id ? '#3ea6ff' : '#222'}`,
-                        background: exportResolution === res.id ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
-                        textAlign: 'center'
+                        width: '100%', height: 48, fontSize: 15, fontWeight: 700, borderRadius: 14,
+                        background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)',
+                        boxShadow: '0 8px 20px -5px rgba(0,122,255,0.4)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+                        opacity: (isProcessing || selectedFormats.length === 0) ? 0.6 : 1
                       }}
                     >
-                      <div style={{ fontSize: 14, fontWeight: 700, color: exportResolution === res.id ? '#3ea6ff' : '#eee' }}>{res.label}</div>
-                      <div style={{ fontSize: 10, color: exportResolution === res.id ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{res.desc}</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+                      {isProcessing ? <><Loader2 className="spin" size={18} /> 處理中...</> : <><Download size={18} /> 開始匯出 ({selectedFormats.length} 個檔案)</>}
+                    </button>
 
-              {/* Advanced Options Grid */}
-              <div style={{ marginBottom: 24 }}>
-                <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>AI 加強與處理</label>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div
-                    onClick={() => setExportAutoCaption(!exportAutoCaption)}
-                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportAutoCaption ? 'rgba(16,185,129,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <Zap size={16} color={exportAutoCaption ? '#10b981' : '#555'} />
-                      <div style={{ fontSize: 13, color: exportAutoCaption ? '#fff' : '#888' }}>自動生成 AI 字幕</div>
+                    <div style={{ marginTop: 16, textAlign: 'center', fontSize: 11, color: '#444' }}>
+                      處理時間取決於影片長度與選取的 AI 功能
                     </div>
-                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportAutoCaption ? '#10b981' : '#333', border: '1px solid #444' }} />
-                  </div>
-
-                  <div
-                    onClick={() => setExportFaceTracking(!exportFaceTracking)}
-                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportFaceTracking ? 'rgba(62,166,255,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <Monitor size={16} color={exportFaceTracking ? '#3ea6ff' : '#555'} />
-                      <div style={{ fontSize: 13, color: exportFaceTracking ? '#fff' : '#888' }}>AI 人臉追蹤與自動取景</div>
-                    </div>
-                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportFaceTracking ? '#3ea6ff' : '#333', border: '1px solid #444' }} />
-                  </div>
-
-                  <div
-                    onClick={() => setExportStudioSound(!exportStudioSound)}
-                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportStudioSound ? 'rgba(235,100,255,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <Smartphone size={16} color={exportStudioSound ? '#eb64ff' : '#555'} />
-                      <div style={{ fontSize: 13, color: exportStudioSound ? '#fff' : '#888' }}>AI 降噪與錄音室音質</div>
-                    </div>
-                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportStudioSound ? '#eb64ff' : '#333', border: '1px solid #444' }} />
-                  </div>
-
-                  <div
-                    onClick={() => setExportMergeClips(!exportMergeClips)}
-                    style={{ padding: '12px 16px', borderRadius: 12, background: '#1a1a1a', border: `1px solid ${exportMergeClips ? 'rgba(255,165,0,0.3)' : '#222'}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
-                  >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                      <Film size={16} color={exportMergeClips ? '#ffa500' : '#555'} />
-                      <div style={{ fontSize: 13, color: exportMergeClips ? '#fff' : '#888' }}>合併為單一影片</div>
-                    </div>
-                    <div style={{ width: 14, height: 14, borderRadius: 4, background: exportMergeClips ? '#ffa500' : '#333', border: '1px solid #444' }} />
                   </div>
                 </div>
               </div>
+            )}
 
-              <button
-                className="btn-primary"
-                onClick={handleExportVideo}
-                disabled={isProcessing}
-                style={{
-                  width: '100%', height: 48, fontSize: 15, fontWeight: 700, borderRadius: 14,
-                  background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)',
-                  boxShadow: '0 8px 20px -5px rgba(0,122,255,0.4)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10
-                }}
-              >
-                {isProcessing ? <><Loader2 className="spin" size={18} /> 處理中...</> : <><Download size={18} /> 開始匯出成品</>}
-              </button>
+          {/* 6. GLOBAL PROCESSING OVERLAY */}
+          {isProcessing && currentJobStatus && (
+            <div style={{
+              position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+              background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)',
+              zIndex: 9999, display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', color: 'white'
+            }}>
+              <div style={{ width: 400, textAlign: 'center' }}>
+                <div style={{ marginBottom: 24, position: 'relative', display: 'inline-block' }}>
+                  <div style={{ width: 80, height: 80, borderRadius: '50%', border: '4px solid #333', borderTopColor: '#3ea6ff' }} className="spin" />
+                  <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', fontWeight: 800, fontSize: 18, color: '#3ea6ff' }}>
+                    {currentJobStatus.progress}%
+                  </div>
+                </div>
 
-              <div style={{ marginTop: 16, textAlign: 'center', fontSize: 11, color: '#444' }}>
-                處理時間取決於影片長度與選取的 AI 功能
+                <h2 style={{ fontSize: 24, fontWeight: 700, marginBottom: 12 }}>AI 處理中...</h2>
+                <p style={{ color: '#aaa', fontSize: 14, marginBottom: 32, minHeight: 40 }}>{currentJobStatus.message}</p>
+
+                {/* Progress Bar Container */}
+                <div style={{ width: '100%', height: 6, background: '#222', borderRadius: 3, overflow: 'hidden', marginBottom: 12 }}>
+                  <div style={{
+                    height: '100%', background: 'linear-gradient(90deg, #3ea6ff, #007aff)',
+                    width: `${currentJobStatus.progress}%`, transition: 'width 0.4s ease-out'
+                  }} />
+                </div>
+
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#666', textTransform: 'uppercase', letterSpacing: 1 }}>
+                  <span>{
+                    currentJobStatus.step === 'idle' ? '待機' :
+                      currentJobStatus.step === 'upload' ? '上傳中' :
+                        currentJobStatus.step === 'audio_extract' ? '音訊提取' :
+                          currentJobStatus.step === 'model_init' ? '模型初始化' :
+                            currentJobStatus.step === 'transcribing' ? '語音辨識中' :
+                              currentJobStatus.step === 'optimizing' ? '優化斷句' :
+                                currentJobStatus.step === 'translating' ? '翻譯轉換' :
+                                  currentJobStatus.step === 'done' ? '完成' :
+                                    currentJobStatus.step === 'error' ? '出錯' :
+                                      currentJobStatus.step === 'init' ? '啟動中' :
+                                        currentJobStatus.step
+                  }</span>
+                  <span>估計時間中...</span>
+                </div>
               </div>
             </div>
-          </div>
+          )}
         </div>
-      )}
-    </div>
+      )
+      }
+      {/* 7. MARQUEE OVERLAY */}
+      {
+        marqueeRect && (
+          <div style={{
+            position: 'fixed',
+            left: Math.min(marqueeRect.startX, marqueeRect.currX),
+            top: Math.min(marqueeRect.startY, marqueeRect.currY),
+            width: Math.abs(marqueeRect.currX - marqueeRect.startX),
+            height: Math.abs(marqueeRect.currY - marqueeRect.startY),
+            background: 'rgba(62,166,255,0.2)',
+            border: '1px solid #3ea6ff',
+            pointerEvents: 'none',
+            zIndex: 1000
+          }}></div>
+        )
+      }
+    </div >
   );
 }
 

@@ -534,7 +534,87 @@ async def get_model_status():
 async def get_job_status():
     return current_job_status
 
+@app.post("/transcribe")
+def transcribe_only(
+    file: UploadFile = File(...),
+    whisper_language: str = Form("zh"),
+    whisper_model_size: str = Form("turbo"),
+    whisper_beam_size: int = Form(5),
+    whisper_temperature: float = Form(0.0),
+    whisper_remove_punctuation: str = Form("true"),
+    whisper_chars_per_line: int = Form(14),
+):
+    global current_job_status
+    try:
+        # 1. Save
+        video_path = os.path.join(UPLOAD_DIR, f"transcribe_{int(time.time())}_{file.filename}")
+        current_job_status = {"progress": 1, "message": "正在上傳並儲存檔案...", "step": "upload"}
+        with open(video_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # 2. Extract Audio
+        current_job_status = {"progress": 5, "message": "正在提取音訊軌道...", "step": "audio_extract"}
+        video_clip = VideoFileClip(video_path)
+        if video_clip.audio is None:
+            video_clip.close()
+            raise ValueError("影片沒有音訊軌道")
+            
+        temp_audio_path = os.path.join(UPLOAD_DIR, f"temp_whisper_full_{int(time.time())}.mp3")
+        video_clip.audio.write_audiofile(temp_audio_path, logger=None)
+        video_clip.close()
+
+        # 3. Whisper Init
+        current_job_status = {"progress": 15, "message": f"正在載入 Whisper {whisper_model_size} 模型...", "step": "model_init"}
+        model = ensure_whisper_model(whisper_model_size)
+        
+        # 4. Transcribe
+        current_job_status = {"progress": 25, "message": "AI 正在辨識語音內容 (這可能需要幾分鐘)...", "step": "transcribing"}
+        transcribe_options = get_transcribe_options(whisper_language, whisper_beam_size, whisper_temperature)
+        result = model.transcribe(temp_audio_path, **transcribe_options)
+        
+        # 5. Optimize & Translate
+        current_job_status = {"progress": 85, "message": "正在優化字幕斷句與格式...", "step": "optimizing"}
+        remove_punc = str(whisper_remove_punctuation).lower() == "true"
+        raw_segments = optimize_segments(result["segments"], max_chars=whisper_chars_per_line, remove_punctuation=remove_punc)
+        
+        current_job_status = {"progress": 95, "message": "正在轉換為繁體中文...", "step": "translating"}
+        final_segments = translate_subtitles(raw_segments, None)
+        
+        # 6. Cleanup
+        if os.path.exists(video_path): os.remove(video_path)
+        if os.path.exists(temp_audio_path): os.remove(temp_audio_path)
+        
+        current_job_status = {"progress": 100, "message": "辨識完成！", "step": "done"}
+        return final_segments
+
+    except Exception as e:
+        current_job_status = {"progress": 0, "message": f"辨識失敗: {str(e)}", "step": "error"}
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
 # Enable CORS for frontend
+# MANUAL CORS HANDLING TO FIX STATIC FILES OPTIONS 405
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
+
+class CustomCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path.startswith(("/fonts", "/exports", "/uploads")):
+            if request.method == "OPTIONS":
+                response = Response(status_code=200)
+                response.headers["Access-Control-Allow-Origin"] = "*"
+                response.headers["Access-Control-Allow-Methods"] = "*"
+                response.headers["Access-Control-Allow-Headers"] = "*"
+                return response
+            
+            response = await call_next(request)
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            return response
+            
+        return await call_next(request)
+
+app.add_middleware(CustomCORSMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -543,10 +623,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enable Static Access to Exports & Uploads for Preview
+# ...
+# Helper to Mount Static Files
+# We will use valid CORS middleware globally, but StaticFiles doesn't support OPTIONS by default.
+# The main CORSMiddleware should handle the preflight if configured correctly.
+# However, if it fails, we can try a simple Starlette setup.
+
+# Revert to standard mount, but wrapped in a Starlette app that handles OPTIONS?
+# Let's try the simple mount first, but verify order.
+
 app.mount("/exports", StaticFiles(directory=OUTPUT_DIR), name="exports")
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 @app.post("/upload-font")
@@ -555,11 +644,31 @@ async def upload_font(file: UploadFile = File(...)):
         font_path = os.path.join(FONTS_DIR, file.filename)
         with open(font_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        font_name = file.filename.rsplit('.', 1)[0]  # Remove extension
-        print(f"✅ Font uploaded: {file.filename} (name: {font_name})")
-        return {"message": f"Font {file.filename} uploaded successfully", "font_name": font_name}
+        
+        # Parse real font name
+        real_font_name = file.filename.rsplit('.', 1)[0]
+        try:
+            font = TTFont(font_path)
+            family = ""
+            for record in font['name'].names:
+                if record.nameID == 16:
+                   family = record.toUnicode()
+                   break
+                if record.nameID == 1 and not family:
+                   family = record.toUnicode()
+            if family: real_font_name = family
+        except: pass
+
+        # Update global map
+        base_name = os.path.splitext(file.filename)[0]
+        FONT_FILE_MAP[base_name] = real_font_name
+
+        print(f"✅ Font uploaded: {file.filename} -> {real_font_name}")
+        return {"message": f"Font uploaded successfully", "font_name": real_font_name}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
+
+app.mount("/fonts", StaticFiles(directory=FONTS_DIR), name="fonts")
 
 @app.get("/list-fonts")
 async def list_fonts():
@@ -568,9 +677,10 @@ async def list_fonts():
         custom_fonts = []
         if os.path.exists(FONTS_DIR):
             for f in os.listdir(FONTS_DIR):
-                if f.endswith(('.ttf', '.otf', '.woff', '.woff2', '.TTF', '.OTF')):
-                    font_name = f.rsplit('.', 1)[0]
-                    custom_fonts.append(font_name)
+                if f.lower().endswith(('.ttf', '.otf', '.woff', '.woff2')):
+                    font_name = os.path.splitext(f)[0]
+                    # We return both the display name (file name without ext) and the full filename for URL
+                    custom_fonts.append({"name": font_name, "filename": f})
         return {"fonts": custom_fonts}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": str(e)})
@@ -1046,17 +1156,20 @@ def apply_smart_reframing(clip, aspect_ratio, face_tracking, vertical_mode, viz_
         return (clip, float(center_x / w)) # Explicit Tuple
 
 @app.post("/analyze-video")
-async def analyze_video(
+def analyze_video(
     file: UploadFile = File(...),
-    api_key: str = Form(...),
-    model_name: str = Form("gemini-1.5-flash"),
-    instruction: str = Form("找出影片中的精華片段"),
+    api_key: str = Form(None),
+    model_name: str = Form("gemini-1.5-flash-latest"),
+    instruction: str = Form("Highlight interesting moments"),
     target_count: int = Form(None),
     target_duration: int = Form(None)
 ):
     try:
         # 1. Config Gemini
-        genai.configure(api_key=api_key)
+        effective_key = api_key or os.environ.get('GEMINI_API_KEY')
+        if not effective_key:
+            raise HTTPException(status_code=400, detail="API key required: provide via request or set GEMINI_API_KEY environment variable")
+        genai.configure(api_key=effective_key)
         
         # 2. Save video temporarily
         video_path = f"{UPLOAD_DIR}/temp_analyze_{file.filename}"
@@ -1186,116 +1299,13 @@ async def analyze_video(
             os.remove(video_path)
 
 
-@app.post("/transcribe")
-def transcribe_only(
-    file: UploadFile = File(...),
-    whisper_language: str = Form("zh"),
-    whisper_model_size: str = Form("turbo"),
-    whisper_beam_size: int = Form(5),
-    whisper_temperature: float = Form(0.0),
-    whisper_no_speech_threshold: float = Form(0.6),
-    whisper_condition_on_previous_text: str = Form("true"),
-    whisper_remove_punctuation: str = Form("true"),
-    whisper_best_of: int = Form(5),
-    whisper_patience: float = Form(1.0),
-    whisper_compression_ratio_threshold: float = Form(2.4),
-    whisper_logprob_threshold: float = Form(-1.0),
-    whisper_fp16: str = Form("true"),
-    whisper_chars_per_line: int = Form(14),
-    subtitle_chars_per_line: int = Form(9),
-    translate_to_chinese: str = Form("false"),
-    api_key: str = Form(None),
-    cuts_json: str = Form(None)
-):
-    try:
-        temp_path = os.path.join(UPLOAD_DIR, f"transcribe_{int(time.time())}_{file.filename}")
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Extract Audio
-        video_clip = VideoFileClip(temp_path)
-        if video_clip.audio is None:
-            video_clip.close()
-            if os.path.exists(temp_path): os.remove(temp_path)
-            return JSONResponse(status_code=400, content={"detail": "影片沒有音軌，無法進行語音轉文字。"})
-
-        # Determine segments to transcribe
-        cuts = []
-        if cuts_json:
-            try:
-                cuts = json.loads(cuts_json)
-            except: pass
-
-        # Whisper Options
-        model = ensure_whisper_model(whisper_model_size)
-        transcribe_options = get_transcribe_options(
-            whisper_language, whisper_beam_size, 
-            whisper_temperature, whisper_no_speech_threshold, 
-            whisper_condition_on_previous_text
-        )
-        remove_punc = str(whisper_remove_punctuation).lower() == "true"
-
-        full_segments_raw = []
-
-        if cuts and len(cuts) > 0:
-            print(f"🗣️ Transcribing {len(cuts)} selected segments...")
-            for idx, cut in enumerate(cuts):
-                c_start = float(cut.get('start', 0))
-                c_end = float(cut.get('end', 0))
-                if c_end <= c_start: continue
-                
-                temp_segment_audio = os.path.join(UPLOAD_DIR, f"seg_trans_{idx}_{int(time.time())}.mp3")
-                try:
-                    audio_sub = video_clip.audio.subclip(c_start, c_end)
-                    audio_sub.write_audiofile(temp_segment_audio, logger=None)
-                    
-                    if os.path.exists(temp_segment_audio) and os.path.getsize(temp_segment_audio) > 1000:
-                        result = whisper_model.transcribe(temp_segment_audio, **transcribe_options)
-                        for seg in result["segments"]:
-                            seg['start'] += c_start
-                            seg['end'] += c_start
-                            full_segments_raw.append(seg)
-                except Exception as e:
-                    print(f"⚠️ Segment {idx} transcription skipped: {e}")
-                finally:
-                    if os.path.exists(temp_segment_audio): os.remove(temp_segment_audio)
-        else:
-            print(f"🗣️ Transcribing full video...")
-            temp_audio = os.path.join(UPLOAD_DIR, f"full_{int(time.time())}.mp3")
-            video_clip.audio.write_audiofile(temp_audio, logger=None)
-            result = whisper_model.transcribe(temp_audio, **transcribe_options)
-            full_segments_raw = result["segments"]
-            if os.path.exists(temp_audio): os.remove(temp_audio)
-
-        video_clip.close()
-
-        raw_segments = optimize_segments(full_segments_raw, max_chars=whisper_chars_per_line)
-        full_subtitles = []
-        for i, seg in enumerate(raw_segments):
-            full_subtitles.append({
-                "id": str(i),
-                "start": seg['start'],
-                "end": seg['end'],
-                "text": seg['text'].strip()
-            })
-
-        # Translation Logic
-        if str(translate_to_chinese).lower() == "true":
-            full_subtitles = translate_subtitles(full_subtitles, api_key)
-
-        # Cleanup
-        if os.path.exists(temp_path): os.remove(temp_path)
-
-        return full_subtitles
-    except Exception as e:
-        print(f"❌ Transcribe Error: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
 @app.post("/process-preview-pipeline")
-async def process_preview_pipeline(
+def process_preview_pipeline(
     file: UploadFile = File(...),
     start: float = Form(...),
     end: float = Form(...),
+    cuts_json: str = Form(None),
+    model_name: str = Form(None),
     
     # Configs
     is_denoise: str = Form("false"),
@@ -1850,7 +1860,7 @@ def detect_face_clip(
         return {"faceCenterX": 0.5}
 
 @app.post("/upload-proxy")
-async def upload_proxy_endpoint(file: UploadFile = File(...)):
+def upload_proxy_endpoint(file: UploadFile = File(...)):
     try:
         # 1. Save Original
         safe_filename = f"{int(time.time())}_{file.filename}"
@@ -1944,9 +1954,9 @@ def detect_silence_ffmpeg(input_path, noise_db=-30, duration=0.5):
     return segments
 
 @app.post("/detect-silence")
-async def detect_silence_endpoint(
+def detect_silence_endpoint(
     file: UploadFile = File(...),
-    threshold_db: float = Form(-30.0),
+    threshold: float = Form(-30.0),
     min_duration: float = Form(0.5),
     padding: float = Form(0.1)
 ):
@@ -2079,9 +2089,25 @@ def process_video(
     subtitle_animation_spring: float = Form(0.5),
     subtitle_outline_width: float = Form(0),
     subtitle_outline_color: str = Form("#000000"),
-    subtitle_shadow_color: str = Form("#000000")
+    subtitle_shadow_color: str = Form("#000000"),
+    output_bitrate: str = Form("16M")
 ):
     global current_job_status
+    print("\n" + "="*50)
+    print("🚀 [BACKEND] NEW PROCESSING REQUEST RECEIVED")
+    print("="*50)
+    print(f"📁 File: {file.filename}")
+    print(f"🎬 Mode: {output_mode} | Resolution: {output_resolution} ({output_bitrate}) | Vertical: {vertical_mode}")
+    print(f"🤖 AI TOOLS:")
+    print(f"   - Auto Caption: {auto_caption} (Burn: {burn_captions})")
+    print(f"   - Face Tracking: {face_tracking} | Studio Sound: {studio_sound}")
+    print(f"   - Model: {whisper_model_size} | Language: {whisper_language}")
+    print(f"   - Silence Removal: {is_silence_removal} (Thresh: {silence_threshold}dB)")
+    print(f"📝 SUBTITLE STYLE:")
+    print(f"   - Font: {subtitle_font_name} ({subtitle_font_size}px) | Color: {subtitle_text_color}")
+    print(f"   - Animation: {subtitle_animation} | Chars/Line: {subtitle_chars_per_line}")
+    print("-"*50)
+
     try:
         print(f"🎬 Processing Request: Vertical={vertical_mode}, Mode={output_mode}, Style={subtitle_style}")
         print(f"📊 DEBUG FORM DATA: Font={subtitle_font_size}, MarginV={subtitle_margin_v}, Chars={subtitle_chars_per_line}, LineHeight={subtitle_line_height}")
@@ -2092,13 +2118,16 @@ def process_video(
             print("ℹ️ legacy preview mode requested, ignoring...")
 
         # Configure GenAI if key provided for Smart Renaming
-        if api_key and api_key != "null":
-            genai.configure(api_key=api_key)
+        effective_key = api_key if (api_key and api_key != "null") else os.environ.get('GEMINI_API_KEY')
+        if effective_key:
+            genai.configure(api_key=effective_key)
 
         # 1. Save uploaded video
         video_path = f"{UPLOAD_DIR}/{file.filename}"
+        print(f"📥 [STEP 1] Saving uploaded file to {video_path}...")
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        print(f"✅ File saved successfully.")
         
         # 2. Parse cuts
         cuts = json.loads(cuts_json)
@@ -2122,6 +2151,7 @@ def process_video(
         full_subtitles = []
         full_segments_raw = []
         
+        print(f"🎙️ [STEP 2] Initializing Whisper Engine (Model: {whisper_model_size})...")
         model = ensure_whisper_model(whisper_model_size)
         transcribe_options = get_transcribe_options(
             whisper_language, whisper_beam_size, 
@@ -2143,7 +2173,7 @@ def process_video(
                      json_data = json.loads(srt_json)
                      full_segments_raw = [{"start": s['start'], "end": s['end'], "text": s['text']} for s in json_data]
                  else:
-                     print("🎙️ Extracting Audio & Transcribing by Cuts...")
+                     print(f"🎙️ [STEP 2.1] Extracting Audio & Transcribing {len(cuts)}片段...")
                      video_clip = VideoFileClip(video_path)
                      if video_clip.audio is None:
                          video_clip.close()
@@ -2472,7 +2502,8 @@ def process_video(
                 "subtitleConfig": remotion_config,
                 "isFaceTracking": is_tracking_enabled,
                 "faceCenterX": face_center_x,
-                "durationInFrames": int(final_duration * 30) # Explicitly pass frames for metadata
+                "durationInFrames": int(final_duration * 30),
+                "verticalMode": vertical_mode
             }
 
             print(f"📦 Debug Input Props: FaceTracking={input_props['isFaceTracking']}, Center={input_props['faceCenterX']}")
@@ -2487,6 +2518,13 @@ def process_video(
             dur_in_frames = int(final_duration * 30)
             print(f"⏱️ Calculated Duration: {final_duration}s -> {dur_in_frames} frames")
             
+            # Calculate Resolution Scale
+            scale = 1.0
+            if output_resolution == "4k":
+                 scale = 2.0
+            elif output_resolution == "720p":
+                 scale = 0.666666667
+
             # Build Remotion Command
             cmd = [
                 "npx", "remotion", "render",
@@ -2495,6 +2533,8 @@ def process_video(
                 abs_output_path,
                 f"--props={props_file}",
                 f"--duration={dur_in_frames}",
+                f"--scale={scale}",
+                f"--vbitrate={output_bitrate}",
                 "--log=verbose",
                 "--concurrency=1",
                 "--timeout=120000"
@@ -2536,6 +2576,8 @@ def process_video(
                     zipf.write(file, os.path.basename(file))
         
         current_job_status = {"progress": 100, "message": "處理完成！", "step": "done"}
+        print(f"✅ [DONE] Processing finished successfully. {len(processed_files)} files exported.")
+        print("="*50 + "\n")
                 
         # Return JSON with download URL instead of FileResponse for better flexibility
         return {
