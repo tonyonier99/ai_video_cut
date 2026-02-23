@@ -1,250 +1,81 @@
-import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { DragEvent } from 'react';
 import { Play, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Download, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type, Video, Music, ChevronDown } from 'lucide-react';
-import { loadApiKey, saveApiKey } from './utils/secureApiKeyStorage';
 import { API_BASE_URL } from './config';
 import './App.css';
 
-interface Cut {
-  id: string;
-  start: number;       // Timeline position start
-  end: number;         // Timeline position end
-  sourceStart: number; // Start in source video
-  sourceEnd: number;   // End in source video
-  label: string;
-  trackId: number;
-  assetId?: string;
-  style?: {
-    scale: number;
-    x: number;
-    y: number;
-    rotation: number;
-    opacity: number;
-    mirror: boolean;
-  };
-}
-
-interface Asset {
-  id: string;
-  type: 'video' | 'image' | 'audio';
-  name: string;
-  url: string;
-  duration?: number;
-  file?: File;
-}
-
-interface TrackConfig {
-  id: number;
-  type: 'video' | 'audio' | 'text';
-  name: string;
-  visible: boolean;
-  locked: boolean;
-}
-
-const MAX_HISTORY = 20;
+import type { Cut, Asset, DragState, ActiveTool, LeftPanelTab, AppView } from './types';
+import { getTrackTheme, getTimelineCursor } from './utils/timelineUtils';
+import { generateFCPXML, downloadFile } from './utils/exportUtils';
+import { usePlayback } from './hooks/usePlayback';
+import { useHistory } from './hooks/useHistory';
+import { useTimeline } from './hooks/useTimeline';
+import { useTrackManagement } from './hooks/useTrackManagement';
+import { useAITools } from './hooks/useAITools';
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { WelcomeScreen } from './components/WelcomeScreen';
+import { ExportModal } from './components/ExportModal';
 
 function App() {
+  // --- Refs ---
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const timelineContainerRef = useRef<HTMLDivElement>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const relinkInputRef = useRef<HTMLInputElement>(null);
+
   // --- Global State ---
   const [projectAssets, setProjectAssets] = useState<Asset[]>([]);
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
-  const [duration, setDuration] = useState(0);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [originalVideoPath, setOriginalVideoPath] = useState<string | null>(null);
 
   // --- Layout State ---
   const [isVerticalMode, setIsVerticalMode] = useState(false);
-  const [leftPanelTab, setLeftPanelTab] = useState<'project' | 'controls' | 'effects' | 'roughcut' | 'highlights' | 'subtitles'>('project');
-  const [activeTool, setActiveTool] = useState<'select' | 'blade' | 'text' | 'hand'>('select');
-  const [appView, setAppView] = useState<'welcome' | 'editor'>('welcome');
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const relinkInputRef = useRef<HTMLInputElement>(null);
-
-  // --- Timeline State ---
-  const [cuts, setCuts] = useState<Cut[]>([]);
-  const [selectedCutIds, setSelectedCutIds] = useState<string[]>([]);
+  const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>('project');
+  const [activeTool, setActiveTool] = useState<ActiveTool>('select');
+  const [appView, setAppView] = useState<AppView>('welcome');
   const [marqueeRect, setMarqueeRect] = useState<{ startX: number; startY: number; currX: number; currY: number } | null>(null);
-  const [zoomLevel, setZoomLevel] = useState(10);
-  const [isMagnetEnabled, setIsMagnetEnabled] = useState(true);
 
-  const [videoTracks, setVideoTracks] = useState<TrackConfig[]>([
-    { id: 0, type: 'video', name: 'V1', visible: true, locked: false },
-    { id: 1, type: 'text', name: 'T1', visible: true, locked: false },
-    { id: 99, type: 'audio', name: 'A1', visible: true, locked: false }
-  ]);
+  // --- Timeline Hook ---
+  const timeline = useTimeline({ duration: 0, currentTime: 0 });
+  const { cuts, setCuts, selectedCutIds, setSelectedCutIds, zoomLevel, setZoomLevel,
+    isMagnetEnabled, setIsMagnetEnabled, totalDuration, getSnapTime,
+    handleSplit, handleDelete, handleAlignCuts, handleZoom } = timeline;
 
-  const totalDuration = useMemo(() => {
-    if (cuts.length === 0) return duration;
-    return Math.max(duration, ...cuts.map(c => c.end));
-  }, [cuts, duration]);
+  // --- Track Management Hook ---
+  const trackMgmt = useTrackManagement({ setCuts });
+  const { videoTracks, sortedTracks, toggleTrackVisibility, toggleTrackLock,
+    handleAddTrack, handleDeleteTrack } = trackMgmt;
 
-  const sortedTracks = useMemo(() => {
-    const subtitles = videoTracks.filter(t => t.type === 'text').sort((a, b) => a.id - b.id);
-    const videos = videoTracks.filter(t => t.type === 'video').sort((a, b) => b.id - a.id);
-    const audios = videoTracks.filter(t => t.type === 'audio').sort((a, b) => a.id - b.id);
-    return [...subtitles, ...videos, ...audios];
-  }, [videoTracks]);
+  // --- Playback Hook ---
+  const playback = usePlayback({ totalDuration, cuts, videoRef });
+  const { currentTime, setCurrentTime, isPlaying, setIsPlaying, duration,
+    setDuration, togglePlay, handleMetadata, seek } = playback;
 
-  // --- Enhanced Playback Timer ---
-  useEffect(() => {
-    let lastTime = performance.now();
-    let frameId: number;
+  // --- History Hook ---
+  const historyHook = useHistory({ cuts, setCuts });
+  const { history, historyIndex, addToHistory, handleUndo, handleRedo } = historyHook;
 
-    const loop = () => {
-      if (isPlaying) {
-        const now = performance.now();
-        const delta = (now - lastTime) / 1000;
-        lastTime = now;
+  // --- AI Tools Hook ---
+  const aiTools = useAITools({ videoFile, videoTracks, setCuts });
+  const { apiKey, setApiKey, apiKeyLoaded, isProcessing, setIsProcessing,
+    currentJobStatus, setCurrentJobStatus,
+    highlightCount, setHighlightCount, targetDuration, setTargetDuration,
+    instruction, setInstruction, geminiModel, setGeminiModel,
+    silenceThreshold, setSilenceThreshold, silenceMinDuration, setSilenceMinDuration,
+    whisperModel, setWhisperModel, whisperLanguage, setWhisperLanguage,
+    whisperBeamSize, setWhisperBeamSize, whisperTemperature, setWhisperTemperature,
+    whisperCharsPerLine, setWhisperCharsPerLine, whisperRemovePunc, setWhisperRemovePunc,
+    availableFonts, subtitleConfig, setSubtitleConfig, fetchFonts,
+    handleGeminiHighlights, handleSilenceRemoval, handleAISubtitles } = aiTools;
 
-        setCurrentTime(prev => {
-          const next = prev + delta;
-          if (next >= totalDuration) {
-            setIsPlaying(false);
-            return totalDuration;
-          }
-          return next;
-        });
-        frameId = requestAnimationFrame(loop);
-      }
-    };
-
-    if (isPlaying) {
-      lastTime = performance.now();
-      frameId = requestAnimationFrame(loop);
-    }
-    return () => cancelAnimationFrame(frameId);
-  }, [isPlaying, totalDuration]);
-
-  const toggleTrackVisibility = (id: number) => {
-    setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, visible: !t.visible } : t));
-  };
-
-  const toggleTrackLock = (id: number) => {
-    setVideoTracks(prev => prev.map(t => t.id === id ? { ...t, locked: !t.locked } : t));
-  };
-
-  const handleAddTrack = (type: 'video' | 'audio' | 'text') => {
-    setVideoTracks(prev => {
-      const sameType = prev.filter(t => t.type === type);
-      const prefix = type === 'video' ? 'V' : type === 'audio' ? 'A' : 'T';
-      const nextNum = sameType.length + 1;
-
-      // Find a safe ID
-      let nextId = Math.max(0, ...prev.map(t => t.id < 99 ? t.id : 0)) + 1;
-      if (type === 'audio') {
-        const audioIds = prev.filter(t => t.type === 'audio').map(t => t.id);
-        nextId = audioIds.length > 0 ? Math.max(...audioIds) + 1 : 99;
-      }
-
-      return [...prev, {
-        id: nextId,
-        type,
-        name: `${prefix}${nextNum}`,
-        visible: true,
-        locked: false
-      }];
-    });
-  };
-
-  const handleDeleteTrack = (id: number) => {
-    // Don't delete V1 or A1 by default if preferred, but for now let's allow it if it's not the last one
-    if (videoTracks.length <= 1) return;
-    if (!confirm(`確定要刪除此軌道及其所有內容嗎？`)) return;
-
-    setVideoTracks(prev => prev.filter(t => t.id !== id));
-    setCuts(prev => prev.filter(c => c.trackId !== id));
-  };
-
-  // History
-  const [history, setHistory] = useState<Cut[][]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
-  const isUndoingRef = useRef(false);
-
-  // Initialize history
-  useEffect(() => {
-    if (history.length === 0 && cuts.length > 0) {
-      setHistory([cuts]);
-      setHistoryIndex(0);
-    }
-  }, [cuts.length]); // Only init on first load
-
-  const addToHistory = (newCuts: Cut[]) => {
-    if (isUndoingRef.current) return;
-
-    const newHistory = history.slice(0, historyIndex + 1);
-    newHistory.push(newCuts);
-    if (newHistory.length > MAX_HISTORY) {
-      newHistory.shift();
-    } else {
-      // Correct index if shifted? No, if push, length increases.
-    }
-    setHistory(newHistory);
-    setHistoryIndex(newHistory.length - 1);
-  };
-
-  const handleUndo = () => {
-    if (historyIndex > 0) {
-      isUndoingRef.current = true;
-      const prevCuts = history[historyIndex - 1];
-      setCuts(prevCuts);
-      setHistoryIndex(historyIndex - 1);
-      // Reset flag after render cycle
-      setTimeout(() => { isUndoingRef.current = false; }, 0);
-    }
-  };
-
-  const handleRedo = () => {
-    if (historyIndex < history.length - 1) {
-      isUndoingRef.current = true;
-      const nextCuts = history[historyIndex + 1];
-      setCuts(nextCuts);
-      setHistoryIndex(historyIndex + 1);
-      setTimeout(() => { isUndoingRef.current = false; }, 0);
-    }
-  };
-
-  // Stop playback if timeline becomes empty
-  useEffect(() => {
-    if (cuts.length === 0 && isPlaying) {
-      if (videoRef.current) videoRef.current.pause();
-      setIsPlaying(false);
-    }
-  }, [cuts, isPlaying]);
-
-  // Color theme helper
-  const getTrackTheme = (type: string) => {
-    switch (type) {
-      case 'video': return { primary: '#3ea6ff', secondary: 'rgba(62,166,255,0.1)', border: '#2563eb' };
-      case 'audio': return { primary: '#10b981', secondary: 'rgba(16,185,129,0.1)', border: '#059669' };
-      case 'text': return { primary: '#6366f1', secondary: 'rgba(99,102,241,0.1)', border: '#4f46e5' };
-      default: return { primary: '#3ea6ff', secondary: 'rgba(62,166,255,0.1)', border: '#007aff' };
-    }
-  };
-
-  // Export Modal
+  // --- Export Modal ---
   const [showExportModal, setShowExportModal] = useState(false);
 
-  const [exportResolution, setExportResolution] = useState('1080p');
-  const [exportBitrate, setExportBitrate] = useState(16); // Mbps
-  const [selectedFormats, setSelectedFormats] = useState<string[]>(['video']);
-
   // Improved Dragging State
-  const [dragState, setDragState] = useState<{
-    isDragging: boolean;
-    type: 'scrub' | 'move' | 'trim-start' | 'trim-end' | 'new-asset' | 'marquee' | 'blade' | 'pan' | null;
-    targetId: string | null;
-    startX: number;
-    initialValue: number;
-    initialCuts?: Cut[]; // Snapshot for smooth dragging
-    newAssetId?: string;
-    newAssetDuration?: number;
-    ghostTime?: number;
-    ghostTrackId?: number;
-    initialScrollLeft?: number;
-  }>({ isDragging: false, type: null, targetId: null, startX: 0, initialValue: 0 });
+  const [dragState, setDragState] = useState<DragState>({ isDragging: false, type: null, targetId: null, startX: 0, initialValue: 0 });
 
   // Synchronized Ref for heavy background tasks (History/Save)
   const cutsRef = useRef(cuts);
@@ -286,275 +117,13 @@ function App() {
 
   }, [dragState.isDragging]); // Crucial: Only depends on the Drag State change
 
-  // Snapping Configuration
-  const SNAP_THRESHOLD_PX = 10;
-
-  const getSnapTime = useCallback((time: number, ignoreCutId?: string | null): number | null => {
-    // Snap to: Playhead
-    if (Math.abs(time - currentTime) * zoomLevel < SNAP_THRESHOLD_PX) return currentTime;
-
-    // Snap to: 0
-    if (Math.abs(time) * zoomLevel < SNAP_THRESHOLD_PX) return 0;
-
-    // Snap to: Other cuts (start/end)
-    let closestTime: number | null = null;
-    let minDiff = SNAP_THRESHOLD_PX / zoomLevel;
-
-    for (const cut of cuts) {
-      if (cut.id === ignoreCutId) continue;
-
-      const diffStart = Math.abs(cut.start - time);
-      if (diffStart < minDiff) {
-        minDiff = diffStart;
-        closestTime = cut.start;
-      }
-
-      const diffEnd = Math.abs(cut.end - time);
-      if (diffEnd < minDiff) {
-        minDiff = diffEnd;
-        closestTime = cut.end;
-      }
-    }
-
-    return closestTime ?? null; // Explicitly return null if no snap found
-  }, [cuts, currentTime, zoomLevel]);
-
-  // Contextual Cursor Helper
-  const getTimelineCursor = () => {
-    if (dragState.isDragging) {
-      if (dragState.type === 'scrub') return 'ew-resize';
-      if (dragState.type === 'pan') return 'grabbing';
-      if (dragState.type === 'move') return 'move';
-      if (dragState.type === 'trim-start' || dragState.type === 'trim-end') return 'ew-resize';
-      return 'default';
-    }
-
-    switch (activeTool) {
-      case 'hand': return 'grab';
-      case 'blade': return 'crosshair';
-      case 'text': return 'text';
-      case 'select': return 'default';
-      default: return 'default';
-    }
-  };
+  // Contextual cursor derived from imported utility
+  const timelineCursor = getTimelineCursor(dragState.isDragging, dragState.type, activeTool);
 
 
-  // --- AI / Tools State ---
-  const [apiKey, setApiKey] = useState('');
-  const apiKeyLoaded = useRef(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    loadApiKey().then(key => {
-      if (!cancelled) {
-        setApiKey(key);
-        apiKeyLoaded.current = true;
-      }
-    });
-    // One-time cleanup: remove plaintext key from legacy localStorage
-    localStorage.removeItem('antigravity_api_key');
-    return () => { cancelled = true; };
-  }, []);
-
-  const [highlightCount, setHighlightCount] = useState(5);
-  const [targetDuration, setTargetDuration] = useState(60);
-  const [instruction, setInstruction] = useState('');
-  const [geminiModel, setGeminiModel] = useState('gemini-3-flash-preview');
-
-  // Silence Removal Params
-  const [silenceThreshold, setSilenceThreshold] = useState(-30);
-  const [silenceMinDuration, setSilenceMinDuration] = useState(0.5);
-
-  // Subtitle Params
-  const [whisperModel, setWhisperModel] = useState('turbo');
-  const [whisperLanguage, setWhisperLanguage] = useState('zh');
-  const [whisperBeamSize, setWhisperBeamSize] = useState(5);
-  const [whisperTemperature, setWhisperTemperature] = useState(0);
-  const [whisperCharsPerLine, setWhisperCharsPerLine] = useState(14);
-  const [whisperRemovePunc, setWhisperRemovePunc] = useState(true);
-
-  // Font / Style State
-  const [availableFonts, setAvailableFonts] = useState<any[]>([]);
-  const [subtitleConfig, setSubtitleConfig] = useState({
-    fontFamily: 'Inter',
-    fontSize: 48,
-    primaryColor: '#FFFFFF',
-    // Gradient
-    useGradient: false,
-    gradientStops: [
-      { color: '#FFFFFF', offset: 0 },
-      { color: '#3ea6ff', offset: 100 }
-    ],
-    gradientAngle: 180,
-    safeZoneMargin: 10, // Default 10% from edges
-    // Outline
-    useOutline: true,
-    outlineColor: '#000000',
-    outlineWidth: 4,
-    // Shadow
-    useShadow: true,
-    shadowColor: 'rgba(0,0,0,0.5)',
-    shadowBlur: 8,
-    shadowOffsetX: 2,
-    shadowOffsetY: 2,
-    // Background
-    useBackground: false,
-    backgroundColor: '#000000',
-    backgroundOpacity: 0.5,
-    borderRadius: 8,
-    paddingX: 20,
-    paddingY: 10,
-
-    verticalOffset: 80 // % from top
-  });
-
-  const fetchFonts = async () => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/list-fonts`);
-      if (res.ok) {
-        const data = await res.json();
-        setAvailableFonts(data.fonts);
-
-        // Inject Font Face Styles
-        const styleId = 'dynamic-fonts-style';
-        let styleEl = document.getElementById(styleId);
-        if (styleEl) styleEl.remove();
-
-        styleEl = document.createElement('style');
-        styleEl.id = styleId;
-        document.head.appendChild(styleEl);
-
-        let css = '';
-        data.fonts.forEach((font: any) => {
-          css += `
-            @font-face {
-              font-family: '${font.name}';
-              src: url('${API_BASE_URL}/fonts/${encodeURIComponent(font.filename)}');
-              font-weight: normal;
-              font-style: normal;
-            }
-          `;
-        });
-        styleEl.textContent = css;
-        console.log(`✅ Loaded ${data.fonts.length} custom fonts.`);
-      }
-    } catch (e) {
-      console.error("Font fetch error:", e);
-    }
-  };
-
-  useEffect(() => {
-    fetchFonts();
-  }, []);
-
-  // Global Processing Status
-  const [currentJobStatus, setCurrentJobStatus] = useState<{ progress: number; message: string; step: string } | null>(null);
-
-  // Polling for Progress
-  useEffect(() => {
-    let interval: any;
-    if (isProcessing) {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch(`${API_BASE_URL}/job-status`);
-          if (res.ok) {
-            const status = await res.json();
-            setCurrentJobStatus(status);
-            // If backend says done or error, we might want to stop, 
-            // but usually the main fetch call handles the end.
-          }
-        } catch (e) {
-          console.error("Polling error:", e);
-        }
-      }, 800);
-    } else {
-      setCurrentJobStatus(null);
-    }
-    return () => clearInterval(interval);
-  }, [isProcessing]);
-
-  const handleAISubtitles = async () => {
-    if (!videoFile) {
-      alert("請先上傳影片以便辨識");
-      return;
-    }
-
-    setIsProcessing(true);
-    setCurrentJobStatus({ progress: 0, message: "準備辨識中...", step: "init" });
-
-    const formData = new FormData();
-    formData.append('file', videoFile);
-    formData.append('whisper_language', whisperLanguage);
-    formData.append('whisper_model_size', whisperModel);
-    formData.append('whisper_beam_size', whisperBeamSize.toString());
-    formData.append('whisper_temperature', whisperTemperature.toString());
-    formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
-    formData.append('whisper_remove_punctuation', whisperRemovePunc ? 'true' : 'false');
-
-    try {
-      const res = await fetch(`${API_BASE_URL}/transcribe`, {
-        method: 'POST',
-        body: formData
-      });
-
-      if (res.ok) {
-        const segments = await res.json();
-        // Convert segments to Cuts
-        const textTrack = videoTracks.find(t => t.type === 'text');
-        const tid = textTrack ? textTrack.id : 1;
-
-        const newCuts: Cut[] = segments.map((seg: any) => ({
-          id: `subtitle-${Math.random().toString(36).substr(2, 5)}`,
-          start: seg.start,
-          end: seg.end,
-          sourceStart: 0,
-          sourceEnd: 0,
-          label: seg.text,
-          trackId: tid
-        }));
-
-        if (newCuts.length > 0) {
-          // Keep existing non-text cuts if any, or just append? 
-          // Usually user wants to REPLACE or ADD. Let's ADD for now.
-          setCuts(prev => [...prev.filter(c => {
-            const tr = videoTracks.find(t => t.id === c.trackId);
-            return tr && tr.type !== 'text';
-          }), ...newCuts]);
-          console.log("✅ Subtitles loaded:", newCuts.length);
-        } else {
-          alert("未辨識到任何語音內容");
-        }
-      } else {
-        const err = await res.text();
-        alert("辨識失敗: " + err);
-      }
-    } catch (e) {
-      console.error(e);
-      alert("連線後端失敗");
-    } finally {
-      setIsProcessing(false);
-      setCurrentJobStatus(null);
-    }
-  };
-
-  // --- Inspector State ---
-
-  // --- Refs ---
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const timelineContainerRef = useRef<HTMLDivElement>(null);
-  const timelineRef = useRef<HTMLDivElement>(null);
-
-  // --- Persistence ---
-  useEffect(() => {
-    if (!apiKeyLoaded.current) return;
-    saveApiKey(apiKey);
-  }, [apiKey]);
-
-  // --- Shortcuts ---
 
 
-  // --- Persistence & Auto-Save Moved Above ---
-
+  // --- Project Management ---
   const loadProject = (data: any) => {
     try {
       if (data.cuts) setCuts(data.cuts);
@@ -602,28 +171,21 @@ function App() {
     reader.readAsText(file);
   };
 
-  // --- Player Logic ---
-  const togglePlay = () => {
-    setIsPlaying(!isPlaying);
-  };
-
-  const handleMetadata = () => {
-    if (videoRef.current) {
-      setDuration(videoRef.current.duration);
-      if (cuts.length === 0) {
-        // Initial clip is full video
-        setCuts([{
-          id: 'full',
-          start: 0,
-          end: videoRef.current.duration,
-          sourceStart: 0,
-          sourceEnd: videoRef.current.duration,
-          label: 'Full Video',
-          trackId: 0
-        }]);
-      }
+  // Extended handleMetadata - also creates initial cut
+  const handleVideoMetadata = useCallback(() => {
+    handleMetadata();
+    if (videoRef.current && cuts.length === 0) {
+      setCuts([{
+        id: 'full',
+        start: 0,
+        end: videoRef.current.duration,
+        sourceStart: 0,
+        sourceEnd: videoRef.current.duration,
+        label: 'Full Video',
+        trackId: 0
+      }]);
     }
-  };
+  }, [handleMetadata, videoRef, cuts.length, setCuts]);
 
   // --- File Upload ---
   const processFile = async (file: File) => {
@@ -678,48 +240,6 @@ function App() {
     e.stopPropagation();
   };
 
-
-  // --- Timeline Operations ---
-  const handleSplit = (splitTime?: number) => {
-    const time = splitTime !== undefined ? splitTime : currentTime;
-    // Find which cut includes the split time
-    const targetCut = cuts.find(c => time > c.start + 0.01 && time < c.end - 0.01);
-    if (!targetCut) return;
-
-    const durationFromStart = time - targetCut.start;
-    const sourceSplitTime = (targetCut.sourceStart ?? targetCut.start) + durationFromStart;
-
-    const newCutId = Math.random().toString(36).substr(2, 9);
-    const firstHalf: Cut = {
-      ...targetCut,
-      end: time,
-      sourceEnd: sourceSplitTime,
-      sourceStart: targetCut.sourceStart ?? targetCut.start
-    };
-    const secondHalf: Cut = {
-      id: newCutId,
-      start: time,
-      end: targetCut.end,
-      sourceStart: sourceSplitTime,
-      sourceEnd: targetCut.sourceEnd ?? targetCut.end,
-      label: targetCut.label,
-      trackId: targetCut.trackId || 0,
-      assetId: targetCut.assetId
-    };
-
-    const newCuts = cuts.map(c => c.id === targetCut.id ? firstHalf : c);
-    const index = newCuts.findIndex(c => c.id === targetCut.id);
-    newCuts.splice(index + 1, 0, secondHalf);
-
-    setCuts([...newCuts]);
-    setSelectedCutIds([newCutId]);
-  };
-
-  const handleDelete = () => {
-    if (selectedCutIds.length === 0) return;
-    setCuts(cuts.filter(c => !selectedCutIds.includes(c.id)));
-    setSelectedCutIds([]);
-  };
 
   // --- DRAG HANDLERS ---
   const handleTimelineMouseDown = (e: React.MouseEvent) => {
@@ -1086,123 +606,15 @@ function App() {
   }, [dragState, cuts, zoomLevel, duration]);
 
 
-  // --- AI Functions ---
 
-
-  const handleGeminiHighlights = async () => {
-    if (!videoFile || !apiKey) return;
-    setIsProcessing(true);
-
-    const formData = new FormData();
-    formData.append('file', videoFile);
-    formData.append('instruction', instruction || "Find the best highlights");
-    formData.append('target_count', highlightCount.toString());
-    formData.append('target_duration', targetDuration.toString());
-    formData.append('api_key', apiKey);
-    formData.append('model_name', geminiModel);
-
-    try {
-      const res = await fetch(`${API_BASE_URL}/analyze-video`, { method: 'POST', body: formData });
-      if (res.ok) {
-        const data = await res.json();
-        const aiCuts = data.map((c: any, i: number) => ({
-          id: `ai-${i}`,
-          start: c.start,
-          end: c.end,
-          label: c.label || `Highlight ${i + 1}`,
-          trackId: 0
-        }));
-
-        if (confirm(`AI Found ${aiCuts.length} clips. Replace timeline?`)) {
-          setCuts(aiCuts);
-        }
-      } else {
-        alert("AI Analysis Failed");
-      }
-    } catch (e) {
-      console.error(e);
-      alert("Error connecting to backend");
-    }
-    setIsProcessing(false);
-  };
-
-  const handleSilenceRemoval = async () => {
-    if (!videoFile) return;
-    if (!confirm("這將會移除影片中的靜音部分並取代目前的時間軸。確定嗎？")) return;
-
-    setIsProcessing(true);
-
-    const formData = new FormData();
-    formData.append('file', videoFile);
-    formData.append('threshold_db', silenceThreshold.toString());
-    formData.append('min_duration', silenceMinDuration.toString());
-
-
-    try {
-      const res = await fetch(`${API_BASE_URL}/detect-silence`, {
-        method: 'POST',
-        body: formData
-      });
-
-      if (res.ok) {
-        const segments = await res.json();
-        const newCuts: Cut[] = segments.map((seg: any, i: number) => ({
-          id: `silence-${i}`,
-          start: seg.start,
-          end: seg.end,
-          sourceStart: seg.start,
-          sourceEnd: seg.end,
-          label: 'Speech',
-          trackId: 0
-        }));
-
-        if (newCuts.length === 0) {
-          alert("未偵測到任何語音片段 (No speech found)");
-        } else {
-          setCuts(newCuts);
-        }
-      } else {
-        console.error(await res.text());
-        alert("偵測失敗");
-      }
-    } catch (e) {
-      console.error(e);
-      alert("連線後端失敗");
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-
-  const handleAlignCuts = () => {
+  const handleExportXML = useCallback(() => {
     if (cuts.length === 0) return;
+    const fileName = videoFile?.name || "video.mp4";
+    const xml = generateFCPXML(cuts, duration, fileName, originalVideoPath);
+    downloadFile(xml, 'project_export.xml', 'application/xml');
+  }, [cuts, videoFile, duration, originalVideoPath]);
 
-    // Process only tracks that usually have gaps (video/audio)
-    // Actually, usually we align everything on the primary track and shift others accordingly
-    // To keep it simple for the user: Align all clips on Track 0 (Video) to be contiguous,
-    // and shift all other overlapping or concurrent clips by the same relative amount.
-
-    const sortedCuts = [...cuts].sort((a, b) => a.start - b.start);
-    let timelineOffset = 0;
-
-    const newCuts = sortedCuts.map(cut => {
-      const duration = cut.end - cut.start;
-      const nc = {
-        ...cut,
-        start: timelineOffset,
-        end: timelineOffset + duration,
-        sourceStart: cut.sourceStart ?? cut.start,
-        sourceEnd: cut.sourceEnd ?? cut.end
-      };
-      timelineOffset += duration;
-      return nc;
-    });
-
-    setCuts(newCuts);
-    alert("間隔已成功移除！片段現在已緊密對齊。");
-  };
-
-  const handleExportVideo = async () => {
+  const handleExportVideo = useCallback(async (resolution: string, bitrate: number, selectedFormats: string[]) => {
     if (cuts.length === 0 || !videoFile) {
       if (!videoFile) alert("請先上傳影片檔案以進行匯出");
       return;
@@ -1211,33 +623,26 @@ function App() {
     setIsProcessing(true);
     setShowExportModal(false);
 
-    // Integrated XML Export
     if (selectedFormats.includes('xml')) {
       handleExportXML();
-      // If ONLY xml was selected, we don't need to ping the backend for heavy processing
       if (selectedFormats.length === 1) {
         setIsProcessing(false);
         return;
       }
     }
 
-    console.log("🚀 [FRONTEND] Starting Video Export...", {
-      model: whisperModel,
-      language: whisperLanguage,
-    });
-
     const cutsForBackend = cuts.map(c => ({
       ...c,
-      start: c.sourceStart ?? c.start, // Send source range to backend
+      start: c.sourceStart ?? c.start,
       end: c.sourceEnd ?? c.end
     }));
 
     const formData = new FormData();
     formData.append('file', videoFile);
     formData.append('cuts_json', JSON.stringify(cutsForBackend));
-    formData.append('output_resolution', exportResolution);
-    formData.append('output_bitrate', `${exportBitrate}M`);
-    formData.append('output_mode', 'video'); // Force video render
+    formData.append('output_resolution', resolution);
+    formData.append('output_bitrate', `${bitrate}M`);
+    formData.append('output_mode', 'video');
     formData.append('whisper_language', whisperLanguage);
     formData.append('whisper_model_size', whisperModel);
     formData.append('whisper_beam_size', whisperBeamSize.toString());
@@ -1245,15 +650,11 @@ function App() {
     formData.append('whisper_chars_per_line', whisperCharsPerLine.toString());
     formData.append('whisper_remove_punctuation', whisperRemovePunc ? 'true' : 'false');
     formData.append('vertical_mode', isVerticalMode ? 'true' : 'false');
-
-    // AI options (now managed by backend via process-preview-pipeline or explicit transcription)
     formData.append('burn_captions', 'false');
     formData.append('auto_caption', 'false');
     formData.append('face_tracking', 'false');
     formData.append('studio_sound', 'false');
     formData.append('merge_clips', 'true');
-
-    // Multi-format support
     formData.append('selected_formats', JSON.stringify(selectedFormats));
 
     try {
@@ -1276,73 +677,14 @@ function App() {
           alert("匯出成功但未獲取下載連結: " + JSON.stringify(data));
         }
       } else {
-        const errorText = await response.text();
-        console.error("Export failed:", errorText);
         alert("匯出失敗，請檢查後端日誌");
       }
-    } catch (e) {
-      console.error("Export error:", e);
+    } catch (_e) {
       alert("連線後端失敗");
     } finally {
       setIsProcessing(false);
     }
-  };
-
-  const handleExportXML = () => {
-    if (cuts.length === 0) return;
-    const fps = 30;
-    const fileName = videoFile?.name || "video.mp4";
-
-    let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE fcpxml>
-<fcpxml version="1.8">
-    <resources>
-        <format id="r1" name="FFVideoFormat1080p30" frameDuration="1/30s" width="1920" height="1080"/>
-        <asset id="a1" name="${fileName}" src="file://${originalVideoPath || `localhost/path/to/${fileName}`}" duration="${Math.round(duration * fps)}/30s" hasVideo="1" hasAudio="1"/>
-    </resources>
-    <library>
-        <event name="Antigravity Cut Event">
-            <project name="Antigravity Project">
-                <sequence format="r1" duration="${Math.round(cuts.reduce((a, b) => a + (b.end - b.start), 0) * fps)}/30s" tcStart="0s" tcFormat="NDF">
-                    <spine>`;
-
-    let offset = 0;
-    cuts.forEach((cut, i) => {
-      const dur = cut.end - cut.start;
-      const durFrames = Math.round(dur * fps);
-      const startFrames = Math.round(cut.start * fps);
-      const offsetFrames = Math.round(offset * fps);
-
-      xml += `
-                        <video name="${cut.label || 'Clip ' + (i + 1)}" offset="${offsetFrames}/30s" ref="a1" duration="${durFrames}/30s" start="${startFrames}/30s"/>`;
-      offset += dur;
-    });
-
-    xml += `
-                    </spine>
-                </sequence>
-            </project>
-        </event>
-    </library>
-</fcpxml>`;
-
-    const blob = new Blob([xml], { type: 'application/xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `project_export.xml`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  // --- Zoom Logic ---
-  const handleZoom = (zoomIn: boolean) => {
-    setZoomLevel(prev => {
-      const newZoom = zoomIn ? Math.min(prev * 1.2, 300) : Math.max(prev / 1.2, 1);
-      return newZoom;
-    });
-  };
+  }, [cuts, videoFile, duration, handleExportXML, setIsProcessing, whisperLanguage, whisperModel, whisperBeamSize, whisperTemperature, whisperCharsPerLine, whisperRemovePunc, isVerticalMode]);
 
   const handleWheelZoom = (e: React.WheelEvent) => {
     if (e.metaKey || e.ctrlKey) {
@@ -1379,83 +721,16 @@ function App() {
     }
   };
 
-  // --- Optimized Shortcut Handler ---
-  const handlersRef = useRef<{
-    togglePlay: () => void;
-    handleSplit: () => void;
-    handleDelete: () => void;
-    handleUndo: () => void;
-    handleRedo: () => void;
-    setActiveTool: React.Dispatch<React.SetStateAction<"text" | "select" | "blade" | "hand">>;
-    handleZoom: (zoomIn: boolean) => void;
-  }>({
+  // --- Keyboard Shortcuts (via hook) ---
+  useKeyboardShortcuts({
     togglePlay,
     handleSplit,
     handleDelete,
     handleUndo,
     handleRedo,
     setActiveTool,
-    handleZoom: () => { } // Initial dummy
+    handleZoom,
   });
-
-  // Update ref on render so it has latest state closures if needed (though mostly state triggers re-render)
-  // Actually, togglePlay uses refs, so it's fine. handleSplit uses state `cuts`... wait.
-  // If `handleSplit` closes over old `cuts`, it will be buggy inside useEffect listener?
-  // `useRef` value is updated on every render? No, I need to update .current.
-  handlersRef.current = {
-    togglePlay,
-    handleSplit,
-    handleDelete,
-    handleUndo,
-    handleRedo,
-    setActiveTool,
-    handleZoom
-  };
-
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in input/textarea
-      const target = e.target as HTMLElement;
-      if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
-
-      if (e.code === 'Space') {
-        e.preventDefault();
-        handlersRef.current.togglePlay();
-      } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        handlersRef.current.handleSplit();
-      } else if (e.code === 'KeyC') {
-        // C for Razor/Cut Tool.
-        // If user wants immediate cut, they might expect it. But standard is Tool select.
-        // User said "裁切是 C" (Cut is C).
-        // If adhering to familiar keys: C = Blade Tool.
-        if (!e.metaKey && !e.ctrlKey) {
-          handlersRef.current.setActiveTool('blade');
-        }
-      } else if (e.code === 'KeyV') {
-        if (!e.metaKey && !e.ctrlKey) {
-          handlersRef.current.setActiveTool('select');
-        }
-      } else if (e.code === 'Backspace' || e.code === 'Delete') {
-        handlersRef.current.handleDelete();
-      } else if (e.code === 'KeyZ' && (e.metaKey || e.ctrlKey)) {
-        e.preventDefault();
-        if (e.shiftKey) {
-          handlersRef.current.handleRedo();
-        } else {
-          handlersRef.current.handleUndo();
-        }
-      } else if ((e.metaKey || e.ctrlKey) && (e.code === 'Equal' || e.code === 'NumpadAdd')) {
-        e.preventDefault();
-        handlersRef.current.handleZoom(true);
-      } else if ((e.metaKey || e.ctrlKey) && (e.code === 'Minus' || e.code === 'NumpadSubtract')) {
-        e.preventDefault();
-        handlersRef.current.handleZoom(false);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
 
   return (
     <div className="app-container" onDrop={handleDrop} onDragOver={handleDragOver}>
@@ -1507,66 +782,27 @@ function App() {
 
       {/* Welcome Screen */}
       {appView === 'welcome' ? (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#111', color: 'white' }}>
-          <div style={{ marginBottom: 40, textAlign: 'center' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 16, marginBottom: 24 }}>
-              <Scissors size={64} className="text-secondary" />
-              <h1 style={{ fontSize: 48, margin: 0, fontWeight: 800, background: 'linear-gradient(135deg, #fff 0%, #a1a1aa 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent' }}>Antigravity Cut</h1>
-            </div>
-            <p style={{ color: '#666', fontSize: 16 }}>專業級 AI 智能影音剪輯工具</p>
-          </div>
-
-          <div style={{ display: 'flex', gap: 24 }}>
-            <div
-              onClick={() => {
-                const hasSaved = localStorage.getItem('antigravity_current_project');
-                if (!hasSaved || confirm('這將會清空目前所有進度，確定嗎？')) {
-                  localStorage.removeItem('antigravity_current_project');
-                  setCuts([]);
-                  setVideoUrl(null);
-                  setOriginalVideoPath(null);
-                  setProjectAssets([]);
-                  setAppView('editor');
-                }
-              }}
-              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s' }}
-              className="welcome-card"
-            >
-              <Plus size={40} color="#3ea6ff" style={{ marginBottom: 16 }} />
-              <span style={{ fontWeight: 600, fontSize: 16 }}>建立新專案</span>
-              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Start New Project</span>
-            </div>
-
-            <div
-              onClick={() => {
-                const saved = localStorage.getItem('antigravity_current_project');
-                if (saved) {
-                  loadProject(JSON.parse(saved));
-                }
-              }}
-              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s', opacity: localStorage.getItem('antigravity_current_project') ? 1 : 0.5, pointerEvents: localStorage.getItem('antigravity_current_project') ? 'auto' : 'none' }}
-              className="welcome-card"
-            >
-              <RotateCcw size={40} color="#3ea6ff" style={{ marginBottom: 16 }} />
-              <span style={{ fontWeight: 600, fontSize: 16 }}>恢復上次專案</span>
-              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Resume Project</span>
-            </div>
-
-            <label
-              style={{ width: 200, height: 160, background: '#222', borderRadius: 12, border: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', transition: 'all 0.2s' }}
-              className="welcome-card"
-            >
-              <Save size={40} color="#eb64ff" style={{ marginBottom: 16 }} />
-              <span style={{ fontWeight: 600, fontSize: 16 }}>從檔案匯入 project</span>
-              <span style={{ fontSize: 12, color: '#666', marginTop: 8 }}>Import .agpro File</span>
-              <input type="file" hidden accept=".agpro,.json" onChange={handleImportProject} />
-            </label>
-          </div>
-
-          <div style={{ marginTop: 64, color: '#444', fontSize: 12 }}>
-            v1.0.0 Alpha
-          </div>
-        </div>
+        <WelcomeScreen
+          onNewProject={() => {
+            const hasSaved = localStorage.getItem('antigravity_current_project');
+            if (!hasSaved || confirm('這將會清空目前所有進度，確定嗎？')) {
+              localStorage.removeItem('antigravity_current_project');
+              setCuts([]);
+              setVideoUrl(null);
+              setOriginalVideoPath(null);
+              setProjectAssets([]);
+              setAppView('editor');
+            }
+          }}
+          onResumeProject={() => {
+            const saved = localStorage.getItem('antigravity_current_project');
+            if (saved) {
+              loadProject(JSON.parse(saved));
+            }
+          }}
+          onImportProject={handleImportProject}
+          hasExistingProject={!!localStorage.getItem('antigravity_current_project')}
+        />
       ) : (
         <div className={`premiere-layout ${isVerticalMode ? 'vertical-layout-active' : ''}`}>
           {/* 2. Main Premiere Layout */}
@@ -2486,7 +1722,7 @@ function App() {
                             <video
                               key={activeCut?.id || 'init-video'}
                               src={url}
-                              onLoadedMetadata={track.id === 0 ? handleMetadata : undefined}
+                              onLoadedMetadata={track.id === 0 ? handleVideoMetadata : undefined}
                               style={{
                                 position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
                                 objectFit: 'contain', zIndex: track.id,
@@ -2938,7 +2174,7 @@ function App() {
                     style={{
                       minWidth: '100%',
                       width: Math.max(100, duration * zoomLevel) + 'px',
-                      cursor: getTimelineCursor()
+                      cursor: timelineCursor
                     }}
                     onMouseDown={handleTimelineMouseDown}
                   >
@@ -2965,7 +2201,7 @@ function App() {
                     style={{
                       minWidth: '100%',
                       width: Math.max(100, duration * zoomLevel) + 'px',
-                      cursor: getTimelineCursor()
+                      cursor: timelineCursor
                     }}
                     onMouseDown={handleTimelineMouseDown}
                     ref={timelineRef}
@@ -3096,178 +2332,16 @@ function App() {
 
 
 
-          {/* Export Sidebar Panel (Addressing: "How do I check if it covers the screen?") */}
-          {
-            showExportModal && (
-              <div className="modal-overlay" style={{ display: 'flex', alignItems: 'stretch', justifyContent: 'flex-end', zIndex: 1001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(2px)' }}>
-                <div
-                  className="export-side-panel"
-                  style={{
-                    width: 400,
-                    background: '#121212',
-                    borderLeft: '1px solid #333',
-                    overflowY: 'auto',
-                    boxShadow: '-10px 0 30px rgba(0,0,0,0.5)',
-                    animation: 'slideInRight 0.3s ease-out'
-                  }}
-                >
-                  <div style={{ padding: '20px 24px', borderBottom: '1px solid #222', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#1a1a1a' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <div style={{ padding: 8, background: 'rgba(62,166,255,0.1)', borderRadius: 10 }}>
-                        <Download size={20} color="#3ea6ff" />
-                      </div>
-                      <div>
-                        <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#fff' }}>匯出影片</h3>
-                        <div style={{ fontSize: 11, color: '#666' }}>設定您的匯出偏好</div>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => setShowExportModal(false)}
-                      className="btn-icon-sm"
-                      style={{ background: '#222', borderRadius: '50%', border: '1px solid #333' }}
-                    >
-                      <X size={16} />
-                    </button>
-                  </div>
-
-                  <div style={{ padding: 24 }}>
-                    {/* Project Status Summary (Addressing user check request) */}
-                    <div className="panel-card" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid #333', padding: 20, borderRadius: 12, marginBottom: 24 }}>
-                      <label style={{ display: 'block', marginBottom: 16, fontSize: 13, fontWeight: 700, color: '#3ea6ff', textTransform: 'uppercase', letterSpacing: 0.5 }}>專案匯出概覽</label>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-                        <div>
-                          <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>總片段數</div>
-                          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>{cuts.length} <span style={{ fontSize: 11, fontWeight: 400, color: '#555' }}>segments</span></div>
-                        </div>
-                        <div>
-                          <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>預估匯出時長</div>
-                          <div style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>
-                            {Math.max(0, ...cuts.map(c => c.end)).toFixed(1)} <span style={{ fontSize: 11, fontWeight: 400, color: '#555' }}>sec</span>
-                          </div>
-                        </div>
-                      </div>
-                      <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #222', display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: videoUrl ? '#3ea6ff' : '#ef4444', boxShadow: videoUrl ? '0 0 8px #3ea6ff' : 'none' }} />
-                        <span style={{ fontSize: 11, color: '#aaa' }}>{videoUrl ? '媒體來源已連結，準備就緒' : '請注意：尚未連結原始影片素材'}</span>
-                      </div>
-                    </div>
-
-                    {/* Resolution Toggle */}
-                    <div style={{ marginBottom: 24 }}>
-                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出解析度</label>
-                      <div style={{ display: 'flex', gap: 10 }}>
-                        {[
-                          { id: '4k', label: '4K', desc: 'Ultra HD' },
-                          { id: '1080p', label: '1080p', desc: 'Full HD' },
-                          { id: '720p', label: '720p', desc: 'HD Ready' }
-                        ].map(res => (
-                          <div
-                            key={res.id}
-                            onClick={() => {
-                              setExportResolution(res.id);
-                              // Auto-adjust bitrate for 4K presets
-                              if (res.id === '4k' && exportBitrate < 30) setExportBitrate(50);
-                              if (res.id === '1080p' && exportBitrate > 30) setExportBitrate(16);
-                            }}
-                            style={{
-                              flex: 1, padding: '12px 16px', borderRadius: 12, cursor: 'pointer', transition: 'all 0.2s',
-                              border: `1px solid ${exportResolution === res.id ? '#3ea6ff' : '#222'}`,
-                              background: exportResolution === res.id ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
-                              textAlign: 'center'
-                            }}
-                          >
-                            <div style={{ fontSize: 14, fontWeight: 700, color: exportResolution === res.id ? '#3ea6ff' : '#eee' }}>{res.label}</div>
-                            <div style={{ fontSize: 10, color: exportResolution === res.id ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{res.desc}</div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Bitrate Presets */}
-                    <div style={{ marginBottom: 24 }}>
-                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>輸出畫質碼率</label>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
-                        {[
-                          { val: 8, label: '標準', desc: '8M' },
-                          { val: 16, label: '高清', desc: '16M' },
-                          { val: 32, label: '極致', desc: '32M' },
-                          { val: 50, label: '大師', desc: '50M' }
-                        ].map(opt => (
-                          <div
-                            key={opt.val}
-                            onClick={() => setExportBitrate(opt.val)}
-                            style={{
-                              padding: '10px 4px', borderRadius: 10, cursor: 'pointer', transition: 'all 0.2s',
-                              border: `1px solid ${exportBitrate === opt.val ? '#3ea6ff' : '#222'}`,
-                              background: exportBitrate === opt.val ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
-                              textAlign: 'center'
-                            }}
-                          >
-                            <div style={{ fontSize: 12, fontWeight: 700, color: exportBitrate === opt.val ? '#3ea6ff' : '#eee' }}>{opt.label}</div>
-                            <div style={{ fontSize: 9, color: exportBitrate === opt.val ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{opt.desc}</div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Format Selector (Multi-select requested by user) */}
-                    <div style={{ marginBottom: 24 }}>
-                      <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 700, color: '#aaa', textTransform: 'uppercase' }}>匯出格式選擇 (可多選)</label>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-                        {[
-                          { id: 'video', label: '影片 (MP4)', icon: <Video size={16} /> },
-                          { id: 'audio', label: '音訊 (MP3)', icon: <Music size={16} /> },
-                          { id: 'xml', label: '工程 (XML)', icon: <SplitSquareHorizontal size={16} /> },
-                          { id: 'srt', label: '字幕 (SRT)', icon: <Type size={16} /> },
-                        ].map(format => {
-                          const isSelected = selectedFormats.includes(format.id);
-                          return (
-                            <div
-                              key={format.id}
-                              onClick={() => {
-                                setSelectedFormats(prev =>
-                                  prev.includes(format.id)
-                                    ? prev.filter(f => f !== format.id)
-                                    : [...prev, format.id]
-                                );
-                              }}
-                              style={{
-                                padding: '12px', borderRadius: 12, background: isSelected ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
-                                border: `1px solid ${isSelected ? '#3ea6ff' : '#222'}`,
-                                cursor: 'pointer', transition: 'all 0.2s',
-                                display: 'flex', alignItems: 'center', gap: 10
-                              }}
-                            >
-                              <span style={{ color: isSelected ? '#3ea6ff' : '#555' }}>{format.icon}</span>
-                              <span style={{ fontSize: 12, fontWeight: 600, color: isSelected ? '#eee' : '#666' }}>{format.label}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    <button
-                      className="btn-primary"
-                      onClick={handleExportVideo}
-                      disabled={isProcessing || selectedFormats.length === 0}
-                      style={{
-                        width: '100%', height: 48, fontSize: 15, fontWeight: 700, borderRadius: 14,
-                        background: 'linear-gradient(135deg, #3ea6ff 0%, #007aff 100%)',
-                        boxShadow: '0 8px 20px -5px rgba(0,122,255,0.4)',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
-                        opacity: (isProcessing || selectedFormats.length === 0) ? 0.6 : 1
-                      }}
-                    >
-                      {isProcessing ? <><Loader2 className="spin" size={18} /> 處理中...</> : <><Download size={18} /> 開始匯出 ({selectedFormats.length} 個檔案)</>}
-                    </button>
-
-                    <div style={{ marginTop: 16, textAlign: 'center', fontSize: 11, color: '#444' }}>
-                      處理時間取決於影片長度與選取的 AI 功能
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
+          {/* Export Sidebar Panel */}
+          {showExportModal && (
+            <ExportModal
+              cuts={cuts}
+              videoUrl={videoUrl}
+              isProcessing={isProcessing}
+              onClose={() => setShowExportModal(false)}
+              onExport={handleExportVideo}
+            />
+          )}
 
           {/* 6. GLOBAL PROCESSING OVERLAY */}
           {isProcessing && currentJobStatus && (
