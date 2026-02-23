@@ -1,70 +1,85 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import type { Cut } from '../types';
 
-const MAX_HISTORY = 20;
+const MAX_HISTORY = 50;
+
+interface HistoryState {
+  entries: Cut[][];
+  index: number;
+}
+
+const INITIAL_STATE: HistoryState = { entries: [], index: -1 };
 
 interface UseHistoryOptions {
   cuts: Cut[];
   setCuts: React.Dispatch<React.SetStateAction<Cut[]>>;
 }
 
-export function useHistory({ cuts, setCuts }: UseHistoryOptions) {
-  const [history, setHistory] = useState<Cut[][]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
+export function useHistory({ setCuts }: UseHistoryOptions) {
+  const [state, setState] = useState<HistoryState>(INITIAL_STATE);
   const isUndoingRef = useRef(false);
 
-  // Initialize history
-  useEffect(() => {
-    if (history.length === 0 && cuts.length > 0) {
-      setHistory([cuts]);
-      setHistoryIndex(0);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cuts.length]);
+  const canUndo = state.index > 0;
+  const canRedo = state.index < state.entries.length - 1;
+  const historyLength = state.entries.length;
+
+  const initializeHistory = useCallback((initialCuts: Cut[]) => {
+    setState({ entries: [initialCuts], index: 0 });
+  }, []);
 
   const addToHistory = useCallback((newCuts: Cut[]) => {
     if (isUndoingRef.current) return;
 
-    setHistory(prev => {
-      const newHistory = prev.slice(0, historyIndex + 1);
-      newHistory.push(newCuts);
-      if (newHistory.length > MAX_HISTORY) {
-        newHistory.shift();
-      }
-      return newHistory;
+    setState(prev => {
+      // Truncate any future states beyond current index
+      const truncated = prev.entries.slice(0, prev.index + 1);
+      const updated = [...truncated, newCuts];
+      const trimmed = updated.length > MAX_HISTORY
+        ? updated.slice(updated.length - MAX_HISTORY)
+        : updated;
+      return {
+        entries: trimmed,
+        index: trimmed.length - 1,
+      };
     });
-    setHistoryIndex(prev => {
-      const effectiveLength = Math.min(prev + 2, MAX_HISTORY);
-      return effectiveLength - 1;
-    });
-  }, [historyIndex]);
+  }, []);
 
   const handleUndo = useCallback(() => {
-    if (historyIndex > 0) {
-      isUndoingRef.current = true;
-      const prevCuts = history[historyIndex - 1];
-      setCuts(prevCuts);
-      setHistoryIndex(historyIndex - 1);
-      setTimeout(() => { isUndoingRef.current = false; }, 0);
-    }
-  }, [historyIndex, history, setCuts]);
+    isUndoingRef.current = true;
+    setState(prev => {
+      if (prev.index <= 0) {
+        isUndoingRef.current = false;
+        return prev;
+      }
+      setCuts(prev.entries[prev.index - 1]);
+      return { ...prev, index: prev.index - 1 };
+    });
+    setTimeout(() => { isUndoingRef.current = false; }, 0);
+  }, [setCuts]);
 
   const handleRedo = useCallback(() => {
-    if (historyIndex < history.length - 1) {
-      isUndoingRef.current = true;
-      const nextCuts = history[historyIndex + 1];
-      setCuts(nextCuts);
-      setHistoryIndex(historyIndex + 1);
-      setTimeout(() => { isUndoingRef.current = false; }, 0);
-    }
-  }, [historyIndex, history, setCuts]);
+    isUndoingRef.current = true;
+    setState(prev => {
+      if (prev.index >= prev.entries.length - 1) {
+        isUndoingRef.current = false;
+        return prev;
+      }
+      setCuts(prev.entries[prev.index + 1]);
+      return { ...prev, index: prev.index + 1 };
+    });
+    setTimeout(() => { isUndoingRef.current = false; }, 0);
+  }, [setCuts]);
 
   return {
-    history,
-    historyIndex,
+    history: state.entries,
+    historyIndex: state.index,
+    historyLength,
+    canUndo,
+    canRedo,
     addToHistory,
     handleUndo,
     handleRedo,
+    initializeHistory,
     isUndoingRef,
   };
 }

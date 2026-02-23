@@ -5,15 +5,20 @@ interface KeyboardHandlers {
   togglePlay: () => void;
   handleSplit: () => void;
   handleDelete: () => void;
+  handleRippleDelete: () => void;
   handleUndo: () => void;
   handleRedo: () => void;
+  handleSelectAll: () => void;
+  handleDeselectAll: () => void;
   setActiveTool: React.Dispatch<React.SetStateAction<ActiveTool>>;
   handleZoom: (zoomIn: boolean) => void;
 }
 
 export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
   const handlersRef = useRef<KeyboardHandlers>(handlers);
-  handlersRef.current = handlers;
+  useEffect(() => {
+    handlersRef.current = handlers;
+  });
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -26,6 +31,11 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
       } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         handlersRef.current.handleSplit();
+      } else if (e.code === 'KeyA' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handlersRef.current.handleSelectAll();
+      } else if (e.code === 'Escape') {
+        handlersRef.current.handleDeselectAll();
       } else if (e.code === 'KeyC') {
         if (!e.metaKey && !e.ctrlKey) {
           handlersRef.current.setActiveTool('blade');
@@ -35,7 +45,13 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
           handlersRef.current.setActiveTool('select');
         }
       } else if (e.code === 'Backspace' || e.code === 'Delete') {
-        handlersRef.current.handleDelete();
+        // Shift+Delete/Backspace = ripple delete (must check BEFORE plain delete)
+        if (e.shiftKey) {
+          e.preventDefault();
+          handlersRef.current.handleRippleDelete();
+        } else {
+          handlersRef.current.handleDelete();
+        }
       } else if (e.code === 'KeyZ' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         if (e.shiftKey) {

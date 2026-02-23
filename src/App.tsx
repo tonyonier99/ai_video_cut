@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import type { DragEvent } from 'react';
-import { Play, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Download, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type, Video, Music, ChevronDown } from 'lucide-react';
+import { Play, Scissors, MousePointer2, ZoomIn, ZoomOut, Upload, Plus, Trash, Save, Film, Loader2, Zap, X, Download, RotateCcw, Monitor, Smartphone, Hand, Magnet, SplitSquareHorizontal, Type, Video, Music, ChevronDown, Undo2, Redo2 } from 'lucide-react';
 import { API_BASE_URL } from './config';
 import './App.css';
 
@@ -13,8 +13,12 @@ import { useTimeline } from './hooks/useTimeline';
 import { useTrackManagement } from './hooks/useTrackManagement';
 import { useAITools } from './hooks/useAITools';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useSnapping } from './hooks/useSnapping';
+import { useWaveformCache } from './hooks/useWaveformCache';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { ExportModal } from './components/ExportModal';
+import { SnapIndicator } from './components/SnapIndicator';
+import { WaveformCanvas } from './components/WaveformCanvas';
 
 function App() {
   // --- Refs ---
@@ -38,30 +42,38 @@ function App() {
   const [appView, setAppView] = useState<AppView>('welcome');
   const [marqueeRect, setMarqueeRect] = useState<{ startX: number; startY: number; currX: number; currY: number } | null>(null);
 
+  // --- Snapping Hook ---
+  const snapping = useSnapping();
+  const { snapTime, snapType, gridInterval, setGridInterval, showSnap, clearSnap } = snapping;
+
+  // --- Waveform Cache Hook ---
+  const waveformCache = useWaveformCache();
+  const { getWaveform, loadWaveform } = waveformCache;
+
   // --- Timeline Hook ---
-  const timeline = useTimeline({ duration: 0, currentTime: 0 });
+  const timeline = useTimeline({ duration: 0, currentTime: 0, onHistoryCommit: (newCuts) => addToHistory(newCuts) });
   const { cuts, setCuts, selectedCutIds, setSelectedCutIds, zoomLevel, setZoomLevel,
     isMagnetEnabled, setIsMagnetEnabled, totalDuration, getSnapTime,
-    handleSplit, handleDelete, handleAlignCuts, handleZoom } = timeline;
+    handleSplit, handleDelete, handleRippleDelete, handleAlignCuts, handleZoom } = timeline;
 
   // --- Track Management Hook ---
   const trackMgmt = useTrackManagement({ setCuts });
-  const { videoTracks, sortedTracks, toggleTrackVisibility, toggleTrackLock,
+  const { videoTracks, setVideoTracks, sortedTracks, toggleTrackVisibility, toggleTrackLock,
     handleAddTrack, handleDeleteTrack } = trackMgmt;
 
   // --- Playback Hook ---
   const playback = usePlayback({ totalDuration, cuts, videoRef });
-  const { currentTime, setCurrentTime, isPlaying, setIsPlaying, duration,
-    setDuration, togglePlay, handleMetadata, seek } = playback;
+  const { currentTime, setCurrentTime, isPlaying, duration,
+    togglePlay, handleMetadata } = playback;
 
   // --- History Hook ---
   const historyHook = useHistory({ cuts, setCuts });
-  const { history, historyIndex, addToHistory, handleUndo, handleRedo } = historyHook;
+  const { history, historyIndex, historyLength, canUndo, canRedo, addToHistory, handleUndo, handleRedo, initializeHistory } = historyHook;
 
   // --- AI Tools Hook ---
   const aiTools = useAITools({ videoFile, videoTracks, setCuts });
-  const { apiKey, setApiKey, apiKeyLoaded, isProcessing, setIsProcessing,
-    currentJobStatus, setCurrentJobStatus,
+  const { apiKey, setApiKey, isProcessing, setIsProcessing,
+    currentJobStatus,
     highlightCount, setHighlightCount, targetDuration, setTargetDuration,
     instruction, setInstruction, geminiModel, setGeminiModel,
     silenceThreshold, setSilenceThreshold, silenceMinDuration, setSilenceMinDuration,
@@ -101,8 +113,7 @@ function App() {
         addToHistory(finalCuts);
       }
     } else if (history.length === 0) {
-      setHistory([finalCuts]);
-      setHistoryIndex(0);
+      initializeHistory(finalCuts);
     }
 
     // 2. Auto-save to localStorage
@@ -356,8 +367,13 @@ function App() {
           let absTime = Math.max(0, offsetX / zoomLevel);
 
           // Snap Playhead
-          const snapped = getSnapTime(absTime);
-          if (snapped !== null) absTime = snapped;
+          const snapResult = getSnapTime(absTime, undefined, gridInterval);
+          if (snapResult.time !== null) {
+            absTime = snapResult.time;
+            showSnap(snapResult.time, snapResult.type);
+          } else {
+            clearSnap();
+          }
 
           setCurrentTime(absTime);
           if (videoRef.current) {
@@ -397,9 +413,14 @@ function App() {
           });
 
           // If shift key is held, merge with previous selection (additive)
-          // But usually marquee REPLACES unless Shift is held.
-          // For now, let's keep it simple: Marquee replaces selection or adds if shift.
-          setSelectedCutIds(newlySelected);
+          if (e.shiftKey) {
+            setSelectedCutIds(prev => {
+              const merged = new Set([...prev, ...newlySelected]);
+              return [...merged];
+            });
+          } else {
+            setSelectedCutIds(newlySelected);
+          }
         }
       }
       else if (dragState.type === 'move' && dragState.targetId) {
@@ -440,8 +461,13 @@ function App() {
           if (!draggingAnchor) return;
 
           let newAnchorStart = Math.max(0, draggingAnchor.start + deltaT);
-          const snapped = getSnapTime(newAnchorStart, dragState.targetId);
-          if (snapped !== null) newAnchorStart = snapped;
+          const snapResult = getSnapTime(newAnchorStart, dragState.targetId, gridInterval);
+          if (snapResult.time !== null) {
+            newAnchorStart = snapResult.time;
+            showSnap(snapResult.time, snapResult.type);
+          } else {
+            clearSnap();
+          }
 
           const actualDelta = newAnchorStart - draggingAnchor.start;
 
@@ -457,11 +483,16 @@ function App() {
           if (!targetCut) return;
 
           let newStart = Math.max(0, targetCut.start + deltaT);
-          const snapped = getSnapTime(newStart, dragState.targetId);
-          if (snapped !== null) newStart = snapped;
+          const snapResult2 = getSnapTime(newStart, dragState.targetId, gridInterval);
+          if (snapResult2.time !== null) {
+            newStart = snapResult2.time;
+            showSnap(snapResult2.time, snapResult2.type);
+          } else {
+            clearSnap();
+          }
 
-          const duration = targetCut.end - targetCut.start;
-          setCuts(baseCuts.map(c => c.id === dragState.targetId ? { ...c, start: newStart, end: newStart + duration } : c));
+          const dur = targetCut.end - targetCut.start;
+          setCuts(baseCuts.map(c => c.id === dragState.targetId ? { ...c, start: newStart, end: newStart + dur } : c));
         }
       }
       else if (dragState.type === 'trim-start' && dragState.targetId) {
@@ -470,8 +501,13 @@ function App() {
         if (!targetCut) return;
 
         let newStart = Math.min(targetCut.start + deltaTime, targetCut.end - 0.1);
-        const snapped = getSnapTime(newStart, dragState.targetId);
-        if (snapped !== null && snapped < targetCut.end) newStart = snapped;
+        const trimStartSnap = getSnapTime(newStart, dragState.targetId, gridInterval);
+        if (trimStartSnap.time !== null && trimStartSnap.time < targetCut.end) {
+          newStart = trimStartSnap.time;
+          showSnap(trimStartSnap.time, trimStartSnap.type);
+        } else {
+          clearSnap();
+        }
 
         const clampedStart = Math.max(0, newStart);
         const delta = clampedStart - targetCut.start;
@@ -489,8 +525,13 @@ function App() {
         if (!targetCut) return;
 
         let newEnd = Math.max(targetCut.end + deltaTime, targetCut.start + 0.1);
-        const snapped = getSnapTime(newEnd, dragState.targetId);
-        if (snapped !== null && snapped > targetCut.start) newEnd = snapped;
+        const trimEndSnap = getSnapTime(newEnd, dragState.targetId, gridInterval);
+        if (trimEndSnap.time !== null && trimEndSnap.time > targetCut.start) {
+          newEnd = trimEndSnap.time;
+          showSnap(trimEndSnap.time, trimEndSnap.type);
+        } else {
+          clearSnap();
+        }
 
         const delta = newEnd - targetCut.end;
         const newSourceEnd = (targetCut.sourceEnd ?? targetCut.end) + delta;
@@ -510,8 +551,13 @@ function App() {
             const offsetX = e.clientX - rect.left;
             let ghostTime = Math.max(0, offsetX / zoomLevel);
 
-            const snapped = getSnapTime(ghostTime);
-            if (snapped !== null) ghostTime = snapped;
+            const ghostSnap = getSnapTime(ghostTime, undefined, gridInterval);
+            if (ghostSnap.time !== null) {
+              ghostTime = ghostSnap.time;
+              showSnap(ghostSnap.time, ghostSnap.type);
+            } else {
+              clearSnap();
+            }
 
             // Determine track based on element under cursor
             let ghostTrackId = dragState.ghostTrackId;
@@ -530,6 +576,7 @@ function App() {
 
     const handleMouseUp = () => {
       setMarqueeRect(null);
+      clearSnap();
       if (dragState.isDragging && dragState.type === 'new-asset' && dragState.ghostTime !== undefined) {
         const asset = projectAssets.find(a => a.id === dragState.newAssetId);
         if (!asset) {
@@ -721,13 +768,26 @@ function App() {
     }
   };
 
+  // --- Multi-Select Handlers ---
+  const handleSelectAll = useCallback(() => {
+    setSelectedCutIds(cuts.map(c => c.id));
+  }, [cuts, setSelectedCutIds]);
+
+  const handleDeselectAll = useCallback(() => {
+    setSelectedCutIds([]);
+    setActiveTool('select');
+  }, [setSelectedCutIds, setActiveTool]);
+
   // --- Keyboard Shortcuts (via hook) ---
   useKeyboardShortcuts({
     togglePlay,
     handleSplit,
     handleDelete,
+    handleRippleDelete,
     handleUndo,
     handleRedo,
+    handleSelectAll,
+    handleDeselectAll,
     setActiveTool,
     handleZoom,
   });
@@ -854,6 +914,10 @@ function App() {
                                 el.src = asset.url;
                                 el.onloadedmetadata = () => {
                                   setProjectAssets(prev => prev.map(p => p.id === asset.id ? { ...p, duration: el.duration } : p));
+                                  // Auto-load waveform for audio assets
+                                  if (asset.type === 'audio') {
+                                    loadWaveform(asset.id, asset.url);
+                                  }
                                 };
                               } else {
                                 // Image default duration
@@ -1955,6 +2019,25 @@ function App() {
                   </div>
                 </div>
 
+                {/* Undo/Redo Group */}
+                <div className="tool-group">
+                  <div
+                    className={`tool-btn ${!canUndo ? 'disabled' : ''}`}
+                    title="復原 (Cmd+Z)"
+                    onClick={handleUndo}
+                  >
+                    <Undo2 size={18} />
+                  </div>
+                  <div
+                    className={`tool-btn ${!canRedo ? 'disabled' : ''}`}
+                    title="重做 (Cmd+Shift+Z)"
+                    onClick={handleRedo}
+                  >
+                    <Redo2 size={18} />
+                  </div>
+                  <span className="history-badge" title="歷史記錄">{historyIndex + 1}/{historyLength}</span>
+                </div>
+
                 {/* Actions Group */}
                 <div className="tool-group">
                   <div
@@ -1971,6 +2054,15 @@ function App() {
                     onClick={handleDelete}
                   >
                     <Trash size={18} />
+                  </div>
+                  <div
+                    className="tool-btn ripple-delete-btn"
+                    title="波紋刪除 (Shift+Delete) - 刪除並填補間隔"
+                    onClick={handleRippleDelete}
+                    style={{ position: 'relative' }}
+                  >
+                    <Trash size={18} />
+                    <span style={{ position: 'absolute', top: 2, right: 2, fontSize: 8, fontWeight: 800, color: '#eab308', lineHeight: 1 }}>R</span>
                   </div>
                 </div>
 
@@ -2031,7 +2123,25 @@ function App() {
                   >
                     <Magnet size={18} />
                   </div>
+
+                  {/* Grid Snap Selector */}
+                  <select
+                    className="grid-snap-select"
+                    value={gridInterval}
+                    onChange={e => setGridInterval(Number(e.target.value))}
+                    title="網格對齊間隔"
+                  >
+                    <option value={0}>Grid Off</option>
+                    <option value={0.25}>0.25s</option>
+                    <option value={0.5}>0.5s</option>
+                    <option value={1}>1s</option>
+                  </select>
                 </div>
+
+                {/* Selection Badge */}
+                {selectedCutIds.length > 0 && (
+                  <span className="selection-badge">{selectedCutIds.length} selected</span>
+                )}
               </div>
 
               {/* Right Side: Time & Zoom */}
@@ -2206,6 +2316,14 @@ function App() {
                     onMouseDown={handleTimelineMouseDown}
                     ref={timelineRef}
                   >
+                    {/* Snap Indicator */}
+                    <SnapIndicator
+                      snapTime={snapTime}
+                      snapType={snapType}
+                      zoomLevel={zoomLevel}
+                      containerHeight={300}
+                    />
+
                     {/* Playhead Line */}
                     <div className="playhead-marker" style={{ left: currentTime * zoomLevel }}>
                       {/* Floating time code */}
@@ -2308,6 +2426,25 @@ function App() {
                                 </>
                               )}
 
+                              {/* Waveform for audio tracks */}
+                              {track.type === 'audio' && cut.assetId && (() => {
+                                const wfEntry = getWaveform(cut.assetId!);
+                                if (wfEntry?.data) {
+                                  const clipWidth = Math.max(10, (cut.end - cut.start) * zoomLevel);
+                                  const clipHeight = isThin ? 16 : 36;
+                                  return (
+                                    <WaveformCanvas
+                                      waveformData={wfEntry.data}
+                                      sourceStart={cut.sourceStart}
+                                      sourceEnd={cut.sourceEnd}
+                                      width={clipWidth}
+                                      height={clipHeight}
+                                    />
+                                  );
+                                }
+                                return null;
+                              })()}
+
                               <span className="clip-label" style={{
                                 fontSize: isThin ? '9px' : '11px',
                                 padding: '0 10px',
@@ -2315,7 +2452,9 @@ function App() {
                                 overflow: 'hidden',
                                 textOverflow: 'ellipsis',
                                 maxWidth: '100%',
-                                pointerEvents: 'none'
+                                pointerEvents: 'none',
+                                zIndex: 1,
+                                position: 'relative',
                               }}>{cut.label}</span>
                             </div>
                           ))}

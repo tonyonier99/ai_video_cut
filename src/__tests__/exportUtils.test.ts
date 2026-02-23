@@ -2,10 +2,18 @@ import { describe, it, expect } from 'vitest'
 import { generateFCPXML } from '../utils/exportUtils'
 import type { Cut } from '../types'
 
+const makeCut = (overrides: Partial<Cut> & { id: string; start: number; end: number }): Cut => ({
+  sourceStart: overrides.start,
+  sourceEnd: overrides.end,
+  label: 'Test',
+  trackId: 0,
+  ...overrides,
+})
+
 describe('generateFCPXML', () => {
   const testCuts: Cut[] = [
-    { id: 'c1', start: 0, end: 10, track: 0, label: 'Intro' },
-    { id: 'c2', start: 20, end: 35, track: 0, label: 'Main' },
+    makeCut({ id: 'c1', start: 0, end: 10, label: 'Intro' }),
+    makeCut({ id: 'c2', start: 20, end: 35, label: 'Main' }),
   ]
 
   it('generates valid XML structure', () => {

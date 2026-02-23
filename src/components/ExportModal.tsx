@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { Download, X, Loader2, Video, Music, SplitSquareHorizontal, Type } from 'lucide-react';
 import type { Cut } from '../types';
 

@@ -1,6 +1,5 @@
 import React from 'react';
 import { Scissors, Plus, RotateCcw, Save } from 'lucide-react';
-import type { Cut, Asset } from '../types';
 
 interface WelcomeScreenProps {
   onNewProject: () => void;

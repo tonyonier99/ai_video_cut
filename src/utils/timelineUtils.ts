@@ -2,18 +2,35 @@ import type { Cut, TrackTheme } from '../types';
 
 const SNAP_THRESHOLD_PX = 10;
 
+export type SnapType = 'playhead' | 'zero' | 'cut-start' | 'cut-end' | 'grid' | null;
+
+export interface SnapResult {
+  time: number | null;
+  type: SnapType;
+  sourceId?: string;
+}
+
+const NO_SNAP: SnapResult = { time: null, type: null };
+
 export function getSnapTime(
   time: number,
   cuts: Cut[],
   currentTime: number,
   zoomLevel: number,
-  ignoreCutId?: string | null
-): number | null {
-  if (Math.abs(time - currentTime) * zoomLevel < SNAP_THRESHOLD_PX) return currentTime;
-  if (Math.abs(time) * zoomLevel < SNAP_THRESHOLD_PX) return 0;
+  ignoreCutId?: string | null,
+  gridInterval?: number
+): SnapResult {
+  const threshold = SNAP_THRESHOLD_PX / zoomLevel;
 
-  let closestTime: number | null = null;
-  let minDiff = SNAP_THRESHOLD_PX / zoomLevel;
+  if (Math.abs(time - currentTime) < threshold) {
+    return { time: currentTime, type: 'playhead' };
+  }
+  if (Math.abs(time) * zoomLevel < SNAP_THRESHOLD_PX) {
+    return { time: 0, type: 'zero' };
+  }
+
+  let best: SnapResult = { ...NO_SNAP };
+  let minDiff = threshold;
 
   for (const cut of cuts) {
     if (cut.id === ignoreCutId) continue;
@@ -21,17 +38,25 @@ export function getSnapTime(
     const diffStart = Math.abs(cut.start - time);
     if (diffStart < minDiff) {
       minDiff = diffStart;
-      closestTime = cut.start;
+      best = { time: cut.start, type: 'cut-start', sourceId: cut.id };
     }
 
     const diffEnd = Math.abs(cut.end - time);
     if (diffEnd < minDiff) {
       minDiff = diffEnd;
-      closestTime = cut.end;
+      best = { time: cut.end, type: 'cut-end', sourceId: cut.id };
     }
   }
 
-  return closestTime ?? null;
+  // Grid snapping (checked after cut boundaries - cuts take priority)
+  if (gridInterval && gridInterval > 0 && best.time === null) {
+    const gridSnapped = Math.round(time / gridInterval) * gridInterval;
+    if (Math.abs(gridSnapped - time) < threshold) {
+      return { time: gridSnapped, type: 'grid' };
+    }
+  }
+
+  return best;
 }
 
 export function getTrackTheme(type: string): TrackTheme {
