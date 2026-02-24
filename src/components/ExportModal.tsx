@@ -1,19 +1,49 @@
 import { useState } from 'react';
-import { Download, X, Loader2, Video, Music, SplitSquareHorizontal, Type } from 'lucide-react';
-import type { Cut } from '../types';
+import { Download, X, Loader2, Video, Music, SplitSquareHorizontal, Type, FileText, Settings } from 'lucide-react';
+import type { Cut, Asset } from '../types';
 
 interface ExportModalProps {
   cuts: Cut[];
+  assets: Asset[];
   videoUrl: string | null;
   isProcessing: boolean;
   onClose: () => void;
-  onExport: (resolution: string, bitrate: number, formats: string[]) => void;
+  onExport: (resolution: string, bitrate: number, formats: string[], codec: string) => void;
+  onRelinkAsset?: (assetId: string, file: File) => void;
 }
 
-export function ExportModal({ cuts, videoUrl, isProcessing, onClose, onExport }: ExportModalProps) {
+export function ExportModal({ cuts, assets, videoUrl, isProcessing, onClose, onExport, onRelinkAsset }: ExportModalProps) {
   const [exportResolution, setExportResolution] = useState('1080p');
   const [exportBitrate, setExportBitrate] = useState(16);
   const [selectedFormats, setSelectedFormats] = useState<string[]>(['video']);
+  const [selectedCodec, setSelectedCodec] = useState('h264');
+
+  const codecs = [
+    { id: 'h264', label: 'H.264', desc: '通用/YouTube' },
+    { id: 'prores', label: 'ProRes 422', desc: 'Apple 專業' },
+    { id: 'dnxhd', label: 'DNxHD', desc: 'Avid 專業' },
+  ];
+
+  const formats = [
+    { id: 'video', label: '影片 (MP4)', icon: <Video size={16} /> },
+    { id: 'audio', label: '音訊 (MP3)', icon: <Music size={16} /> },
+    { id: 'xml', label: '工程 (FCPXML)', icon: <SplitSquareHorizontal size={16} /> },
+    { id: 'edl', label: '剪輯表 (EDL)', icon: <FileText size={16} /> },
+    { id: 'srt', label: '字幕 (SRT)', icon: <Type size={16} /> },
+  ];
+
+  const handleRelinkClick = (assetId: string) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'video/*,audio/*,image/*';
+    input.onchange = (e) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (file && onRelinkAsset) {
+        onRelinkAsset(assetId, file);
+      }
+    };
+    input.click();
+  };
 
   return (
     <div className="modal-overlay" style={{ display: 'flex', alignItems: 'stretch', justifyContent: 'flex-end', zIndex: 1001, background: 'rgba(0,0,0,0.4)', backdropFilter: 'blur(2px)' }}>
@@ -126,16 +156,36 @@ export function ExportModal({ cuts, videoUrl, isProcessing, onClose, onExport }:
             </div>
           </div>
 
+          {/* Codec Selector */}
+          <div style={{ marginBottom: 24 }}>
+            <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>
+              <Settings size={12} style={{ marginRight: 6, verticalAlign: 'middle' }} />
+              編碼格式
+            </label>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {codecs.map(codec => (
+                <div
+                  key={codec.id}
+                  onClick={() => setSelectedCodec(codec.id)}
+                  style={{
+                    flex: 1, padding: '10px 8px', borderRadius: 10, cursor: 'pointer', transition: 'all 0.2s',
+                    border: `1px solid ${selectedCodec === codec.id ? '#3ea6ff' : '#222'}`,
+                    background: selectedCodec === codec.id ? 'rgba(62,166,255,0.08)' : '#1a1a1a',
+                    textAlign: 'center'
+                  }}
+                >
+                  <div style={{ fontSize: 11, fontWeight: 700, color: selectedCodec === codec.id ? '#3ea6ff' : '#eee' }}>{codec.label}</div>
+                  <div style={{ fontSize: 9, color: selectedCodec === codec.id ? 'rgba(62,166,255,0.6)' : '#555', marginTop: 2 }}>{codec.desc}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
           {/* Format Selector */}
           <div style={{ marginBottom: 24 }}>
             <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 700, color: '#aaa', textTransform: 'uppercase' }}>匯出格式選擇 (可多選)</label>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-              {[
-                { id: 'video', label: '影片 (MP4)', icon: <Video size={16} /> },
-                { id: 'audio', label: '音訊 (MP3)', icon: <Music size={16} /> },
-                { id: 'xml', label: '工程 (XML)', icon: <SplitSquareHorizontal size={16} /> },
-                { id: 'srt', label: '字幕 (SRT)', icon: <Type size={16} /> },
-              ].map(format => {
+              {formats.map(format => {
                 const isSelected = selectedFormats.includes(format.id);
                 return (
                   <div
@@ -162,9 +212,32 @@ export function ExportModal({ cuts, videoUrl, isProcessing, onClose, onExport }:
             </div>
           </div>
 
+          {/* Media Relink Section */}
+          {assets.length > 0 && (
+            <div style={{ marginBottom: 24 }}>
+              <label style={{ display: 'block', marginBottom: 12, fontSize: 13, fontWeight: 600, color: '#aaa' }}>媒體重新連結</label>
+              <div style={{ background: '#1a1a1a', borderRadius: 10, border: '1px solid #222', overflow: 'hidden' }}>
+                {assets.map(asset => (
+                  <div key={asset.id} style={{ padding: '10px 14px', borderBottom: '1px solid #222', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+                      <div style={{ width: 6, height: 6, borderRadius: '50%', background: asset.url ? '#4ade80' : '#ef4444', flexShrink: 0 }} />
+                      <span style={{ fontSize: 11, color: '#ccc', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{asset.name}</span>
+                    </div>
+                    <button
+                      onClick={() => handleRelinkClick(asset.id)}
+                      style={{ fontSize: 10, color: '#3ea6ff', background: 'none', border: '1px solid #333', borderRadius: 6, padding: '3px 8px', cursor: 'pointer', flexShrink: 0 }}
+                    >
+                      重新連結
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <button
             className="btn-primary"
-            onClick={() => onExport(exportResolution, exportBitrate, selectedFormats)}
+            onClick={() => onExport(exportResolution, exportBitrate, selectedFormats, selectedCodec)}
             disabled={isProcessing || selectedFormats.length === 0}
             style={{
               width: '100%', height: 48, fontSize: 15, fontWeight: 700, borderRadius: 14,

@@ -23,6 +23,10 @@ export interface Asset {
   name: string;
   url: string;
   duration?: number;
+  fps?: number;
+  width?: number;
+  height?: number;
+  originalPath?: string;
   file?: File;
 }
 

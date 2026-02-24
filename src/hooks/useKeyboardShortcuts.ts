@@ -12,6 +12,12 @@ interface KeyboardHandlers {
   handleDeselectAll: () => void;
   setActiveTool: React.Dispatch<React.SetStateAction<ActiveTool>>;
   handleZoom: (zoomIn: boolean) => void;
+  pause?: () => void;
+  cycleForwardRate?: () => void;
+  cycleReverseRate?: () => void;
+  setPlaybackRate?: (rate: number) => void;
+  markIn?: () => void;
+  markOut?: () => void;
 }
 
 export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
@@ -19,6 +25,8 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
   useEffect(() => {
     handlersRef.current = handlers;
   });
+
+  const kHeldRef = useRef(false);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -28,9 +36,33 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
       if (e.code === 'Space') {
         e.preventDefault();
         handlersRef.current.togglePlay();
+      } else if (e.code === 'KeyK' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        kHeldRef.current = true;
+        handlersRef.current.pause?.();
       } else if (e.code === 'KeyK' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         handlersRef.current.handleSplit();
+      } else if (e.code === 'KeyL' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        if (kHeldRef.current) {
+          handlersRef.current.setPlaybackRate?.(0.25);
+        } else {
+          handlersRef.current.cycleForwardRate?.();
+        }
+      } else if (e.code === 'KeyJ' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        if (kHeldRef.current) {
+          handlersRef.current.setPlaybackRate?.(-0.25);
+        } else {
+          handlersRef.current.cycleReverseRate?.();
+        }
+      } else if (e.code === 'KeyI' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        handlersRef.current.markIn?.();
+      } else if (e.code === 'KeyO' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        handlersRef.current.markOut?.();
       } else if (e.code === 'KeyA' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         handlersRef.current.handleSelectAll();
@@ -45,7 +77,6 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
           handlersRef.current.setActiveTool('select');
         }
       } else if (e.code === 'Backspace' || e.code === 'Delete') {
-        // Shift+Delete/Backspace = ripple delete (must check BEFORE plain delete)
         if (e.shiftKey) {
           e.preventDefault();
           handlersRef.current.handleRippleDelete();
@@ -67,7 +98,18 @@ export function useKeyboardShortcuts(handlers: KeyboardHandlers) {
         handlersRef.current.handleZoom(false);
       }
     };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.code === 'KeyK') {
+        kHeldRef.current = false;
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
   }, []);
 }

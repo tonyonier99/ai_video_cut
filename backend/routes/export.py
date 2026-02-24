@@ -59,12 +59,29 @@ def upload_proxy_endpoint(file: UploadFile = File(...)):
             final_path = proxy_path
             print(f"✅ Transcode complete: {proxy_path}")
 
+        # Probe media metadata
+        fps = 30.0
+        width = 1920
+        height = 1080
+        try:
+            cap = cv2.VideoCapture(final_path)
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+                cap.release()
+        except Exception as probe_err:
+            print(f"⚠️ Metadata probe failed: {probe_err}")
+
         return {
             "url": f"http://localhost:8000/uploads/{final_filename}",
             "filename": file.filename,
             "original_path": os.path.abspath(original_path),
             "proxy_path": os.path.abspath(final_path),
-            "is_proxy": needs_transcode
+            "is_proxy": needs_transcode,
+            "fps": round(fps, 3),
+            "width": width,
+            "height": height
         }
     except Exception as e:
         print(f"❌ Upload/Transcode failed: {e}")
@@ -131,6 +148,7 @@ def process_video(
     dfn3_strength: int = Form(100),
     subtitle_box_color: str = Form("#000000"),
     subtitle_box_enabled: str = Form("false"),
+    codec: str = Form("h264"),
     is_silence_removal: str = Form("false"),
     silence_threshold: float = Form(0.5),
     is_jump_cut_zoom: str = Form("true"),
@@ -467,6 +485,14 @@ def process_video(
             elif output_resolution == "720p":
                 scale = 0.666666667
 
+            # Map codec to Remotion codec name
+            codec_map = {
+                "h264": "h264",
+                "prores": "prores",
+                "dnxhd": "h264",  # Remotion doesn't support DNxHD natively, fallback
+            }
+            remotion_codec = codec_map.get(codec, "h264")
+
             cmd = [
                 "npx", "remotion", "render",
                 "src/remotion/index.ts",
@@ -476,6 +502,7 @@ def process_video(
                 f"--duration={dur_in_frames}",
                 f"--scale={scale}",
                 f"--vbitrate={output_bitrate}",
+                f"--codec={remotion_codec}",
                 "--log=verbose",
                 "--concurrency=1",
                 "--timeout=120000"

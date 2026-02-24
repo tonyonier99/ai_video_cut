@@ -7,6 +7,7 @@ import './App.css';
 import type { Cut, Asset, DragState, ActiveTool, LeftPanelTab, AppView } from './types';
 import { getTrackTheme, getTimelineCursor } from './utils/timelineUtils';
 import { generateFCPXML, downloadFile } from './utils/exportUtils';
+import { generateEDL } from './utils/edlUtils';
 import { usePlayback } from './hooks/usePlayback';
 import { useHistory } from './hooks/useHistory';
 import { useTimeline } from './hooks/useTimeline';
@@ -15,6 +16,7 @@ import { useAITools } from './hooks/useAITools';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useSnapping } from './hooks/useSnapping';
 import { useWaveformCache } from './hooks/useWaveformCache';
+import { useMarkPoints } from './hooks/useMarkPoints';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { ExportModal } from './components/ExportModal';
 import { SnapIndicator } from './components/SnapIndicator';
@@ -64,7 +66,9 @@ function App() {
   // --- Playback Hook ---
   const playback = usePlayback({ totalDuration, cuts, videoRef });
   const { currentTime, setCurrentTime, isPlaying, duration,
-    togglePlay, handleMetadata } = playback;
+    playbackRate, setPlaybackRate,
+    togglePlay, pause, cycleForwardRate, cycleReverseRate,
+    handleMetadata } = playback;
 
   // --- History Hook ---
   const historyHook = useHistory({ cuts, setCuts });
@@ -82,6 +86,16 @@ function App() {
     whisperCharsPerLine, setWhisperCharsPerLine, whisperRemovePunc, setWhisperRemovePunc,
     availableFonts, subtitleConfig, setSubtitleConfig, fetchFonts,
     handleGeminiHighlights, handleSilenceRemoval, handleAISubtitles } = aiTools;
+
+  // --- Mark Points Hook ---
+  const markPoints = useMarkPoints({
+    getCurrentTime: () => currentTime,
+    setCuts,
+    defaultTrackId: videoTracks.find(t => t.type === 'video')?.id ?? 0,
+    defaultAssetId: projectAssets.find(a => a.type === 'video')?.id,
+    onHistoryCommit: addToHistory,
+  });
+  const { inPoint, outPoint, markIn, markOut, clearMarks, createCutFromMarks } = markPoints;
 
   // --- Export Modal ---
   const [showExportModal, setShowExportModal] = useState(false);
@@ -214,10 +228,23 @@ function App() {
       });
       if (res.ok) {
         const data = await res.json();
-        const encodedUrl = data.url; // Server already encodes if needed, but we'll ensure it's a valid URL object
+        const encodedUrl = data.url;
         setVideoUrl(encodedUrl);
         setOriginalVideoPath(data.original_path);
         setCuts([]);
+
+        const newAsset: Asset = {
+          id: `asset_${Date.now()}`,
+          type: 'video',
+          name: file.name,
+          url: encodedUrl,
+          file,
+          fps: data.fps || 30,
+          width: data.width || 1920,
+          height: data.height || 1080,
+          originalPath: data.original_path,
+        };
+        setProjectAssets(prev => [...prev.filter(a => a.type !== 'video' || a.name !== file.name), newAsset]);
       } else {
         alert("Upload failed");
         // Fallback to client side
@@ -656,12 +683,32 @@ function App() {
 
   const handleExportXML = useCallback(() => {
     if (cuts.length === 0) return;
-    const fileName = videoFile?.name || "video.mp4";
-    const xml = generateFCPXML(cuts, duration, fileName, originalVideoPath);
-    downloadFile(xml, 'project_export.xml', 'application/xml');
-  }, [cuts, videoFile, duration, originalVideoPath]);
+    const projectName = videoFile?.name?.replace(/\.[^.]+$/, '') || 'Antigravity Project';
+    const primaryAsset = projectAssets.find(a => a.type === 'video');
+    const fps = primaryAsset?.fps || 30;
+    const xml = generateFCPXML(cuts, projectAssets, videoTracks, projectName, fps);
+    downloadFile(xml, `${projectName}_export.fcpxml`, 'application/xml');
+  }, [cuts, videoFile, projectAssets, videoTracks]);
 
-  const handleExportVideo = useCallback(async (resolution: string, bitrate: number, selectedFormats: string[]) => {
+  const handleExportEDL = useCallback(() => {
+    if (cuts.length === 0) return;
+    const projectName = videoFile?.name?.replace(/\.[^.]+$/, '') || 'Antigravity Project';
+    const primaryAsset = projectAssets.find(a => a.type === 'video');
+    const fps = primaryAsset?.fps || 30;
+    const edl = generateEDL(cuts, projectAssets, projectName, fps);
+    downloadFile(edl, `${projectName}_export.edl`, 'text/plain');
+  }, [cuts, videoFile, projectAssets]);
+
+  const handleRelinkAsset = useCallback((assetId: string, file: File) => {
+    const newUrl = URL.createObjectURL(file);
+    setProjectAssets(prev => prev.map(a =>
+      a.id === assetId
+        ? { ...a, url: newUrl, file, name: file.name, originalPath: undefined }
+        : a
+    ));
+  }, []);
+
+  const handleExportVideo = useCallback(async (resolution: string, bitrate: number, selectedFormats: string[], codec: string) => {
     if (cuts.length === 0 || !videoFile) {
       if (!videoFile) alert("請先上傳影片檔案以進行匯出");
       return;
@@ -670,12 +717,20 @@ function App() {
     setIsProcessing(true);
     setShowExportModal(false);
 
+    const clientOnlyFormats = ['xml', 'edl'];
+    const needsBackend = selectedFormats.some(f => !clientOnlyFormats.includes(f));
+
     if (selectedFormats.includes('xml')) {
       handleExportXML();
-      if (selectedFormats.length === 1) {
-        setIsProcessing(false);
-        return;
-      }
+    }
+
+    if (selectedFormats.includes('edl')) {
+      handleExportEDL();
+    }
+
+    if (!needsBackend) {
+      setIsProcessing(false);
+      return;
     }
 
     const cutsForBackend = cuts.map(c => ({
@@ -702,6 +757,7 @@ function App() {
     formData.append('face_tracking', 'false');
     formData.append('studio_sound', 'false');
     formData.append('merge_clips', 'true');
+    formData.append('codec', codec || 'h264');
     formData.append('selected_formats', JSON.stringify(selectedFormats));
 
     try {
@@ -731,7 +787,7 @@ function App() {
     } finally {
       setIsProcessing(false);
     }
-  }, [cuts, videoFile, duration, handleExportXML, setIsProcessing, whisperLanguage, whisperModel, whisperBeamSize, whisperTemperature, whisperCharsPerLine, whisperRemovePunc, isVerticalMode]);
+  }, [cuts, videoFile, duration, handleExportXML, handleExportEDL, setIsProcessing, whisperLanguage, whisperModel, whisperBeamSize, whisperTemperature, whisperCharsPerLine, whisperRemovePunc, isVerticalMode]);
 
   const handleWheelZoom = (e: React.WheelEvent) => {
     if (e.metaKey || e.ctrlKey) {
@@ -790,6 +846,12 @@ function App() {
     handleDeselectAll,
     setActiveTool,
     handleZoom,
+    pause,
+    cycleForwardRate,
+    cycleReverseRate,
+    setPlaybackRate,
+    markIn,
+    markOut,
   });
 
   return (
@@ -2036,7 +2098,23 @@ function App() {
                     <Redo2 size={18} />
                   </div>
                   <span className="history-badge" title="歷史記錄">{historyIndex + 1}/{historyLength}</span>
+                  {playbackRate !== 1 && playbackRate !== 0 && (
+                    <span className="history-badge" title="播放速度" style={{ color: '#fbbf24' }}>{playbackRate > 0 ? '' : ''}{playbackRate}x</span>
+                  )}
                 </div>
+
+                {/* Mark Points Badge */}
+                {(inPoint !== null || outPoint !== null) && (
+                  <div className="tool-group" style={{ gap: 4 }}>
+                    <span className="history-badge" title="In/Out 標記" style={{ color: '#fbbf24', fontSize: 10 }}>
+                      I: {inPoint !== null ? inPoint.toFixed(1) + 's' : '--'} O: {outPoint !== null ? outPoint.toFixed(1) + 's' : '--'}
+                    </span>
+                    {inPoint !== null && outPoint !== null && (
+                      <div className="tool-btn" title="從標記建立片段" onClick={createCutFromMarks} style={{ fontSize: 10, padding: '2px 6px' }}>+Cut</div>
+                    )}
+                    <div className="tool-btn" title="清除標記" onClick={clearMarks} style={{ fontSize: 10, padding: '2px 6px' }}>Clear</div>
+                  </div>
+                )}
 
                 {/* Actions Group */}
                 <div className="tool-group">
@@ -2297,6 +2375,40 @@ function App() {
                       pointerEvents: 'none'
                     }}></div>
 
+                    {/* In/Out Mark Point Indicators */}
+                    {inPoint !== null && outPoint !== null && (
+                      <div style={{
+                        position: 'absolute',
+                        left: inPoint * zoomLevel,
+                        top: 0,
+                        width: (outPoint - inPoint) * zoomLevel,
+                        height: '100%',
+                        background: 'rgba(255, 200, 0, 0.12)',
+                        pointerEvents: 'none',
+                        zIndex: 1,
+                      }} />
+                    )}
+                    {inPoint !== null && (
+                      <div style={{
+                        position: 'absolute',
+                        left: inPoint * zoomLevel - 5,
+                        top: 2,
+                        width: 0, height: 0,
+                        borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '8px solid #fbbf24',
+                        pointerEvents: 'none', zIndex: 2,
+                      }} />
+                    )}
+                    {outPoint !== null && (
+                      <div style={{
+                        position: 'absolute',
+                        left: outPoint * zoomLevel - 5,
+                        top: 2,
+                        width: 0, height: 0,
+                        borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '8px solid #fbbf24',
+                        pointerEvents: 'none', zIndex: 2,
+                      }} />
+                    )}
+
                     {/* Ruler Ticks */}
                     {Array.from({ length: Math.ceil(duration) }).map((_, i) => (
                       <React.Fragment key={i}>
@@ -2475,10 +2587,12 @@ function App() {
           {showExportModal && (
             <ExportModal
               cuts={cuts}
+              assets={projectAssets}
               videoUrl={videoUrl}
               isProcessing={isProcessing}
               onClose={() => setShowExportModal(false)}
               onExport={handleExportVideo}
+              onRelinkAsset={handleRelinkAsset}
             />
           )}
 
